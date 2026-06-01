@@ -43,154 +43,6 @@ def _event_to_dict(event: OmniEvent) -> dict[str, Any]:
     }
 
 
-def _wants_text_stream(payload: StagePayload) -> bool:
-    if not bool((payload.request.params or {}).get("stream", False)):
-        return False
-    modalities = payload.request.metadata.get("output_modalities")
-    return modalities is None or "text" in modalities
-
-
-def _stream_text_from_events(
-    events: list[OmniEvent],
-    stream_state: dict[str, Any],
-) -> str:
-    text_parts: list[str] = []
-    for event in events:
-        if event.modality != "text":
-            continue
-        text = event.payload.get("text")
-        if not isinstance(text, str) or not text:
-            continue
-        if event.is_final or event.type == "text_final":
-            emitted_text = str(stream_state.get("emitted_text", ""))
-            delta = text[len(emitted_text) :] if text.startswith(emitted_text) else text
-            if delta:
-                text_parts.append(delta)
-                stream_state["emitted_text"] = text
-            continue
-        if event.type == "text_delta":
-            text_parts.append(text)
-    return "".join(text_parts)
-
-
-def _build_ming_text_stream_chunk(
-    payload: StagePayload,
-    item: Any,
-    *,
-    tokenizer: Any,
-    eos_token_id: int | None,
-    step: int,
-) -> dict[str, Any] | None:
-    token_id = int(item)
-
-    state = load_state(payload)
-    thinker_out: ThinkerOutput = {
-        "output_ids": [token_id],
-        "step": step,
-        "is_final": False,
-    }
-    events = list(
-        decode_events(
-            thinker_out=thinker_out,
-            state=state,
-            tokenizer=tokenizer,
-            eos_token_id=eos_token_id,
-            step=step,
-        )
-    )
-    text_delta = _stream_text_from_events(events, state.stream_state)
-    store_state(payload, state)
-    if not text_delta:
-        return None
-
-    return {
-        "events": [_event_to_dict(event) for event in events],
-        "token_ids": [token_id],
-        "token_id": token_id,
-        "step": step,
-        "stage": THINKER_STAGE,
-        "stage_name": THINKER_STAGE,
-        "modality": "text",
-        "text": text_delta,
-    }
-
-
-def _decode_ming_payload(
-    payload: StagePayload,
-    *,
-    tokenizer: Any,
-    eos_token_id: int | None,
-) -> StagePayload:
-    state = load_state(payload)
-    thinker_out = state.thinker_out or state.engine_outputs.get(THINKER_STAGE)
-    if not isinstance(thinker_out, dict):
-        thinker_out = {
-            "output_ids": [],
-            "step": 0,
-            "is_final": True,
-            "finish_reason": None,
-            "extra_model_outputs": {},
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-        }
-
-    step = int(thinker_out.get("step") or len(thinker_out.get("output_ids", [])))
-    events = list(
-        decode_events(
-            thinker_out=thinker_out,
-            state=state,
-            tokenizer=tokenizer,
-            eos_token_id=eos_token_id,
-            step=step,
-        )
-    )
-    event_dicts = [_event_to_dict(event) for event in events]
-
-    result: dict[str, Any] = {"events": event_dicts}
-    final_event = next(
-        (
-            event
-            for event in reversed(events)
-            if event.is_final or event.type in {"text_final", "final"}
-        ),
-        None,
-    )
-    if final_event is not None:
-        result.update(final_event.payload)
-        result.setdefault("modality", final_event.modality)
-
-    output_ids = thinker_out.get("output_ids")
-    if "text" not in result:
-        if (
-            callable(getattr(tokenizer, "decode", None))
-            and isinstance(output_ids, list)
-            and output_ids
-        ):
-            result["text"] = tokenizer.decode(output_ids, skip_special_tokens=True)
-            result.setdefault("modality", "text")
-
-    finish_reason = thinker_out.get("finish_reason")
-    if finish_reason is not None:
-        result["finish_reason"] = finish_reason
-
-    prompt_tokens = int(thinker_out.get("prompt_tokens", 0) or 0)
-    completion_tokens = thinker_out.get("completion_tokens")
-    if completion_tokens is None:
-        completion_tokens = len(output_ids) if isinstance(output_ids, list) else 0
-    completion_tokens = int(completion_tokens or 0)
-    result["usage"] = {
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": prompt_tokens + completion_tokens,
-    }
-
-    if bool((payload.request.params or {}).get("stream", False)):
-        result.pop("text", None)
-
-    payload.data = result
-    return payload
-
-
 def create_preprocessing_executor(model_path: str) -> PreprocessingExecutor:
     preprocessor = MingPreprocessor(model_path=model_path)
 
@@ -306,19 +158,54 @@ def create_sglang_thinker_executor(
     def _stream_builder(payload: StagePayload | None, item: Any) -> Any:
         if payload is None:
             return None
-        if not _wants_text_stream(payload):
-            return None
         request_id = payload.request_id
         step = step_counters.get(request_id, 0) + 1
         step_counters[request_id] = step
 
-        return _build_ming_text_stream_chunk(
-            payload,
-            item,
-            tokenizer=tokenizer,
-            eos_token_id=eos_token_id,
-            step=step,
+        try:
+            token_id = int(item)
+        except Exception:
+            return {"token_id": item, "step": step}
+
+        state = load_state(payload)
+        thinker_out: ThinkerOutput = {
+            "output_ids": [token_id],
+            "step": step,
+            "is_final": False,
+        }
+        events = list(
+            decode_events(
+                thinker_out=thinker_out,
+                state=state,
+                tokenizer=tokenizer,
+                eos_token_id=eos_token_id,
+                step=step,
+            )
         )
+        store_state(payload, state)
+        if eos_token_id is not None and token_id == eos_token_id and not events:
+            events = [
+                OmniEvent(type="text_final", modality="text", payload={}, is_final=True)
+            ]
+
+        text_to_add = ""
+        for event in events:
+            if event.modality == "text" and "text" in event.payload:
+                if event.is_final:
+                    text_to_add = event.payload["text"]
+                    break
+                else:
+                    text_to_add += event.payload["text"]
+
+        result: dict[str, Any] = {
+            "events": [_event_to_dict(event) for event in events],
+            "token_id": token_id,
+            "step": step,
+            "stage": THINKER_STAGE,
+        }
+        if text_to_add:
+            result["text"] = text_to_add
+        return result
 
     engine = create_sglang_ar_engine(
         server_args=server_args,
@@ -463,10 +350,52 @@ def create_decode_executor(model_path: str) -> PreprocessingExecutor:
     eos_token_id = getattr(tokenizer, "eos_token_id", None)
 
     def _decode(payload: StagePayload) -> StagePayload:
-        return _decode_ming_payload(
-            payload,
-            tokenizer=tokenizer,
-            eos_token_id=eos_token_id,
+        state = load_state(payload)
+        thinker_out = state.thinker_out or state.engine_outputs.get(THINKER_STAGE)
+        if not isinstance(thinker_out, dict):
+            thinker_out = {
+                "output_ids": [],
+                "step": 0,
+                "is_final": True,
+                "extra_model_outputs": {},
+            }
+
+        step = int(thinker_out.get("step") or len(thinker_out.get("output_ids", [])))
+        events = list(
+            decode_events(
+                thinker_out=thinker_out,
+                state=state,
+                tokenizer=tokenizer,
+                eos_token_id=eos_token_id,
+                step=step,
+            )
         )
+        event_dicts = [_event_to_dict(event) for event in events]
+
+        result: dict[str, Any] = {"events": event_dicts}
+        final_event = next(
+            (
+                event
+                for event in reversed(events)
+                if event.is_final or event.type in {"text_final", "final"}
+            ),
+            None,
+        )
+        if final_event is not None:
+            result.update(final_event.payload)
+            result.setdefault("modality", final_event.modality)
+
+        if "text" not in result:
+            output_ids = thinker_out.get("output_ids")
+            if (
+                callable(getattr(tokenizer, "decode", None))
+                and isinstance(output_ids, list)
+                and output_ids
+            ):
+                result["text"] = tokenizer.decode(output_ids, skip_special_tokens=True)
+                result.setdefault("modality", "text")
+
+        payload.data = result
+        return payload
 
     return PreprocessingExecutor(_decode)

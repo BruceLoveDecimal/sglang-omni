@@ -6,12 +6,17 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as futures
 import json
+import re
 import statistics
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
 
 import requests
+
+
+_NUMBER_RE = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?")
 
 
 def _percentile(values: list[float], pct: float) -> float | None:
@@ -29,7 +34,14 @@ def _percentile(values: list[float], pct: float) -> float | None:
 
 def _stats(values: list[float]) -> dict[str, float | int | None]:
     if not values:
-        return {"count": 0, "mean": None, "median": None, "p95": None, "min": None, "max": None}
+        return {
+            "count": 0,
+            "mean": None,
+            "median": None,
+            "p95": None,
+            "min": None,
+            "max": None,
+        }
     return {
         "count": len(values),
         "mean": statistics.fmean(values),
@@ -38,6 +50,39 @@ def _stats(values: list[float]) -> dict[str, float | int | None]:
         "min": min(values),
         "max": max(values),
     }
+
+
+def _git_metadata() -> dict[str, Any]:
+    def _run(args: list[str]) -> str | None:
+        try:
+            return subprocess.check_output(
+                ["git", *args],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        except Exception:
+            return None
+
+    status = _run(["status", "--porcelain"])
+    return {
+        "head": _run(["rev-parse", "HEAD"]),
+        "branch": _run(["branch", "--show-current"]),
+        "status_porcelain": status,
+        "is_clean": status == "",
+    }
+
+
+def _extract_number(text: str) -> str | None:
+    matches = _NUMBER_RE.findall(text.replace(",", ""))
+    if not matches:
+        return None
+    value = matches[-1]
+    return value[:-2] if value.endswith(".0") else value
+
+
+def _expected_gsm8k_answer(answer: str) -> str | None:
+    marker = answer.rsplit("####", 1)
+    return _extract_number(marker[-1] if len(marker) == 2 else answer)
 
 
 def _prompt(question: str) -> str:
@@ -57,6 +102,7 @@ def _run_one(
     model: str,
     max_tokens: int,
     timeout: int,
+    min_non_empty_chunks: int,
 ) -> dict[str, Any]:
     payload = {
         "model": model,
@@ -136,12 +182,20 @@ def _run_one(
     completion_tokens = None
     if isinstance(usage, dict):
         completion_tokens = usage.get("completion_tokens")
-    if isinstance(completion_tokens, int) and completion_tokens > 1 and last_content_at and first_content_at:
+    if (
+        isinstance(completion_tokens, int)
+        and completion_tokens > 1
+        and last_content_at
+        and first_content_at
+    ):
         tpot_s = (last_content_at - first_content_at) / (completion_tokens - 1)
     elif non_empty_chunks > 1 and last_content_at and first_content_at:
         tpot_s = (last_content_at - first_content_at) / (non_empty_chunks - 1)
     else:
         tpot_s = None
+    generated_text = "".join(content_parts)
+    expected_numeric = _expected_gsm8k_answer(answer)
+    predicted_numeric = _extract_number(generated_text)
 
     return {
         "idx": idx,
@@ -157,7 +211,13 @@ def _run_one(
         "usage": usage,
         "question": question,
         "expected_answer": answer,
-        "generated_text": "".join(content_parts),
+        "expected_numeric_answer": expected_numeric,
+        "predicted_numeric_answer": predicted_numeric,
+        "exact_match": (
+            expected_numeric is not None and predicted_numeric == expected_numeric
+        ),
+        "streaming_ok": non_empty_chunks >= min_non_empty_chunks,
+        "generated_text": generated_text,
     }
 
 
@@ -177,10 +237,20 @@ def main() -> None:
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument("--require-clean-git", action="store_true")
+    parser.add_argument("--require-streaming", action="store_true")
+    parser.add_argument("--min-non-empty-chunks", type=int, default=2)
+    parser.add_argument("--min-exact-match", type=float, default=0.0)
     args = parser.parse_args()
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    git = _git_metadata()
+    if args.require_clean_git and not git["is_clean"]:
+        raise SystemExit(
+            "Refusing to run e2e with dirty git status: "
+            f"{git['status_porcelain']!r}"
+        )
 
     total_needed = args.limit + args.warmup
     if args.dataset_jsonl:
@@ -222,8 +292,15 @@ def main() -> None:
         "explicit_modalities": ["text"],
         "url": args.url,
         "model": args.model,
+        "git": git,
+        "require_streaming": args.require_streaming,
+        "min_non_empty_chunks": args.min_non_empty_chunks,
+        "min_exact_match": args.min_exact_match,
     }
-    (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    (out_dir / "metadata.json").write_text(
+        json.dumps(metadata, indent=2),
+        encoding="utf-8",
+    )
 
     for item in warmups:
         result = _run_one(
@@ -234,6 +311,7 @@ def main() -> None:
             model=args.model,
             max_tokens=args.max_tokens,
             timeout=args.timeout,
+            min_non_empty_chunks=args.min_non_empty_chunks,
         )
         print("warmup", item["idx"], result.get("success"), result.get("latency_s"))
 
@@ -249,6 +327,7 @@ def main() -> None:
                 model=args.model,
                 max_tokens=args.max_tokens,
                 timeout=args.timeout,
+                min_non_empty_chunks=args.min_non_empty_chunks,
             )
             for item in measured
         ]
@@ -277,13 +356,30 @@ def main() -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     successes = [r for r in results if r.get("success")]
+    streaming_successes = [
+        r
+        for r in successes
+        if int(r.get("non_empty_content_chunks") or 0) >= args.min_non_empty_chunks
+    ]
+    exact_matches = [r for r in successes if r.get("exact_match") is True]
+    exact_match_rate = len(exact_matches) / len(successes) if successes else 0.0
     summary = {
         **metadata,
         "successes": len(successes),
         "failures": len(results) - len(successes),
-        "ttft_s": _stats([r["ttft_s"] for r in successes if r.get("ttft_s") is not None]),
-        "tpot_s": _stats([r["tpot_s"] for r in successes if r.get("tpot_s") is not None]),
-        "latency_s": _stats([r["latency_s"] for r in successes if r.get("latency_s") is not None]),
+        "streaming_successes": len(streaming_successes),
+        "streaming_failures": len(successes) - len(streaming_successes),
+        "exact_matches": len(exact_matches),
+        "exact_match_rate": exact_match_rate,
+        "ttft_s": _stats(
+            [r["ttft_s"] for r in successes if r.get("ttft_s") is not None]
+        ),
+        "tpot_s": _stats(
+            [r["tpot_s"] for r in successes if r.get("tpot_s") is not None]
+        ),
+        "latency_s": _stats(
+            [r["latency_s"] for r in successes if r.get("latency_s") is not None]
+        ),
         "non_empty_content_chunks": _stats(
             [float(r["non_empty_content_chunks"]) for r in successes]
         ),
@@ -300,6 +396,13 @@ def main() -> None:
         encoding="utf-8",
     )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
+    if args.require_streaming and len(streaming_successes) != len(successes):
+        raise SystemExit("Streaming check failed; see requests.jsonl for details")
+    if exact_match_rate < args.min_exact_match:
+        raise SystemExit(
+            f"Exact match rate {exact_match_rate:.3f} below required "
+            f"{args.min_exact_match:.3f}"
+        )
 
 
 if __name__ == "__main__":

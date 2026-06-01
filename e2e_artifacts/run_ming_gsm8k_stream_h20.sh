@@ -12,6 +12,7 @@ LIMIT=${LIMIT:-32}
 CONCURRENCY=${CONCURRENCY:-4}
 MAX_TOKENS=${MAX_TOKENS:-256}
 WARMUP=${WARMUP:-1}
+MIN_EXACT_MATCH=${MIN_EXACT_MATCH:-0.0}
 DATASET_JSONL=${DATASET_JSONL:-$BASE/data/gsm8k_test.jsonl}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-8}
@@ -22,6 +23,14 @@ export PYTHONPATH=$CODE:${PYTHONPATH:-}
 source "$VENV/bin/activate"
 cd "$CODE"
 mkdir -p "$BASE/logs" "$BASE/results"
+
+GIT_HEAD=$(git rev-parse HEAD)
+GIT_STATUS=$(git status --porcelain)
+if [ -n "$GIT_STATUS" ]; then
+  echo "Refusing to run e2e with dirty git status:"
+  echo "$GIT_STATUS"
+  exit 1
+fi
 
 STAMP=$(date +%Y%m%d_%H%M%S)
 RESULT_DIR=$BASE/results/ming_gsm8k_stream_$STAMP
@@ -61,6 +70,7 @@ echo "server_pid=$SERVER_PID"
 echo "server_log=$SERVER_LOG"
 echo "result_dir=$RESULT_DIR"
 echo "benchmark_log=$BENCH_LOG"
+echo "git_head=$GIT_HEAD"
 
 python - <<PY
 import requests
@@ -82,7 +92,7 @@ print("server_not_ready")
 sys.exit(1)
 PY
 
-python "$BASE/benchmark_ming_gsm8k_stream.py" \
+python "$CODE/e2e_artifacts/benchmark_ming_gsm8k_stream.py" \
   --url "http://127.0.0.1:$PORT" \
   --model ming-omni \
   --split test \
@@ -92,8 +102,14 @@ python "$BASE/benchmark_ming_gsm8k_stream.py" \
   --max-tokens "$MAX_TOKENS" \
   --warmup "$WARMUP" \
   --output-dir "$RESULT_DIR" \
+  --require-clean-git \
+  --require-streaming \
+  --min-non-empty-chunks 2 \
+  --min-exact-match "$MIN_EXACT_MATCH" \
   2>&1 | tee "$BENCH_LOG"
 
 cp "$SERVER_LOG" "$RESULT_DIR/server.log"
 cp "$BENCH_LOG" "$RESULT_DIR/benchmark.log"
+cp "$CODE/e2e_artifacts/benchmark_ming_gsm8k_stream.py" "$RESULT_DIR/"
+cp "$CODE/e2e_artifacts/run_ming_gsm8k_stream_h20.sh" "$RESULT_DIR/"
 echo "$RESULT_DIR"

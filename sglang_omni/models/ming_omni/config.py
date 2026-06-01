@@ -93,14 +93,33 @@ def _aggregate_stage(*, process: str) -> StageConfig:
     )
 
 
-def _thinker_stage(*, gpu: int, speech_enabled: bool, process: str) -> StageConfig:
+def _thinker_stage(
+    *,
+    gpu: int,
+    speech_enabled: bool,
+    process: str,
+    stream_text_to_decode: bool = False,
+) -> StageConfig:
+    factory_args: dict[str, Any] = {"thinker_max_seq_len": 8192}
+    stream_to = None
+    if stream_text_to_decode:
+        factory_args.update(
+            {
+                "stream_text_to_stage": DECODE_STAGE,
+                "require_stream_text_modality": True,
+                "require_stream_request": True,
+            }
+        )
+        stream_to = [DECODE_STAGE]
+    streaming_kwargs = {"stream_to": stream_to} if stream_to is not None else {}
     return StageConfig(
         name=THINKER_STAGE,
         process=process,
         factory=f"{_PKG}.stages.create_sglang_thinker_executor_from_config",
-        factory_args={"thinker_max_seq_len": 8192},
+        factory_args=factory_args,
         gpu=gpu,
         next=[DECODE_STAGE, TALKER_STAGE] if speech_enabled else DECODE_STAGE,
+        **streaming_kwargs,
     )
 
 
@@ -151,6 +170,7 @@ def _decode_stage(*, process: str) -> StageConfig:
         process=process,
         factory=f"{_PKG}.stages.create_decode_executor",
         terminal=True,
+        can_accept_stream_before_payload=True,
     )
 
 
@@ -171,7 +191,12 @@ def _ming_text_stages() -> list[StageConfig]:
         _audio_encoder_stage(gpu=0, process="audio_encoder"),
         _image_encoder_stage(gpu=0, process="image_encoder"),
         _aggregate_stage(process="mm_aggregate"),
-        _thinker_stage(gpu=0, speech_enabled=False, process="thinker"),
+        _thinker_stage(
+            gpu=0,
+            speech_enabled=False,
+            process="thinker",
+            stream_text_to_decode=True,
+        ),
         _decode_stage(process="decode"),
     ]
 

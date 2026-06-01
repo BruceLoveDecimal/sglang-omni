@@ -174,16 +174,10 @@ def apply_thinker_result(
 ) -> ThinkerOutput:
     if isinstance(result, ARRequestData):
         output_ids = list(result.output_ids)
-        prompt_tokens = (
-            int(result.input_ids.shape[0]) if result.input_ids is not None else 0
-        )
         thinker_out: ThinkerOutput = {
             "output_ids": output_ids,
             "step": len(output_ids),
             "is_final": True,
-            "finish_reason": result.finish_reason,
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": len(output_ids),
             "extra_model_outputs": dict(result.extra_model_outputs),
         }
     else:
@@ -191,9 +185,6 @@ def apply_thinker_result(
             "output_ids": [],
             "step": 0,
             "is_final": True,
-            "finish_reason": None,
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
             "extra_model_outputs": {"result": result},
         }
 

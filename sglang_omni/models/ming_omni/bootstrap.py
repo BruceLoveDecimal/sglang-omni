@@ -19,6 +19,9 @@ def create_thinker_scheduler(
     tp_size: int = 1,
     nccl_port: int | None = None,
     enable_streaming_tts: bool = False,
+    stream_text_to_stage: str | None = None,
+    require_stream_text_modality: bool = False,
+    require_stream_request: bool = False,
 ):
     if tp_size < 1:
         raise ValueError(f"tp_size must be >= 1, got {tp_size}")
@@ -83,11 +86,17 @@ def create_thinker_scheduler(
     )
 
     stream_output_builder = None
-    if enable_streaming_tts:
+    target_stage = stream_text_to_stage
+    if target_stage is None and enable_streaming_tts:
+        target_stage = "segmenter"
+    if target_stage is not None:
         eos_token_id = getattr(tokenizer, "eos_token_id", None)
         stream_output_builder = make_thinker_stream_output_builder(
             tokenizer=tokenizer,
             eos_token_id=eos_token_id,
+            target_stage=target_stage,
+            require_text_output_modality=require_stream_text_modality,
+            require_request_stream=require_stream_request,
         )
 
     return OmniScheduler(
@@ -253,12 +262,14 @@ def make_thinker_stream_output_builder(
     tokenizer: Any,
     eos_token_id: int | None,
     target_stage: str = "segmenter",
+    require_text_output_modality: bool = False,
+    require_request_stream: bool = False,
 ):
-    """Build a per-token stream callback that emits text deltas to the segmenter.
+    """Build a per-token stream callback that emits text deltas downstream.
 
     OmniScheduler calls this on every model step with the freshly generated
     token id. We maintain per-request running output_ids on ``req`` so we can
-    incrementally decode and compute the text delta to push to the segmenter.
+    incrementally decode and compute the text delta to push to ``target_stage``.
 
     Incomplete UTF-8 sequences (``\\ufffd`` in the decoded result) are buffered
     until the next token completes them.
@@ -274,6 +285,19 @@ def make_thinker_stream_output_builder(
         # assistant token and leak prompt content into TTS.
         if req is not None and int(getattr(req, "is_chunked", 0) or 0) > 0:
             return []
+        payload = getattr(req_data, "stage_payload", None)
+        if require_request_stream and not bool(
+            (getattr(getattr(payload, "request", None), "params", None) or {}).get(
+                "stream", False
+            )
+        ):
+            return []
+        if require_text_output_modality:
+            modalities = getattr(getattr(payload, "request", None), "metadata", {}).get(
+                "output_modalities"
+            )
+            if modalities is not None and "text" not in modalities:
+                return []
         if req_output.data is None or req is None:
             return []
 
@@ -316,13 +340,6 @@ def make_thinker_stream_output_builder(
             list(delta.encode("utf-8")),
             dtype=torch.uint8,
         )
-        # Only emit to the segmenter. The thinker is not a terminal stage,
-        # so it cannot send chunks directly to the coordinator via
-        # target=None — the runtime would fan that out to ``stream_to``
-        # peers, and the relay transport requires torch.Tensor payloads.
-        # Streaming text deltas to the client requires either a stream-
-        # aware decode stage or a dedicated text fan-out stage; left as a
-        # follow-up. Streaming audio still works via the talker_stream.
         return [
             OutgoingMessage(
                 request_id=request_id,

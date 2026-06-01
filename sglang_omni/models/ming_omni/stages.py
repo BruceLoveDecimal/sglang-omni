@@ -7,6 +7,7 @@ Ming's config remains usable in lightweight environments.
 
 from __future__ import annotations
 
+import queue as _queue_mod
 from typing import Any
 
 from sglang_omni.models.ming_omni.io import PipelineState
@@ -99,6 +100,109 @@ def _attach_decode_final_metadata(
     if finish_reason is not None:
         result.setdefault("finish_reason", finish_reason)
     result.setdefault("usage", build_text_usage(state, thinker_out))
+
+
+class MingTextDecodeScheduler:
+    """Decode final Ming text and forward live text deltas to the client."""
+
+    def __init__(self, decode_fn):
+        self.inbox: _queue_mod.Queue = _queue_mod.Queue()
+        self.outbox: _queue_mod.Queue = _queue_mod.Queue()
+        self._decode_fn = decode_fn
+        self._running = False
+        self._streamed_text: set[str] = set()
+
+    def start(self) -> None:
+        self._running = True
+        while self._running:
+            try:
+                msg = self.inbox.get(timeout=0.1)
+            except _queue_mod.Empty:
+                continue
+            try:
+                self._handle_message(msg)
+            except Exception as exc:
+                self._emit_error(msg.request_id, exc)
+
+    def stop(self) -> None:
+        self._running = False
+
+    def abort(self, request_id: str) -> None:
+        self._streamed_text.discard(request_id)
+
+    def _handle_message(self, msg) -> None:
+        if msg.type == "new_request":
+            self._on_new_request(msg)
+        elif msg.type == "stream_chunk":
+            self._on_stream_chunk(msg)
+        elif msg.type == "stream_done":
+            return
+
+    def _on_new_request(self, msg) -> None:
+        from sglang_omni.scheduling.messages import OutgoingMessage
+
+        strip_text = msg.request_id in self._streamed_text
+        self._streamed_text.discard(msg.request_id)
+        payload = self._decode_fn(msg.data, strip_text=strip_text)
+        self.outbox.put(
+            OutgoingMessage(
+                request_id=msg.request_id,
+                type="result",
+                data=payload,
+            )
+        )
+
+    def _on_stream_chunk(self, msg) -> None:
+        from sglang_omni.models.ming_omni.components.streaming_text import (
+            uint8_tensor_to_text,
+        )
+        from sglang_omni.pipeline.stage.stream_queue import StreamItem
+        from sglang_omni.scheduling.messages import OutgoingMessage
+
+        item = msg.data
+        if not isinstance(item, StreamItem):
+            return
+        text = uint8_tensor_to_text(item.data)
+        if not text:
+            return
+
+        self._streamed_text.add(msg.request_id)
+        metadata = dict(item.metadata or {})
+        metadata["modality"] = "text"
+        data: dict[str, Any] = {
+            "text": text,
+            "modality": "text",
+            "stage_name": "decode",
+        }
+        token_id = metadata.get("token_id")
+        if token_id is not None:
+            data["token_id"] = token_id
+            data["token_ids"] = [token_id]
+        step = metadata.get("step")
+        if step is not None:
+            data["step"] = step
+
+        self.outbox.put(
+            OutgoingMessage(
+                request_id=msg.request_id,
+                type="stream",
+                data=data,
+                target=None,
+                metadata=metadata,
+            )
+        )
+
+    def _emit_error(self, request_id: str, exc: BaseException) -> None:
+        from sglang_omni.scheduling.messages import OutgoingMessage
+
+        self._streamed_text.discard(request_id)
+        self.outbox.put(
+            OutgoingMessage(
+                request_id=request_id,
+                type="error",
+                data=exc,
+            )
+        )
 
 
 def create_preprocessing_executor(model_path: str):
@@ -220,6 +324,9 @@ def create_sglang_thinker_executor_from_config(
     thinker_max_seq_len: int = 8192,
     server_args_overrides: dict[str, Any] | None = None,
     enable_streaming_tts: bool = False,
+    stream_text_to_stage: str | None = None,
+    require_stream_text_modality: bool = False,
+    require_stream_request: bool = False,
 ):
     from sglang_omni.models.ming_omni.bootstrap import create_thinker_scheduler
     from sglang_omni.models.ming_omni.registration import register_ming_hf_config
@@ -243,6 +350,9 @@ def create_sglang_thinker_executor_from_config(
         tp_size=tp_size,
         nccl_port=nccl_port,
         enable_streaming_tts=enable_streaming_tts,
+        stream_text_to_stage=stream_text_to_stage,
+        require_stream_text_modality=require_stream_text_modality,
+        require_stream_request=require_stream_request,
     )
 
 
@@ -312,7 +422,6 @@ def create_decode_executor(model_path: str):
     from sglang_omni.models.ming_omni.pipeline.merge import decode_events
     from sglang_omni.models.ming_omni.pipeline.next_stage import THINKER_STAGE
     from sglang_omni.models.ming_omni.pipeline.state_io import load_state
-    from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
     tokenizer = load_ming_tokenizer(model_path)
     eos_token_id = getattr(tokenizer, "eos_token_id", None)
@@ -325,7 +434,7 @@ def create_decode_executor(model_path: str):
             "is_final": bool(event.is_final),
         }
 
-    def _decode(payload: StagePayload) -> StagePayload:
+    def _decode(payload: StagePayload, *, strip_text: bool = False) -> StagePayload:
         state = load_state(payload)
         thinker_out = state.thinker_out or state.engine_outputs.get(THINKER_STAGE)
         if not isinstance(thinker_out, dict):
@@ -370,7 +479,9 @@ def create_decode_executor(model_path: str):
                 result.setdefault("modality", "text")
 
         _attach_decode_final_metadata(result, state, thinker_out)
+        if strip_text:
+            result.pop("text", None)
         payload.data = result
         return payload
 
-    return SimpleScheduler(_decode)
+    return MingTextDecodeScheduler(_decode)
