@@ -1,0 +1,12 @@
+run_dir=/root/autodl-tmp/sglang-omni-h20/results/ming_text_stream_smoke_bench_20260601_185728
+git_head=120e601242c7a5374a0d9c2b3c3ed19517ea1143
+port=18001
+cuda_visible_devices=0,1
+code=/root/sgomni
+real_code=/root/autodl-tmp/sglang-omni-h20/code/sglang-omni
+model_path=/root/ming-model
+real_model=/root/autodl-tmp/sglang-omni-h20/models/Ming-flash-omni-2.0
+dataset_jsonl=/root/autodl-tmp/sglang-omni-h20/data/gsm8k_test.jsonl
+bench_limit=32
+bench_concurrency=4
+bench_max_tokens=256

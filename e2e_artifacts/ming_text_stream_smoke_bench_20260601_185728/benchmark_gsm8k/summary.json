@@ -1,0 +1,68 @@
+{
+  "dataset": "gsm8k/main",
+  "split": "test",
+  "limit": 32,
+  "warmup": 1,
+  "concurrency": 4,
+  "max_tokens": 256,
+  "explicit_modalities": [
+    "text"
+  ],
+  "url": "http://127.0.0.1:18001",
+  "model": "ming-omni",
+  "git": {
+    "head": "120e601242c7a5374a0d9c2b3c3ed19517ea1143",
+    "branch": "feat/ming-omni-text-streaming-600",
+    "status_porcelain": "",
+    "is_clean": true
+  },
+  "require_streaming": true,
+  "min_non_empty_chunks": 2,
+  "min_exact_match": 0.0,
+  "successes": 32,
+  "failures": 0,
+  "streaming_successes": 32,
+  "streaming_failures": 0,
+  "exact_matches": 17,
+  "exact_match_rate": 0.53125,
+  "ttft_s": {
+    "count": 32,
+    "mean": 4.897120159119368,
+    "median": 5.425483651459217,
+    "p95": 5.881298181042075,
+    "min": 1.8291895352303982,
+    "max": 7.5562721230089664
+  },
+  "tpot_s": {
+    "count": 32,
+    "mean": 1.907550052852541,
+    "median": 1.8865111236697902,
+    "p95": 2.025891140262111,
+    "min": 1.800247977966187,
+    "max": 2.1395981882409805
+  },
+  "latency_s": {
+    "count": 32,
+    "mean": 456.0590956188971,
+    "median": 469.8824125416577,
+    "p95": 514.5407590597868,
+    "min": 316.05421463400126,
+    "max": 516.9483939111233
+  },
+  "non_empty_content_chunks": {
+    "count": 32,
+    "mean": 236.625,
+    "median": 256.0,
+    "p95": 256.0,
+    "min": 145.0,
+    "max": 256.0
+  },
+  "completion_tokens": {
+    "count": 32,
+    "mean": 237.03125,
+    "median": 256.0,
+    "p95": 256.0,
+    "min": 146.0,
+    "max": 256.0
+  }
+}

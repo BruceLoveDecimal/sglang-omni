@@ -1,0 +1,22 @@
+{
+  "dataset": "gsm8k/main",
+  "split": "test",
+  "limit": 1,
+  "warmup": 0,
+  "concurrency": 1,
+  "max_tokens": 64,
+  "explicit_modalities": [
+    "text"
+  ],
+  "url": "http://127.0.0.1:18001",
+  "model": "ming-omni",
+  "git": {
+    "head": "120e601242c7a5374a0d9c2b3c3ed19517ea1143",
+    "branch": "feat/ming-omni-text-streaming-600",
+    "status_porcelain": "",
+    "is_clean": true
+  },
+  "require_streaming": true,
+  "min_non_empty_chunks": 2,
+  "min_exact_match": 0.0
+}
