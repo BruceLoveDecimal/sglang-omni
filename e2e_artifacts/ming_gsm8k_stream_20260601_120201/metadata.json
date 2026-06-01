@@ -1,0 +1,13 @@
+{
+  "dataset": "gsm8k/main",
+  "split": "test",
+  "limit": 32,
+  "warmup": 1,
+  "concurrency": 4,
+  "max_tokens": 256,
+  "explicit_modalities": [
+    "text"
+  ],
+  "url": "http://127.0.0.1:8000",
+  "model": "ming-omni"
+}

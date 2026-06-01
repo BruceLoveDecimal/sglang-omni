@@ -1,0 +1,200 @@
+Failed to import mooncake: No module named 'mooncake'. MooncakeRelay will not work. Install with: pip install mooncake-transfer-engine
+Failed to import nixl: No module named 'nixl'. NixlRelay will not work.
+2026-06-01 12:02:05,743 [INFO] sglang_omni.serve.launcher: GPU placement: {} → single-process
+2026-06-01 12:02:07,225 [INFO] qwen_vl_utils.vision_process: set VIDEO_TOTAL_PIXELS: 90316800
+2026-06-01 12:02:07,226 [INFO] sglang_omni.pipeline.stage.runtime: Initializing shm for stage preprocessing (device=cpu)
+The tokenizer class you load from this checkpoint is not the same type as the class this function is called from. It may result in unexpected tokenization. 
+The tokenizer class you load from this checkpoint is 'BailingTokenizer'. 
+The class this function is called from is 'PreTrainedTokenizerFast'.
+2026-06-01 12:02:07,554 [INFO] sglang_omni.pipeline.coordinator: Coordinator registered stage: preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+2026-06-01 12:02:07,554 [INFO] sglang_omni.pipeline.stage.runtime: Initializing shm for stage audio_encoder (device=cuda:0)
+2026-06-01 12:02:10,856 [INFO] sglang_omni.models.ming_omni.components.audio_encoder: Loading Ming audio encoder weights from /root/autodl-tmp/sglang-omni-h20/models/Ming-flash-omni-2.0
+2026-06-01 12:02:12,787 [INFO] sglang_omni.pipeline.coordinator: Coordinator registered stage: audio_encoder at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_audio_encoder.sock
+2026-06-01 12:02:12,787 [INFO] sglang_omni.pipeline.stage.runtime: Initializing shm for stage image_encoder (device=cuda:0)
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+2026-06-01 12:02:14,744 [INFO] sglang.srt.layers.moe.utils: MOE_RUNNER_BACKEND is not initialized, the backend will be automatically selected
+2026-06-01 12:02:14,768 [INFO] sglang.srt.utils.common: Multimodal attention backend not set. Use fa3.
+2026-06-01 12:02:14,768 [INFO] sglang.srt.utils.common: Using fa3 as multimodal attention backend.
+2026-06-01 12:02:15,492 [INFO] sglang_omni.models.ming_omni.components.image_encoder: MingImageEncoder loaded: 351 vision + 4 projector weights
+2026-06-01 12:02:15,782 [INFO] sglang_omni.models.ming_omni.components.image_encoder: Cleaned up distributed state for thinker reuse
+2026-06-01 12:02:15,784 [INFO] sglang_omni.pipeline.coordinator: Coordinator registered stage: image_encoder at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_image_encoder.sock
+2026-06-01 12:02:15,784 [INFO] sglang_omni.pipeline.stage.runtime: Initializing shm for stage mm_aggregate (device=cpu)
+2026-06-01 12:02:15,785 [INFO] sglang_omni.pipeline.coordinator: Coordinator registered stage: mm_aggregate at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_mm_aggregate.sock
+2026-06-01 12:02:15,785 [INFO] sglang_omni.pipeline.stage.runtime: Initializing shm for stage thinker (device=cuda:0)
+2026-06-01 12:02:15,785 [INFO] sglang_omni.models.ming_omni.pipeline.stages: create_sglang_thinker_executor_from_config: server_args_overrides={'tp_size': 2, 'disable_custom_all_reduce': True, 'cpu_offload_gb': 60, 'mem_fraction_static': 0.8}
+2026-06-01 12:02:15,909 [INFO] sglang.srt.server_args: Attention backend not specified. Use fa3 backend by default.
+2026-06-01 12:02:15,909 [INFO] sglang_omni.models.ming_omni.pipeline.stages: ServerArgs: cpu_offload_gb=60, mem_fraction_static=0.8, pre_load_avail_mem=92.13 GB
+The tokenizer class you load from this checkpoint is not the same type as the class this function is called from. It may result in unexpected tokenization. 
+The tokenizer class you load from this checkpoint is 'BailingTokenizer'. 
+The class this function is called from is 'PreTrainedTokenizerFast'.
+2026-06-01 12:02:16,150 [INFO] sglang_omni.engines.tp.follower: Spawned follower rank 1 on GPU 1 (pid=5417)
+2026-06-01 12:02:16,353 [WARNING] sglang.srt.models.registry: Ignore import error when loading sglang.srt.models.glmasr: cannot import name 'GlmAsrConfig' from 'transformers' (/root/autodl-tmp/sglang-omni-h20/venvs/sglang-omni-py312/lib/python3.12/site-packages/transformers/__init__.py)
+2026-06-01 12:02:16,530 [INFO] sglang.srt.model_executor.model_runner: Init torch distributed begin.
+Failed to import mooncake: No module named 'mooncake'. MooncakeRelay will not work. Install with: pip install mooncake-transfer-engine
+Failed to import nixl: No module named 'nixl'. NixlRelay will not work.
+2026-06-01 12:02:23,273 [INFO] tp_follower.1: Starting follower on GPU 1
+2026-06-01 12:02:23,544 [WARNING] sglang.srt.models.registry: Ignore import error when loading sglang.srt.models.glmasr: cannot import name 'GlmAsrConfig' from 'transformers' (/root/autodl-tmp/sglang-omni-h20/venvs/sglang-omni-py312/lib/python3.12/site-packages/transformers/__init__.py)
+2026-06-01 12:02:23,723 [INFO] qwen_vl_utils.vision_process: set VIDEO_TOTAL_PIXELS: 90316800
+2026-06-01 12:02:23,732 [INFO] sglang.srt.model_executor.model_runner: Init torch distributed begin.
+[Gloo] Rank 1 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 0 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 0 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 1 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+2026-06-01 12:02:23,803 [INFO] sglang.srt.distributed.device_communicators.pynccl: sglang is using nccl==2.27.5
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 1 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+[Gloo] Rank 0 is connected to 1 peer ranks. Expected number of connected peer ranks is : 1
+2026-06-01 12:02:24,276 [INFO] sglang.srt.model_executor.model_runner: Init torch distributed ends. mem usage=0.75 GB
+2026-06-01 12:02:24,276 [INFO] sglang.srt.model_executor.model_runner: Init torch distributed ends. mem usage=0.80 GB
+2026-06-01 12:02:24,277 [INFO] sglang.srt.model_executor.model_runner: Load weight begin. avail mem=91.38 GB
+2026-06-01 12:02:24,277 [INFO] sglang.srt.model_executor.model_runner: Load weight begin. avail mem=93.95 GB
+The tokenizer class you load from this checkpoint is not the same type as the class this function is called from. It may result in unexpected tokenization. 
+The tokenizer class you load from this checkpoint is 'BailingTokenizer'. 
+The class this function is called from is 'PreTrainedTokenizerFast'.
+The tokenizer class you load from this checkpoint is not the same type as the class this function is called from. It may result in unexpected tokenization. 
+The tokenizer class you load from this checkpoint is 'BailingTokenizer'. 
+The class this function is called from is 'PreTrainedTokenizerFast'.
+Loading safetensors checkpoint shards:   0% Completed | 0/42 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards:   7% Completed | 3/42 [00:00<00:01, 19.86it/s]
+Loading safetensors checkpoint shards:  12% Completed | 5/42 [00:00<00:02, 17.41it/s]
+Loading safetensors checkpoint shards:  17% Completed | 7/42 [00:00<00:02, 16.45it/s]
+Loading safetensors checkpoint shards:  21% Completed | 9/42 [00:00<00:02, 15.54it/s]
+Loading safetensors checkpoint shards:  26% Completed | 11/42 [00:00<00:02, 14.40it/s]
+Loading safetensors checkpoint shards:  31% Completed | 13/42 [00:00<00:01, 15.05it/s]
+Loading safetensors checkpoint shards:  36% Completed | 15/42 [00:00<00:01, 15.17it/s]
+Loading safetensors checkpoint shards:  40% Completed | 17/42 [00:01<00:01, 13.92it/s]
+Loading safetensors checkpoint shards:  45% Completed | 19/42 [00:01<00:01, 13.63it/s]
+Loading safetensors checkpoint shards:  50% Completed | 21/42 [00:01<00:01, 13.03it/s]
+Loading safetensors checkpoint shards:  55% Completed | 23/42 [00:01<00:01, 13.29it/s]
+Loading safetensors checkpoint shards:  60% Completed | 25/42 [00:01<00:01, 13.97it/s]
+Loading safetensors checkpoint shards:  69% Completed | 29/42 [00:02<00:01,  7.18it/s]
+Loading safetensors checkpoint shards:  88% Completed | 37/42 [00:02<00:00, 14.75it/s]
+Loading safetensors checkpoint shards:  95% Completed | 40/42 [00:02<00:00, 14.58it/s]
+Loading safetensors checkpoint shards: 100% Completed | 42/42 [00:02<00:00, 14.23it/s]
+
+2026-06-01 12:09:30,442 [INFO] sglang.srt.model_executor.model_runner: Load weight end. type=BailingMoeV2ForCausalLM, dtype=torch.bfloat16, avail mem=55.37 GB, mem usage=36.02 GB.
+2026-06-01 12:09:32,959 [INFO] sglang.srt.model_executor.model_runner: Load weight end. type=BailingMoeV2ForCausalLM, dtype=torch.bfloat16, avail mem=57.94 GB, mem usage=36.02 GB.
+2026-06-01 12:09:32,964 [INFO] sglang.srt.model_executor.model_runner: Using KV cache dtype: torch.bfloat16
+2026-06-01 12:09:33,015 [INFO] sglang.srt.mem_cache.memory_pool: KV Cache is allocated. #tokens: 1215360, K size: 18.54 GB, V size: 18.54 GB
+2026-06-01 12:09:33,015 [INFO] sglang.srt.model_executor.model_runner_kv_cache_mixin: Memory pool end. avail mem=18.24 GB
+2026-06-01 12:09:33,015 [INFO] sglang.srt.mem_cache.memory_pool: KV Cache is allocated. #tokens: 1215360, K size: 18.54 GB, V size: 18.54 GB
+2026-06-01 12:09:33,016 [INFO] sglang.srt.model_executor.model_runner_kv_cache_mixin: Memory pool end. avail mem=20.79 GB
+/root/autodl-tmp/sglang-omni-h20/venvs/sglang-omni-py312/lib/python3.12/site-packages/sglang/srt/utils/common.py:1232: UserWarning: The given NumPy array is not writable, and PyTorch does not support non-writable tensors. This means writing to this tensor will result in undefined behavior. You may want to copy the array to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:206.)
+  tensor_data = torch.ByteTensor(
+2026-06-01 12:09:33,184 [INFO] tp_follower.1: ModelWorker initialized, NCCL group joined
+2026-06-01 12:09:33,187 [INFO] sglang_omni.models.ming_omni.pipeline.stages: Ming thinker SGLang executor initialized: gpu_id=0 post_load_avail_mem=18.14 GB
+2026-06-01 12:09:33,188 [INFO] sglang_omni.pipeline.coordinator: Coordinator registered stage: thinker at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_thinker.sock
+2026-06-01 12:09:33,188 [INFO] sglang_omni.pipeline.stage.runtime: Initializing shm for stage decode (device=cpu)
+The tokenizer class you load from this checkpoint is not the same type as the class this function is called from. It may result in unexpected tokenization. 
+The tokenizer class you load from this checkpoint is 'BailingTokenizer'. 
+The class this function is called from is 'PreTrainedTokenizerFast'.
+2026-06-01 12:09:33,762 [INFO] sglang_omni.pipeline.coordinator: Coordinator registered stage: decode at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_decode.sock
+2026-06-01 12:09:33,866 [INFO] sglang_omni.pipeline.control_plane: Coordinator control plane started
+2026-06-01 12:09:33,866 [INFO] sglang_omni.pipeline.coordinator: Coordinator started
+2026-06-01 12:09:33,866 [INFO] sglang_omni.serve.launcher: Pipeline 'model' started (6 stages)
+INFO:     Started server process [5358]
+INFO:     Waiting for application startup.
+2026-06-01 12:09:33,942 [INFO] sglang_omni.pipeline.control_plane: Stage preprocessing control plane started
+2026-06-01 12:09:33,942 [INFO] sglang_omni.pipeline.stage.runtime: Stage preprocessing started
+2026-06-01 12:09:33,943 [INFO] sglang_omni.pipeline.control_plane: Stage audio_encoder control plane started
+2026-06-01 12:09:33,943 [INFO] sglang_omni.pipeline.stage.runtime: Stage audio_encoder started
+2026-06-01 12:09:33,943 [INFO] sglang_omni.pipeline.control_plane: Stage image_encoder control plane started
+2026-06-01 12:09:33,943 [INFO] sglang_omni.pipeline.stage.runtime: Stage image_encoder started
+2026-06-01 12:09:33,944 [INFO] sglang_omni.pipeline.control_plane: Stage mm_aggregate control plane started
+2026-06-01 12:09:33,944 [INFO] sglang_omni.pipeline.stage.runtime: Stage mm_aggregate started
+2026-06-01 12:09:33,945 [INFO] sglang_omni.pipeline.control_plane: Stage thinker control plane started
+2026-06-01 12:09:33,945 [INFO] sglang_omni.pipeline.stage.runtime: Stage thinker started
+2026-06-01 12:09:33,945 [INFO] sglang_omni.pipeline.control_plane: Stage decode control plane started
+2026-06-01 12:09:33,945 [INFO] sglang_omni.pipeline.stage.runtime: Stage decode started
+2026-06-01 12:09:33,946 [INFO] sglang_omni.pipeline.worker.runtime: Worker started for stage preprocessing
+2026-06-01 12:09:33,946 [INFO] sglang_omni.engines.omni.engine: OmniEngine started (overlap=False)
+2026-06-01 12:09:33,946 [INFO] sglang_omni.pipeline.worker.runtime: Worker started for stage audio_encoder
+2026-06-01 12:09:33,946 [INFO] sglang_omni.engines.omni.engine: OmniEngine started (overlap=False)
+2026-06-01 12:09:33,946 [INFO] sglang_omni.pipeline.worker.runtime: Worker started for stage image_encoder
+2026-06-01 12:09:33,946 [INFO] sglang_omni.pipeline.worker.runtime: Worker started for stage mm_aggregate
+2026-06-01 12:09:33,947 [INFO] sglang_omni.engines.omni.engine: OmniEngine started (overlap=True)
+2026-06-01 12:09:33,947 [INFO] sglang_omni.pipeline.worker.runtime: Worker started for stage thinker
+2026-06-01 12:09:33,947 [INFO] sglang_omni.pipeline.worker.runtime: Worker started for stage decode
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     127.0.0.1:48664 - "GET /v1/models HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48666 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 12:09:41,560 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=cdc48ccd-3f5d-4664-a281-aa9676381c45 to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+2026-06-01 12:09:43,936 [WARNING] sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config: Config file not found at /root/autodl-tmp/sglang-omni-h20/venvs/sglang-omni-py312/lib/python3.12/site-packages/sglang/srt/layers/moe/fused_moe_triton/configs/triton_3_5_1/E=256,N=512,device_name=NVIDIA_H20.json. Fallback to triton version 3.4.0 and use MoE kernel config from /root/autodl-tmp/sglang-omni-h20/venvs/sglang-omni-py312/lib/python3.12/site-packages/sglang/srt/layers/moe/fused_moe_triton/configs/triton_3_4_0/E=256,N=512,device_name=NVIDIA_H20.json. Performance might be sub-optimal!
+2026-06-01 12:09:43,936 [WARNING] sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config: Using MoE kernel config with down_moe=False. Performance might be sub-optimal! Config file not found at /root/autodl-tmp/sglang-omni-h20/venvs/sglang-omni-py312/lib/python3.12/site-packages/sglang/srt/layers/moe/fused_moe_triton/configs/triton_3_5_1/E=256,N=512,device_name=NVIDIA_H20_down.json, you can create them with https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton
+2026-06-01 12:09:43,959 [WARNING] sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config: Config file not found at /root/autodl-tmp/sglang-omni-h20/venvs/sglang-omni-py312/lib/python3.12/site-packages/sglang/srt/layers/moe/fused_moe_triton/configs/triton_3_5_1/E=256,N=512,device_name=NVIDIA_H20.json. Fallback to triton version 3.4.0 and use MoE kernel config from /root/autodl-tmp/sglang-omni-h20/venvs/sglang-omni-py312/lib/python3.12/site-packages/sglang/srt/layers/moe/fused_moe_triton/configs/triton_3_4_0/E=256,N=512,device_name=NVIDIA_H20.json. Performance might be sub-optimal!
+2026-06-01 12:09:43,960 [WARNING] sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config: Using MoE kernel config with down_moe=False. Performance might be sub-optimal! Config file not found at /root/autodl-tmp/sglang-omni-h20/venvs/sglang-omni-py312/lib/python3.12/site-packages/sglang/srt/layers/moe/fused_moe_triton/configs/triton_3_5_1/E=256,N=512,device_name=NVIDIA_H20_down.json, you can create them with https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton
+INFO:     127.0.0.1:34128 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 12:15:58,893 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=70ddf736-30ef-4de0-8d63-ab7c9393f6ca to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+INFO:     127.0.0.1:34134 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 12:15:58,895 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=79cc36c3-640c-40c0-94de-faf60bef83b2 to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+INFO:     127.0.0.1:34148 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 12:15:58,903 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=d580c056-3c08-4565-94e3-c5bc59b8a03a to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+INFO:     127.0.0.1:34156 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 12:15:58,903 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=5ef8d24c-30ac-49b1-96cc-d1358fca6d2e to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+2026-06-01 12:16:02,971 [INFO] sglang_omni.engines.ar.sglang_backend.scheduler.prefill: Chunked prefill scheduled: rid=5ef8d24c-30ac-49b1-96cc-d1358fca6d2e projected=False extend_input_len=84
+INFO:     127.0.0.1:36024 - "GET /v1/models HTTP/1.1" 200 OK
+INFO:     127.0.0.1:35366 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 12:21:06,913 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=4eaf8744-2dfa-4be5-a3c3-4c643338a04b to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+INFO:     127.0.0.1:51638 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 12:22:52,400 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=43ab3f44-ff03-4ad4-a05c-952071dfc287 to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+INFO:     127.0.0.1:45486 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 12:23:53,907 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=3d2a5a5b-edc8-4765-8f16-69b3d9c7cf88 to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+INFO:     127.0.0.1:45490 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 12:23:53,907 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=cb041ca3-842e-4de2-9dc2-e84ff3e9ffa1 to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+2026-06-01 12:23:57,807 [INFO] sglang_omni.engines.ar.sglang_backend.scheduler.prefill: Chunked prefill scheduled: rid=cb041ca3-842e-4de2-9dc2-e84ff3e9ffa1 projected=False extend_input_len=50
+INFO:     127.0.0.1:53688 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 12:28:59,537 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=b4c9fce4-74fb-4e8c-b184-5351c56f7179 to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+INFO:     127.0.0.1:37342 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 12:30:02,678 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=a26550b8-dd42-4a3c-bfd2-997a9f4e0c8a to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+INFO:     127.0.0.1:48798 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 12:31:46,087 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=6114cb5f-955e-4126-a2ba-b655d44dbce5 to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+INFO:     127.0.0.1:48810 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 12:31:46,088 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=9717fffd-565e-418a-b216-6a2be049f928 to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+2026-06-01 12:31:49,676 [INFO] sglang_omni.engines.ar.sglang_backend.scheduler.prefill: Chunked prefill scheduled: rid=9717fffd-565e-418a-b216-6a2be049f928 projected=False extend_input_len=57
+INFO:     127.0.0.1:50170 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 12:36:01,070 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=9810688f-5d05-4d18-a919-4029bd2e62b1 to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+INFO:     127.0.0.1:48614 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 12:36:13,766 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=13b30a0f-89ab-48ff-8773-38769e35e2a0 to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+INFO:     127.0.0.1:50328 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 12:39:37,739 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=83ff95f2-81cd-454c-8546-c95a228c2ba8 to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+INFO:     127.0.0.1:50318 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 12:39:37,740 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=30bfd65f-2c14-491c-bd63-e8f62e21f8a2 to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+2026-06-01 12:39:41,328 [INFO] sglang_omni.engines.ar.sglang_backend.scheduler.prefill: Chunked prefill scheduled: rid=30bfd65f-2c14-491c-bd63-e8f62e21f8a2 projected=False extend_input_len=66
+INFO:     127.0.0.1:59660 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 12:43:52,466 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=2002bc1c-d607-453d-8bf3-d049351c7cd2 to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+INFO:     127.0.0.1:38540 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 12:44:05,153 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=a10bcb94-fb66-40c8-b49d-62eccc9ed58e to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+INFO:     127.0.0.1:36180 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 12:45:28,245 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=4e1e0029-b744-45c3-926c-a319dafeff98 to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+INFO:     127.0.0.1:59816 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 12:47:30,950 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=c34f2998-710a-4f8e-af7f-a4bf3da774cc to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+INFO:     127.0.0.1:46060 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 12:51:43,617 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=84eb6faf-9544-4a55-b7e2-041d10b952f7 to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+INFO:     127.0.0.1:45356 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 12:51:56,305 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=591c795d-2cf8-485a-af0b-5b23a72343d0 to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+INFO:     127.0.0.1:41360 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 12:53:19,368 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=9e698a54-0351-411f-8b0d-9a7eb956c27c to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+INFO:     127.0.0.1:50896 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 12:55:22,051 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=cb23d307-dcaa-4012-aa0b-b51451544305 to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+INFO:     127.0.0.1:57312 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 12:58:08,061 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=0e510b4e-7509-412d-a27f-5bdd66da0763 to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+INFO:     127.0.0.1:49092 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 12:59:27,548 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=c5f92d03-c57d-44ca-8ef2-6c2aa60c100c to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+INFO:     127.0.0.1:39966 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 12:59:42,002 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=fe638e81-97cf-4627-aa10-99dc083f5edb to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+INFO:     127.0.0.1:58562 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 13:00:52,962 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=69f2884a-362b-41df-a297-d02f2bebe247 to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+INFO:     127.0.0.1:37588 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 13:05:59,619 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=2b67b2b7-4600-46a0-81ed-7c3edfbb23c0 to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+INFO:     127.0.0.1:54354 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 13:06:46,608 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=1618e034-b1c4-4f4e-88ba-75457f7bd5d0 to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+INFO:     127.0.0.1:43650 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 13:07:20,969 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=c9d7797c-8e47-4b2b-b3ef-1eaddd4054f4 to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
+INFO:     127.0.0.1:47810 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+2026-06-01 13:07:35,449 [INFO] sglang_omni.pipeline.coordinator: Coordinator submitted req=8601a58e-96aa-4a61-9bed-b7f9df7e60a8 to preprocessing at ipc:///tmp/sglang_omni/model-yk6u9yic/stage_preprocessing.sock
