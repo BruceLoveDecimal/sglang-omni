@@ -175,21 +175,13 @@ def apply_thinker_result(
     if isinstance(result, ARRequestData):
         output_ids = list(result.output_ids)
         prompt_tokens = (
-            int(result.input_ids.shape[0])
-            if result.input_ids is not None and hasattr(result.input_ids, "shape")
-            else 0
+            int(result.input_ids.shape[0]) if result.input_ids is not None else 0
         )
-        finish_reason = None
-        req_finish_reason = getattr(
-            getattr(result, "req", None), "finished_reason", None
-        )
-        if hasattr(req_finish_reason, "to_json"):
-            finish_reason = req_finish_reason.to_json().get("type")
         thinker_out: ThinkerOutput = {
             "output_ids": output_ids,
             "step": len(output_ids),
             "is_final": True,
-            "finish_reason": finish_reason,
+            "finish_reason": result.finish_reason,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": len(output_ids),
             "extra_model_outputs": dict(result.extra_model_outputs),

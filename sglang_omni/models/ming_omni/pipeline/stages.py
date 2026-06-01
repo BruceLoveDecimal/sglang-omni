@@ -81,10 +81,7 @@ def _build_ming_text_stream_chunk(
     eos_token_id: int | None,
     step: int,
 ) -> dict[str, Any] | None:
-    try:
-        token_id = int(item)
-    except Exception:
-        return None
+    token_id = int(item)
 
     state = load_state(payload)
     thinker_out: ThinkerOutput = {
