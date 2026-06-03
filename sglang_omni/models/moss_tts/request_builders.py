@@ -23,6 +23,7 @@ from sglang_omni.scheduling.types import ARRequestData
 
 MOSS_TTS_DEFAULT_MAX_NEW_TOKENS = 4096
 _MOSS_TTS_PREPARED_MARKER = "_moss_tts_prepared_request"
+_MOSS_TTS_PREPARED_INLINE = "_moss_tts_prepared_payload"
 _TOKEN_PREFIX_RE = re.compile(r"^\$\{token:(\d+)\}")
 _TOKEN_PREFIX_START_RE = re.compile(r"^\$\{token:")
 _DATA_URI_RE = re.compile(r"^data:audio/[^;,]+;base64,(?P<data>.+)$", re.DOTALL)
@@ -117,6 +118,9 @@ class MossTTSPreprocessingContext:
 
 
 _PREPROCESSING_CONTEXT: MossTTSPreprocessingContext | None = None
+# Backward-compatible same-process cache fallback for payloads produced by older
+# code paths. Current preprocessing publishes the prepared handoff inline in the
+# StagePayload so TP/process-split AR stages can consume it.
 _PREPARED_REQUESTS: dict[str, MossTTSPreparedRequest] = {}
 # Request ids currently inside preprocess_moss_tts_payload.
 _INFLIGHT_REQUESTS: set[str] = set()
@@ -169,6 +173,9 @@ def pop_prepared_moss_tts_request(
 ) -> MossTTSPreparedRequest | None:
     data = payload.data if isinstance(payload.data, dict) else {}
     marker = data.get(_MOSS_TTS_PREPARED_MARKER)
+    inline = data.pop(_MOSS_TTS_PREPARED_INLINE, None)
+    if inline is not None:
+        return _prepared_from_payload(inline)
     if marker is None:
         return None
     with _PREPARED_REQUESTS_LOCK:
@@ -179,6 +186,32 @@ def pop_prepared_moss_tts_request(
             f"{marker!r}; the AR scheduler must not rebuild it"
         )
     return prepared
+
+
+def _prepared_to_payload(prepared: MossTTSPreparedRequest) -> dict[str, Any]:
+    return {
+        "state": prepared.state.to_dict(),
+        "input_ids_list": [int(token_id) for token_id in prepared.input_ids_list],
+        "input_ids": prepared.input_ids.detach().to(dtype=torch.long, device="cpu"),
+        "prompt_rows": prepared.prompt_rows.detach().to(dtype=torch.long, device="cpu"),
+        "gen_kwargs": dict(prepared.gen_kwargs),
+    }
+
+
+def _prepared_from_payload(data: Any) -> MossTTSPreparedRequest:
+    if not isinstance(data, dict):
+        raise RuntimeError("MOSS-TTS inline prepared payload must be a mapping")
+    input_ids_list = [int(token_id) for token_id in data.get("input_ids_list", [])]
+    input_ids = torch.as_tensor(data.get("input_ids", input_ids_list), dtype=torch.long)
+    prompt_rows = torch.as_tensor(data.get("prompt_rows"), dtype=torch.long)
+    gen_kwargs = data.get("gen_kwargs")
+    return MossTTSPreparedRequest(
+        state=MossTTSState.from_dict(data.get("state")),
+        input_ids_list=input_ids_list,
+        input_ids=input_ids.detach().cpu(),
+        prompt_rows=prompt_rows.detach().cpu(),
+        gen_kwargs=dict(gen_kwargs) if isinstance(gen_kwargs, dict) else {},
+    )
 
 
 def normalize_moss_tts_inputs(inputs: Any) -> tuple[str, list[dict[str, Any]]]:
@@ -485,12 +518,11 @@ def preprocess_moss_tts_payload(payload: StagePayload) -> StagePayload:
         _INFLIGHT_REQUESTS.discard(rid)
         aborted = rid in _ABORTED_REQUESTS
         _ABORTED_REQUESTS.discard(rid)
-        if not aborted:
-            # Aborted-while-preprocessing drops the handoff so it never lingers.
-            _PREPARED_REQUESTS[rid] = prepared
 
     data = prepared.state.to_dict()
     data[_MOSS_TTS_PREPARED_MARKER] = payload.request_id
+    if not aborted:
+        data[_MOSS_TTS_PREPARED_INLINE] = _prepared_to_payload(prepared)
     return StagePayload(
         request_id=payload.request_id, request=payload.request, data=data
     )

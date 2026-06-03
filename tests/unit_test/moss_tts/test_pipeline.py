@@ -165,9 +165,19 @@ def test_moss_tts_engine_uses_auto_mem_fraction_by_default(monkeypatch) -> None:
         server_args,
         gpu_id,
         *,
+        tp_rank=0,
+        nccl_port=None,
         model_arch_override=None,
+        total_gpu_memory_fraction=None,
     ):
         captured["gpu_id"] = gpu_id
+        captured.setdefault("infra_kwargs", []).append(
+            {
+                "tp_rank": tp_rank,
+                "nccl_port": nccl_port,
+                "total_gpu_memory_fraction": total_gpu_memory_fraction,
+            }
+        )
         captured["model_arch_override"] = model_arch_override
         model = object()
         model_runner = SimpleNamespace(
@@ -237,9 +247,16 @@ def test_moss_tts_engine_uses_auto_mem_fraction_by_default(monkeypatch) -> None:
 
     default_kwargs, explicit_kwargs = captured["build_kwargs"]
     assert default_kwargs["enable_torch_compile"] is False
+    assert default_kwargs["tp_size"] == 1
     assert "mem_fraction_static" not in default_kwargs
     assert explicit_kwargs["enable_torch_compile"] is True
     assert explicit_kwargs["mem_fraction_static"] == 0.61
+    assert explicit_kwargs["tp_size"] == 1
+    assert captured["infra_kwargs"][0] == {
+        "tp_rank": 0,
+        "nccl_port": None,
+        "total_gpu_memory_fraction": None,
+    }
     assert captured["context_length"] == 8192
     assert captured["model_arch_override"] == "MossTTSDelaySGLangModel"
     assert callable(captured["scheduler_kwargs"]["stream_output_builder"])
@@ -508,6 +525,10 @@ def test_moss_preprocess_and_sglang_request_handoff(
     try:
         set_moss_tts_preprocessing_context(processor=processor)
         prepared_payload = preprocess_moss_tts_payload(payload)
+        # Simulate TP/process-split execution: the AR stage must consume the
+        # prepared handoff from StagePayload, without relying on process-local
+        # preprocessing globals.
+        clear_moss_tts_preprocessing_context()
         data = build_sglang_moss_tts_request(prepared_payload, model=model)
     finally:
         clear_moss_tts_preprocessing_context()
@@ -987,7 +1008,8 @@ def test_moss_preprocess_discards_handoff_after_abort(
     monkeypatch.setattr(rb, "_prepare_moss_tts_request", fake_prepare)
     try:
         rb.set_moss_tts_preprocessing_context(processor=object())
-        rb.preprocess_moss_tts_payload(payload)
+        prepared_payload = rb.preprocess_moss_tts_payload(payload)
+        assert rb._MOSS_TTS_PREPARED_INLINE not in prepared_payload.data
         with rb._PREPARED_REQUESTS_LOCK:
             assert "abort-me" not in rb._PREPARED_REQUESTS
             assert not rb._PREPARED_REQUESTS
@@ -1063,9 +1085,12 @@ def test_moss_preprocess_pre_start_abort_does_not_block(
         with rb._PREPARED_REQUESTS_LOCK:
             assert not rb._ABORTED_REQUESTS
         # The same id can still run a normal preprocess and publish its handoff.
-        rb.preprocess_moss_tts_payload(make_payload(inputs="hello", request_id="ghost"))
+        prepared_payload = rb.preprocess_moss_tts_payload(
+            make_payload(inputs="hello", request_id="ghost")
+        )
+        assert rb._MOSS_TTS_PREPARED_INLINE in prepared_payload.data
         with rb._PREPARED_REQUESTS_LOCK:
-            assert "ghost" in rb._PREPARED_REQUESTS
+            assert "ghost" not in rb._PREPARED_REQUESTS
             assert not rb._ABORTED_REQUESTS
             assert not rb._INFLIGHT_REQUESTS
     finally:

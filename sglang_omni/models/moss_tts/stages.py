@@ -186,8 +186,12 @@ def create_sglang_tts_engine_executor(
     *,
     device: str = "cuda:0",
     gpu_id: int | None = None,
+    tp_rank: int = 0,
+    tp_size: int = 1,
+    nccl_port: int | None = None,
     dtype: str = "bfloat16",
     server_args_overrides: dict[str, Any] | None = None,
+    total_gpu_memory_fraction: float | None = None,
 ) -> Any:
     from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
     from sglang_omni.scheduling.bootstrap import create_sglang_infrastructure
@@ -217,6 +221,7 @@ def create_sglang_tts_engine_executor(
     }
     if server_args_overrides:
         overrides.update(server_args_overrides)
+    overrides["tp_size"] = tp_size
 
     server_args = build_sglang_server_args(
         checkpoint_dir,
@@ -239,7 +244,10 @@ def create_sglang_tts_engine_executor(
     ) = create_sglang_infrastructure(
         server_args,
         gpu_id,
+        tp_rank=tp_rank,
+        nccl_port=nccl_port,
         model_arch_override="MossTTSDelaySGLangModel",
+        total_gpu_memory_fraction=total_gpu_memory_fraction,
     )
 
     if want_cuda_graph:
