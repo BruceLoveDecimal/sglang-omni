@@ -4,6 +4,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from sglang_omni.models.moss_tts.codec import split_moss_audio_segments
@@ -243,3 +244,136 @@ def test_abort_frees_streaming_state() -> None:
     # Per-request streaming state and the latched payload are both released.
     assert "req" not in scheduler._stream_states
     assert "req" not in scheduler._stream_payloads
+
+
+def _drain_outbox(scheduler: MossStreamingVocoderScheduler) -> list:
+    messages = []
+    while not scheduler.outbox.empty():
+        messages.append(scheduler.outbox.get_nowait())
+    return messages
+
+
+def test_abort_mid_stream_suppresses_outbox_and_allows_reuse() -> None:
+    scheduler = _new_scheduler()
+    scheduler._on_streaming_new_request("req", _streaming_payload("req"))
+    scheduler._on_chunk("req", _row_item(0))
+    _drain_outbox(scheduler)
+
+    scheduler.abort("req")
+
+    # A late chunk after abort must neither leak to the outbox nor resurrect state.
+    scheduler._on_chunk("req", _row_item(1))
+    assert _drain_outbox(scheduler) == []
+    assert "req" not in scheduler._stream_states
+    assert "req" not in scheduler._stream_payloads
+
+    # The same id can start a fresh stream and finish normally afterwards.
+    scheduler._on_streaming_new_request("req", _streaming_payload("req"))
+    scheduler._on_chunk("req", _row_item(0))
+    scheduler._on_done("req")
+    messages = _drain_outbox(scheduler)
+    assert messages, "a reused request id must stream again after abort"
+    assert messages[-1].type == "result"
+
+
+def test_stream_metadata_n_vq_change_raises() -> None:
+    scheduler = _new_scheduler()
+    scheduler._on_streaming_new_request("req", _streaming_payload("req"))
+    scheduler._on_chunk("req", _row_item(0))
+
+    bad = StreamItem(
+        chunk_id=1,
+        data=torch.tensor([1, 2, 3], dtype=torch.long),
+        from_stage="tts_engine",
+        metadata={
+            "modality": "moss_delayed_audio_row",
+            "stream": True,
+            "n_vq": 3,
+            "audio_pad_code": 99,
+            "sample_rate": 24,
+        },
+    )
+    with pytest.raises(ValueError, match="n_vq changed"):
+        scheduler.on_stream_chunk("req", bad)
+
+
+def test_stream_metadata_audio_pad_code_change_raises() -> None:
+    scheduler = _new_scheduler()
+    scheduler._on_streaming_new_request("req", _streaming_payload("req"))
+    scheduler._on_chunk("req", _row_item(0))
+
+    bad = StreamItem(
+        chunk_id=1,
+        data=torch.tensor([1, 2], dtype=torch.long),
+        from_stage="tts_engine",
+        metadata={
+            "modality": "moss_delayed_audio_row",
+            "stream": True,
+            "n_vq": 2,
+            "audio_pad_code": 7,
+            "sample_rate": 24,
+        },
+    )
+    with pytest.raises(ValueError, match="audio_pad_code changed"):
+        scheduler.on_stream_chunk("req", bad)
+
+
+def test_stream_chunk_without_metadata_before_latch_raises() -> None:
+    scheduler = _new_scheduler()
+    scheduler._on_streaming_new_request("req", _streaming_payload("req"))
+
+    item = StreamItem(
+        chunk_id=0,
+        data=torch.tensor([1, 2], dtype=torch.long),
+        from_stage="tts_engine",
+        metadata=None,
+    )
+    with pytest.raises(RuntimeError, match="missing metadata"):
+        scheduler.on_stream_chunk("req", item)
+
+
+def test_stream_continuity_without_samples_per_frame() -> None:
+    # When the processor exposes no frame size, the first decoded window must
+    # latch one samples-per-frame so the stream still reconstructs the full
+    # decode without gaps or overlaps.
+    processor = _FakeMossProcessor()
+    frames = torch.tensor(
+        [[1, 2], [3, 4], [99, 99], [5, 6], [7, 8], [9, 10]],
+        dtype=torch.long,
+    )
+    delayed = _delayed_from_frames(frames)
+    state = _MossStreamState(n_vq=2, audio_pad_code=99, sample_rate=24)
+    outputs = []
+    for row in delayed:
+        state.delayed_rows.append(row)
+        outputs.extend(
+            _decode_stream_delta(
+                state,
+                processor=processor,
+                device=torch.device("cpu"),
+                stream_stride=2,
+                stream_followup_stride=2,
+                stream_overlap_tokens=1,
+                stream_holdback_tokens=0,
+                samples_per_frame=None,
+                is_final=False,
+            )
+        )
+    outputs.extend(
+        _decode_stream_delta(
+            state,
+            processor=processor,
+            device=torch.device("cpu"),
+            stream_stride=2,
+            stream_followup_stride=2,
+            stream_overlap_tokens=1,
+            stream_holdback_tokens=0,
+            samples_per_frame=None,
+            is_final=True,
+        )
+    )
+
+    streaming_audio = torch.cat([_audio_tensor(output) for output in outputs])
+    full_audio = _full_decode(_FakeMossProcessor(), delayed)
+    assert state.samples_per_frame is not None
+    torch.testing.assert_close(streaming_audio, full_audio)

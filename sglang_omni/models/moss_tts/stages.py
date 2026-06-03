@@ -312,7 +312,3 @@ def create_vocoder_executor(
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
     )
-
-
-def create_streaming_vocoder_executor(*args, **kwargs) -> MossStreamingVocoderScheduler:
-    return create_vocoder_executor(*args, **kwargs)

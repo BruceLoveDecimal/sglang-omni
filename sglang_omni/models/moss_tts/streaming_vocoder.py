@@ -9,7 +9,10 @@ from typing import Any
 import torch
 
 from sglang_omni.models.moss_tts.codec import split_moss_audio_segments
-from sglang_omni.models.moss_tts.payload_types import MossTTSState
+from sglang_omni.models.moss_tts.payload_types import (
+    MossTTSState,
+    resolve_moss_audio_pad_code,
+)
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
@@ -26,12 +29,14 @@ class _MossSegmentDecodeState:
 class _MossStreamState:
     delayed_rows: list[torch.Tensor] = field(default_factory=list)
     segment_states: list[_MossSegmentDecodeState] = field(default_factory=list)
-    emitted_audio_chunks: list[torch.Tensor] = field(default_factory=list)
     next_decode_rows: int = 0
     has_emitted: bool = False
     n_vq: int | None = None
     audio_pad_code: int | None = None
     sample_rate: int = 24000
+    # Latched once from the first decoded window so every chunk trims on the
+    # same samples-per-frame and the stream stays gap-free.
+    samples_per_frame: int | None = None
 
 
 def _as_audio_tensor(value: Any) -> torch.Tensor:
@@ -145,6 +150,12 @@ def _decode_stream_delta(
     while len(state.segment_states) < len(segments):
         state.segment_states.append(_MossSegmentDecodeState())
 
+    # A config-provided rate wins; otherwise reuse whatever the first window
+    # already latched so the trim boundary never drifts between chunks.
+    stable_spf = (
+        samples_per_frame if samples_per_frame is not None else state.samples_per_frame
+    )
+
     chunks: list[dict[str, Any]] = []
     for idx, segment in enumerate(segments):
         segment_state = state.segment_states[idx]
@@ -159,12 +170,15 @@ def _decode_stream_delta(
         if audio is None or audio.numel() == 0:
             continue
 
-        decoded_frames = total_frames - window_start
-        spf = samples_per_frame or max(int(audio.shape[-1]) // max(decoded_frames, 1), 1)
+        if stable_spf is None:
+            decoded_frames = total_frames - window_start
+            stable_spf = max(int(audio.shape[-1]) // max(decoded_frames, 1), 1)
+            state.samples_per_frame = stable_spf
+        spf = stable_spf
         trim_frames = emitted_frames - window_start
         trim_samples = min(int(trim_frames * spf), int(audio.shape[-1]))
         segment_is_closed = is_final or idx < len(segments) - 1
-        if not segment_is_closed and samples_per_frame is not None:
+        if not segment_is_closed:
             new_frames = total_frames - emitted_frames
             emit_samples = int(new_frames * spf)
             delta = audio[trim_samples : trim_samples + emit_samples].contiguous()
@@ -175,7 +189,6 @@ def _decode_stream_delta(
 
         segment_state.emitted_frames = total_frames
         state.has_emitted = True
-        state.emitted_audio_chunks.append(delta.detach().cpu())
         chunks.append(
             audio_waveform_payload(
                 delta,
@@ -242,13 +255,18 @@ class MossStreamingVocoderScheduler(StreamingSimpleScheduler):
         self._prepare_vocoder_item(payload)
 
     def on_streaming_new_request(self, request_id: str, payload: StagePayload) -> None:
-        stream_state = self._stream_states.setdefault(request_id, _MossStreamState())
-        if stream_state.n_vq is None and not stream_state.delayed_rows:
-            stream_state.sample_rate = self._resolve_payload_sample_rate(payload)
+        # Always start from a clean state so a reused id never inherits rows left
+        # behind by an aborted attempt.
+        stream_state = _MossStreamState()
+        stream_state.sample_rate = self._resolve_payload_sample_rate(payload)
+        self._stream_states[request_id] = stream_state
 
     def on_stream_chunk(
         self, request_id: str, item: StreamItem
     ) -> list[OutgoingMessage]:
+        if self._is_aborted(request_id):
+            # A late chunk for an aborted request must not resurrect state.
+            return []
         stream_state = self._stream_states.setdefault(request_id, _MossStreamState())
         self._latch_stream_metadata(request_id, stream_state, item.metadata)
         row = item.data
@@ -393,12 +411,8 @@ class MossStreamingVocoderScheduler(StreamingSimpleScheduler):
         delayed_codes: torch.Tensor,
     ) -> tuple[torch.Tensor, int]:
         delayed_codes = delayed_codes.to(device=self._device, dtype=torch.long)
-        audio_pad_code = int(
-            getattr(
-                getattr(self._processor, "model_config", None),
-                "audio_pad_code",
-                1024,
-            )
+        audio_pad_code = resolve_moss_audio_pad_code(
+            getattr(self._processor, "model_config", None)
         )
         segments = split_moss_audio_segments(
             delayed_codes,
@@ -444,22 +458,16 @@ class MossStreamingVocoderScheduler(StreamingSimpleScheduler):
         payload: StagePayload,
         stream_state: _MossStreamState,
     ) -> StagePayload:
+        # The audio (including the final tail) already left as stream chunks, so
+        # the terminal result carries no waveform — only usage/metadata. This
+        # keeps a long stream bounded in host memory and matches the terminal
+        # SSE event, whose ``audio`` is always null.
         state = MossTTSState.from_dict(payload.data)
         state.delayed_audio_codes = None
         state.sample_rate = int(stream_state.sample_rate or state.sample_rate)
-        if stream_state.emitted_audio_chunks:
-            wav = torch.cat(stream_state.emitted_audio_chunks, dim=0)
-        else:
-            wav = torch.empty(0, dtype=torch.float32)
         data = state.to_dict()
-        data.update(
-            audio_waveform_payload(
-                wav,
-                sample_rate=state.sample_rate,
-                modality="audio",
-                source_hint="MOSS-TTS streaming",
-            )
-        )
+        data["modality"] = "audio"
+        data["sample_rate"] = state.sample_rate
         usage = _build_usage(state)
         if usage is not None:
             data["usage"] = usage

@@ -16,7 +16,10 @@ from typing import Any
 
 import torch
 
-from sglang_omni.models.moss_tts.payload_types import MossTTSState
+from sglang_omni.models.moss_tts.payload_types import (
+    MossTTSState,
+    resolve_moss_audio_pad_code,
+)
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.types import ARRequestData
@@ -118,9 +121,8 @@ class MossTTSPreprocessingContext:
 
 
 _PREPROCESSING_CONTEXT: MossTTSPreprocessingContext | None = None
-# Backward-compatible same-process cache fallback for payloads produced by older
-# code paths. Current preprocessing publishes the prepared handoff inline in the
-# StagePayload so TP/process-split AR stages can consume it.
+# note (gaokai): same-process fallback only; the inline StagePayload handoff is
+# the path TP/process-split AR stages actually use.
 _PREPARED_REQUESTS: dict[str, MossTTSPreparedRequest] = {}
 # Request ids currently inside preprocess_moss_tts_payload.
 _INFLIGHT_REQUESTS: set[str] = set()
@@ -535,10 +537,8 @@ def _last_equal(rows: torch.Tensor, value: int) -> int:
     return int(matches[-1].item())
 
 
-def _resolve_audio_payload_bounds(
-    rows: torch.Tensor, cfg: Any
-) -> tuple[int, int] | None:
-    text = rows[:, 0].to(dtype=torch.long)
+def _resolve_audio_payload_start(text: torch.Tensor, cfg: Any) -> int | None:
+    """Locate the first generated audio row (shared by full and stream bounds)."""
     bos_pos = (text == int(cfg.audio_start_token_id)).nonzero(as_tuple=False)
     if bos_pos.numel() == 0:
         gen_pos = (text == int(cfg.audio_assistant_gen_slot_token_id)).nonzero(
@@ -546,9 +546,17 @@ def _resolve_audio_payload_bounds(
         )
         if gen_pos.numel() == 0:
             return None
-        start = int(gen_pos[0].item())
-    else:
-        start = int(bos_pos[0].item()) + 1
+        return int(gen_pos[0].item())
+    return int(bos_pos[0].item()) + 1
+
+
+def _resolve_audio_payload_bounds(
+    rows: torch.Tensor, cfg: Any
+) -> tuple[int, int] | None:
+    text = rows[:, 0].to(dtype=torch.long)
+    start = _resolve_audio_payload_start(text, cfg)
+    if start is None:
+        return None
 
     eos_pos = (text[start:] == int(cfg.audio_end_token_id)).nonzero(as_tuple=False)
     if eos_pos.numel() > 0:
@@ -575,27 +583,15 @@ def _resolve_audio_payload_bounds(
 def _resolve_audio_payload_stream_bounds(
     rows: torch.Tensor, cfg: Any
 ) -> tuple[int, int] | None:
-    """Resolve the currently streamable delayed-audio row range.
-
-    This mirrors ``_resolve_audio_payload_bounds`` for the start row, but treats
-    the current row count as an open-ended stream until an audio-end token is
-    observed. The returned slice excludes ``audio_start`` and ``audio_end`` rows,
-    matching the terminal full-response payload.
-    """
+    """Streamable delayed-audio row range: same start as the full payload, but
+    open-ended until an audio-end token is observed."""
 
     if rows.ndim != 2 or rows.numel() == 0:
         return None
     text = rows[:, 0].to(dtype=torch.long)
-    bos_pos = (text == int(cfg.audio_start_token_id)).nonzero(as_tuple=False)
-    if bos_pos.numel() == 0:
-        gen_pos = (text == int(cfg.audio_assistant_gen_slot_token_id)).nonzero(
-            as_tuple=False
-        )
-        if gen_pos.numel() == 0:
-            return None
-        start = int(gen_pos[0].item())
-    else:
-        start = int(bos_pos[0].item()) + 1
+    start = _resolve_audio_payload_start(text, cfg)
+    if start is None:
+        return None
 
     eos_pos = (text[start:] == int(cfg.audio_end_token_id)).nonzero(as_tuple=False)
     if eos_pos.numel() > 0:
@@ -623,9 +619,8 @@ def _moss_stream_metadata(
         "modality": "moss_delayed_audio_row",
         "stream": True,
         "n_vq": int(n_vq),
-        "audio_pad_code": int(getattr(cfg, "audio_pad_code", 1024)),
-        # Streamed rows are already sliced to the audio payload bounds, so the
-        # vocoder should not apply the assistant-prefix trim again.
+        "audio_pad_code": resolve_moss_audio_pad_code(cfg),
+        # Rows are pre-sliced to payload bounds; no assistant-prefix trim downstream.
         "assistant_start_length": 0,
         "sample_rate": sample_rate,
     }

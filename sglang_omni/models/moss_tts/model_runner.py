@@ -102,6 +102,11 @@ class MossTTSModelRunner(ModelRunner):
         forward_batch: Any,
         input_embeds: torch.Tensor,
     ) -> GenerationBatchResult:
+        # MOSS owns prefill to inject pre-projected multi-channel embeds, so it
+        # must init attn metadata itself (the standard
+        # tp_worker.forward_batch_generation path would otherwise do it).
+        # note (gaokai): can_run_cuda_graph stays False for the eager baseline;
+        # the graph-capture path lands with CUDA Graph + torch.compile.
         model_runner = self.tp_worker.model_runner
         model_runner.attn_backend.init_forward_metadata(forward_batch)
 

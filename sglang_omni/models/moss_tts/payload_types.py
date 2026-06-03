@@ -24,6 +24,19 @@ def moss_tts_special_token_defaults(
     )
 
 
+def resolve_moss_audio_pad_code(cfg: Any) -> int:
+    """Resolve ``audio_pad_code`` from a config object.
+
+    Falls back to the shared default keyed on ``audio_vocab_size`` rather than a
+    bare ``1024`` literal, so a non-default vocab stays consistent everywhere."""
+    value = getattr(cfg, "audio_pad_code", None)
+    if value is not None:
+        return int(value)
+    vocab = getattr(cfg, "audio_vocab_size", None)
+    defaults = dict(moss_tts_special_token_defaults(int(vocab) if vocab else 1024))
+    return int(defaults["audio_pad_code"])
+
+
 @dataclass
 class MossTTSState:
     """Per-request state for MOSS-TTS Delay generation."""
