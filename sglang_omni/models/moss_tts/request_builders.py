@@ -121,8 +121,8 @@ class MossTTSPreprocessingContext:
 
 
 _PREPROCESSING_CONTEXT: MossTTSPreprocessingContext | None = None
-# note (gaokai): same-process fallback only; the inline StagePayload handoff is
-# the path TP/process-split AR stages actually use.
+# Same-process fallback only; the inline StagePayload handoff is the path
+# TP/process-split AR stages actually use.
 _PREPARED_REQUESTS: dict[str, MossTTSPreparedRequest] = {}
 # Request ids currently inside preprocess_moss_tts_payload.
 _INFLIGHT_REQUESTS: set[str] = set()
@@ -341,9 +341,9 @@ def build_generation_kwargs(
 
     generation_kwargs: dict[str, Any] = {
         "max_new_tokens": max_new_tokens,
-        # note (chenyang): the checkpoint's own generate() defaults; greedy
-        # (temperature=0) collapses the codec LM into copying the reference
-        # audio. Callers may override any field.
+        # The checkpoint's own generate() defaults; greedy (temperature=0)
+        # collapses the codec LM into copying the reference audio. Callers may
+        # override any field.
         "text_temperature": 1.5,
         "audio_temperature": 1.7,
         "text_top_p": 1.0,
