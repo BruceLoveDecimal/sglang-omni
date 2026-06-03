@@ -236,11 +236,7 @@ class MossStreamingVocoderScheduler(StreamingSimpleScheduler):
 
     def is_streaming_payload(self, payload: StagePayload) -> bool:
         params = payload.request.params
-        if not isinstance(params, dict):
-            raise TypeError(
-                f"MOSS-TTS request params must be a dict, got {type(params).__name__}"
-            )
-        return bool(params.get("stream", False))
+        return isinstance(params, dict) and bool(params.get("stream", False))
 
     def validate_non_streaming_payload(self, payload: StagePayload) -> None:
         self._prepare_vocoder_item(payload)

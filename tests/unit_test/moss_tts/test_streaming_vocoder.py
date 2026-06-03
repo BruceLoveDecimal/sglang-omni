@@ -218,6 +218,17 @@ def _new_scheduler() -> MossStreamingVocoderScheduler:
     )
 
 
+def test_is_streaming_payload_treats_malformed_params_as_non_streaming() -> None:
+    scheduler = _new_scheduler()
+    payload = StagePayload(
+        request_id="req",
+        request=OmniRequest(inputs="hi", params=["stream"]),  # type: ignore[arg-type]
+        data={},
+    )
+
+    assert scheduler.is_streaming_payload(payload) is False
+
+
 def test_abort_frees_streaming_state() -> None:
     scheduler = _new_scheduler()
     scheduler._on_streaming_new_request("req", _streaming_payload("req"))
