@@ -30,6 +30,7 @@ from sglang_omni.models.moss_tts.request_builders import (
     build_row_cache_key_ids,
     build_sglang_moss_tts_request,
     clear_moss_tts_preprocessing_context,
+    make_moss_tts_stream_output_builder,
     preprocess_moss_tts_payload,
     set_moss_tts_preprocessing_context,
 )
@@ -129,6 +130,10 @@ def test_moss_tts_config_and_registry_contracts() -> None:
     assert config.terminal_stages == ["vocoder"]
     assert config.gpu_placement == {"tts_engine": 0, "vocoder": 0}
     assert {stage.process for stage in config.stages} == {"pipeline"}
+    tts_engine = next(stage for stage in config.stages if stage.name == "tts_engine")
+    vocoder = next(stage for stage in config.stages if stage.name == "vocoder")
+    assert tts_engine.stream_to == ["vocoder"]
+    assert vocoder.can_accept_stream_before_payload is True
     assert (
         PIPELINE_CONFIG_REGISTRY.get_config("MossTTSDelayModel")
         is MossTTSPipelineConfig
@@ -237,6 +242,7 @@ def test_moss_tts_engine_uses_auto_mem_fraction_by_default(monkeypatch) -> None:
     assert explicit_kwargs["mem_fraction_static"] == 0.61
     assert captured["context_length"] == 8192
     assert captured["model_arch_override"] == "MossTTSDelaySGLangModel"
+    assert callable(captured["scheduler_kwargs"]["stream_output_builder"])
 
 
 def test_moss_tts_talker_torch_compile_cli_override_targets_tts_engine() -> None:
@@ -806,6 +812,80 @@ def test_moss_post_process_outputs_skips_im_end() -> None:
     assert len(requests[0].data.pending_feedback_queue) == 1
     assert requests[1].data.output_rows == []
     assert requests[1].data.pending_feedback_queue == []
+
+
+def test_moss_stream_output_builder_emits_audio_rows_once() -> None:
+    builder = make_moss_tts_stream_output_builder()
+    cfg = SimpleNamespace(
+        audio_start_token_id=10,
+        audio_end_token_id=11,
+        audio_assistant_gen_slot_token_id=12,
+        audio_assistant_delay_slot_token_id=13,
+        audio_pad_code=1024,
+    )
+    payload = StagePayload(
+        request_id="req",
+        request=OmniRequest(inputs="hello", params={"stream": True}),
+        data={},
+    )
+    data = SimpleNamespace(
+        stage_payload=payload,
+        req=SimpleNamespace(is_chunked=0),
+        model_config=cfg,
+        state=SimpleNamespace(sample_rate=24000),
+        assistant_prefix_rows=torch.tensor(
+            [
+                [1, 1024, 1024],
+                [10, 1024, 1024],
+                [12, 7, 1024],
+            ],
+            dtype=torch.long,
+        ),
+        output_rows=[
+            torch.tensor([12, 8, 9], dtype=torch.long),
+        ],
+        streamed_row_count=0,
+    )
+
+    messages = builder("req", data, SimpleNamespace(data=12))
+
+    assert [msg.data.tolist() for msg in messages] == [[7, 1024], [8, 9]]
+    assert [msg.metadata["row_index"] for msg in messages] == [0, 1]
+    assert [msg.metadata["request_id"] for msg in messages] == ["req", "req"]
+    assert all(msg.target == "vocoder" for msg in messages)
+    assert all(msg.metadata["modality"] == "moss_delayed_audio_row" for msg in messages)
+    assert data.streamed_row_count == 2
+
+    data.output_rows.append(torch.tensor([12, 10, 11], dtype=torch.long))
+    messages = builder("req", data, SimpleNamespace(data=12))
+
+    assert [msg.data.tolist() for msg in messages] == [[10, 11]]
+    assert messages[0].metadata["row_index"] == 2
+    assert data.streamed_row_count == 3
+
+    data.output_rows.append(torch.tensor([11, 1024, 1024], dtype=torch.long))
+    assert builder("req", data, SimpleNamespace(data=11)) == []
+    assert data.streamed_row_count == 3
+
+
+def test_moss_stream_output_builder_skips_non_streaming_requests() -> None:
+    builder = make_moss_tts_stream_output_builder()
+    payload = StagePayload(
+        request_id="req",
+        request=OmniRequest(inputs="hello", params={"stream": False}),
+        data={},
+    )
+    data = SimpleNamespace(
+        stage_payload=payload,
+        req=SimpleNamespace(is_chunked=0),
+        model_config=SimpleNamespace(),
+        state=SimpleNamespace(sample_rate=24000),
+        assistant_prefix_rows=None,
+        output_rows=[torch.tensor([12, 8, 9], dtype=torch.long)],
+        streamed_row_count=0,
+    )
+
+    assert builder("req", data, SimpleNamespace(data=12)) == []
 
 
 def test_moss_delay_codec_splits_non_pad_segments() -> None:

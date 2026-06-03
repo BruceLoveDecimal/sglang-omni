@@ -7,6 +7,7 @@ from typing import Any
 
 import torch
 from sglang.srt.layers.sampler import multinomial_with_seed
+from sglang.srt.managers.scheduler import GenerationBatchResult
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.models.moss_tts.request_builders import _INF_DELAY
@@ -29,12 +30,10 @@ class MossTTSModelRunner(ModelRunner):
         forward_batch: Any,
         schedule_batch: Any,
         requests: list,
-    ) -> None:
+    ) -> GenerationBatchResult:
         del schedule_batch
-        forward_batch.input_embeds = self._build_prefill_input_embeds(
-            forward_batch, requests
-        )
-        return None
+        input_embeds = self._build_prefill_input_embeds(forward_batch, requests)
+        return self._forward_with_input_embeds(forward_batch, input_embeds)
 
     def before_decode(
         self,
@@ -96,6 +95,33 @@ class MossTTSModelRunner(ModelRunner):
         return torch.cat(pieces, dim=0).to(
             device=forward_batch.input_ids.device,
             dtype=self.model.dtype,
+        )
+
+    def _forward_with_input_embeds(
+        self,
+        forward_batch: Any,
+        input_embeds: torch.Tensor,
+    ) -> GenerationBatchResult:
+        model_runner = self.tp_worker.model_runner
+        model_runner.attn_backend.init_forward_metadata(forward_batch)
+
+        positions = forward_batch.positions
+        if forward_batch.mrope_positions is not None:
+            positions = forward_batch.mrope_positions
+        input_embeds = input_embeds.to(
+            device=forward_batch.input_ids.device,
+            dtype=self.model.dtype,
+        )
+        logits_output = self.model(
+            input_ids=forward_batch.input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
+            input_embeds=input_embeds,
+            input_embeds_are_projected=True,
+        )
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            can_run_cuda_graph=False,
         )
 
     def _write_decode_input_embedding(

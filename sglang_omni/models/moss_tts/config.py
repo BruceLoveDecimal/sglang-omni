@@ -44,6 +44,7 @@ class MossTTSPipelineConfig(PipelineConfig):
             factory_args={"gpu_id": 0, "dtype": "bfloat16"},
             gpu=0,
             next="vocoder",
+            stream_to=["vocoder"],
         ),
         StageConfig(
             name="vocoder",
@@ -52,6 +53,7 @@ class MossTTSPipelineConfig(PipelineConfig):
             factory_args={"gpu_id": 0, "dtype": "float32"},
             gpu=0,
             terminal=True,
+            can_accept_stream_before_payload=True,
         ),
     ]
 

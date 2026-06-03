@@ -18,6 +18,7 @@ import torch
 
 from sglang_omni.models.moss_tts.payload_types import MossTTSState
 from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.messages import OutgoingMessage
 from sglang_omni.scheduling.types import ARRequestData
 
 MOSS_TTS_DEFAULT_MAX_NEW_TOKENS = 4096
@@ -81,6 +82,7 @@ class MossTTSSGLangRequestData(ARRequestData):
     prompt_rows: torch.Tensor | None = None
     assistant_prefix_rows: torch.Tensor | None = None
     output_rows: list[torch.Tensor] = field(default_factory=list)
+    streamed_row_count: int = 0
     pending_feedback_queue: Any = field(default_factory=collections.deque)
     text_temperature: float = 1.5
     text_top_p: float = 1.0
@@ -536,6 +538,135 @@ def _resolve_audio_payload_bounds(
     if end <= start or end <= start + n_vq:
         return None
     return start, end
+
+
+def _resolve_audio_payload_stream_bounds(
+    rows: torch.Tensor, cfg: Any
+) -> tuple[int, int] | None:
+    """Resolve the currently streamable delayed-audio row range.
+
+    This mirrors ``_resolve_audio_payload_bounds`` for the start row, but treats
+    the current row count as an open-ended stream until an audio-end token is
+    observed. The returned slice excludes ``audio_start`` and ``audio_end`` rows,
+    matching the terminal full-response payload.
+    """
+
+    if rows.ndim != 2 or rows.numel() == 0:
+        return None
+    text = rows[:, 0].to(dtype=torch.long)
+    bos_pos = (text == int(cfg.audio_start_token_id)).nonzero(as_tuple=False)
+    if bos_pos.numel() == 0:
+        gen_pos = (text == int(cfg.audio_assistant_gen_slot_token_id)).nonzero(
+            as_tuple=False
+        )
+        if gen_pos.numel() == 0:
+            return None
+        start = int(gen_pos[0].item())
+    else:
+        start = int(bos_pos[0].item()) + 1
+
+    eos_pos = (text[start:] == int(cfg.audio_end_token_id)).nonzero(as_tuple=False)
+    if eos_pos.numel() > 0:
+        end = start + int(eos_pos[0].item())
+    else:
+        end = int(rows.shape[0])
+    if end <= start:
+        return None
+    return start, end
+
+
+def _moss_stream_metadata(
+    data: MossTTSSGLangRequestData,
+    *,
+    cfg: Any,
+    n_vq: int,
+) -> dict[str, Any]:
+    sample_rate = int(
+        data.state.sample_rate
+        or getattr(cfg, "sampling_rate", 0)
+        or getattr(getattr(cfg, "audio_tokenizer_config", None), "sampling_rate", 0)
+        or 24000
+    )
+    return {
+        "modality": "moss_delayed_audio_row",
+        "stream": True,
+        "n_vq": int(n_vq),
+        "audio_pad_code": int(getattr(cfg, "audio_pad_code", 1024)),
+        # Streamed rows are already sliced to the audio payload bounds, so the
+        # vocoder should not apply the assistant-prefix trim again.
+        "assistant_start_length": 0,
+        "sample_rate": sample_rate,
+    }
+
+
+def make_moss_tts_stream_output_builder():
+    """Build delayed-audio row chunks for the MOSS streaming vocoder."""
+
+    def _build_stream_output(
+        request_id: str, req_data: Any, req_output: Any
+    ) -> list[OutgoingMessage]:
+        del req_output
+        stage_payload = getattr(req_data, "stage_payload", None)
+        params = getattr(getattr(stage_payload, "request", None), "params", None)
+        if not isinstance(params, dict) or not bool(params.get("stream", False)):
+            return []
+
+        req = getattr(req_data, "req", None)
+        if req is not None and int(getattr(req, "is_chunked", 0) or 0) > 0:
+            return []
+
+        cfg = getattr(req_data, "model_config", None)
+        output_rows = getattr(req_data, "output_rows", None)
+        if cfg is None or not output_rows:
+            return []
+        generated_rows = torch.stack(output_rows, dim=0).to(dtype=torch.long)
+
+        assistant_prefix_rows = getattr(req_data, "assistant_prefix_rows", None)
+        if (
+            isinstance(assistant_prefix_rows, torch.Tensor)
+            and assistant_prefix_rows.numel() > 0
+        ):
+            rows = torch.cat(
+                [assistant_prefix_rows.to(generated_rows.device), generated_rows],
+                dim=0,
+            )
+        else:
+            rows = generated_rows
+
+        bounds = _resolve_audio_payload_stream_bounds(rows, cfg)
+        if bounds is None:
+            return []
+        start, end = bounds
+        payload_rows = rows[start:end]
+        emitted = int(getattr(req_data, "streamed_row_count", 0) or 0)
+        if emitted >= int(payload_rows.shape[0]):
+            return []
+
+        new_rows = payload_rows[emitted:]
+        req_data.streamed_row_count = int(payload_rows.shape[0])
+        n_vq = int(new_rows.shape[1] - 1)
+        if n_vq <= 0:
+            return []
+        metadata = _moss_stream_metadata(req_data, cfg=cfg, n_vq=n_vq)
+        messages: list[OutgoingMessage] = []
+        base_row_index = emitted
+        for offset, row in enumerate(new_rows):
+            row_index = base_row_index + offset
+            row_metadata = dict(metadata)
+            row_metadata["row_index"] = int(row_index)
+            row_metadata["request_id"] = request_id
+            messages.append(
+                OutgoingMessage(
+                    request_id=request_id,
+                    type="stream",
+                    target="vocoder",
+                    data=row[1:].detach().to(dtype=torch.long).cpu().clone(),
+                    metadata=row_metadata,
+                )
+            )
+        return messages
+
+    return _build_stream_output
 
 
 def _initialize_generation_state(
