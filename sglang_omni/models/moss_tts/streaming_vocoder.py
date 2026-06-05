@@ -255,11 +255,8 @@ class MossStreamingVocoderScheduler(StreamingSimpleScheduler):
         self._prepare_vocoder_item(payload)
 
     def on_streaming_new_request(self, request_id: str, payload: StagePayload) -> None:
-        # Always start from a clean state so a reused id never inherits rows left
-        # behind by an aborted attempt.
-        stream_state = _MossStreamState()
+        stream_state = self._stream_states.setdefault(request_id, _MossStreamState())
         stream_state.sample_rate = self._resolve_payload_sample_rate(payload)
-        self._stream_states[request_id] = stream_state
 
     def on_stream_chunk(
         self, request_id: str, item: StreamItem
@@ -280,7 +277,9 @@ class MossStreamingVocoderScheduler(StreamingSimpleScheduler):
             )
         n_vq = stream_state.n_vq
         if n_vq is None:
-            raise RuntimeError(f"MOSS-TTS stream metadata missing n_vq for {request_id}")
+            raise RuntimeError(
+                f"MOSS-TTS stream metadata missing n_vq for {request_id}"
+            )
         if int(row.shape[0]) != int(n_vq):
             raise ValueError(
                 f"MOSS-TTS stream row for {request_id!r} has {int(row.shape[0])} "
@@ -425,7 +424,9 @@ class MossStreamingVocoderScheduler(StreamingSimpleScheduler):
         if not decoded:
             raise RuntimeError("MOSS-TTS vocoder decoded no audio segments")
         waveforms = [_as_audio_tensor(wav) for wav in decoded]
-        return torch.cat(waveforms, dim=0), self._resolve_payload_or_processor_rate(state)
+        return torch.cat(waveforms, dim=0), self._resolve_payload_or_processor_rate(
+            state
+        )
 
     def _resolve_payload_or_processor_rate(self, state: MossTTSState) -> int:
         return int(self._sample_rate or state.sample_rate or 24000)

@@ -620,12 +620,30 @@ def test_moss_prefill_forward_uses_prompt_row_embeds() -> None:
         dtype = torch.float32
         hidden_size = 2
 
+        def __init__(self):
+            self.forward_kwargs = None
+
         def _prepare_multi_modal_inputs(self, rows):
             return rows.to(torch.float32)[:, :2]
 
+        def __call__(self, **kwargs):
+            self.forward_kwargs = kwargs
+            return "logits"
+
+    class FakeAttnBackend:
+        def __init__(self):
+            self.forward_batch = None
+
+        def init_forward_metadata(self, forward_batch):
+            self.forward_batch = forward_batch
+
     model = FakeModel()
+    attn_backend = FakeAttnBackend()
     runner = MossTTSModelRunner.__new__(MossTTSModelRunner)
     runner.model = model
+    runner.tp_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(attn_backend=attn_backend)
+    )
     prompt_rows = torch.tensor(
         [[1, 2, 3], [4, 5, 6], [7, 8, 9]],
         dtype=torch.long,
@@ -644,10 +662,15 @@ def test_moss_prefill_forward_uses_prompt_row_embeds() -> None:
 
     result = runner.custom_prefill_forward(forward_batch, object(), [sched_req])
 
-    assert result is None
+    assert result.logits_output == "logits"
+    assert result.can_run_cuda_graph is False
+    assert attn_backend.forward_batch is forward_batch
     assert torch.equal(forward_batch.input_ids, torch.tensor([123456, 123457]))
+    assert model.forward_kwargs["positions"] is forward_batch.positions
+    assert model.forward_kwargs["forward_batch"] is forward_batch
+    assert model.forward_kwargs["input_embeds_are_projected"] is True
     assert torch.equal(
-        forward_batch.input_embeds,
+        model.forward_kwargs["input_embeds"],
         torch.tensor([[4.0, 5.0], [7.0, 8.0]]),
     )
 
@@ -909,6 +932,49 @@ def test_moss_stream_output_builder_skips_non_streaming_requests() -> None:
     assert builder("req", data, SimpleNamespace(data=12)) == []
 
 
+def test_moss_stream_output_builder_does_not_restack_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = make_moss_tts_stream_output_builder()
+    cfg = SimpleNamespace(
+        audio_start_token_id=10,
+        audio_end_token_id=11,
+        audio_assistant_gen_slot_token_id=12,
+        audio_assistant_delay_slot_token_id=13,
+        audio_pad_code=1024,
+    )
+    payload = StagePayload(
+        request_id="req",
+        request=OmniRequest(inputs="hello", params={"stream": True}),
+        data={},
+    )
+    data = SimpleNamespace(
+        stage_payload=payload,
+        req=SimpleNamespace(is_chunked=0),
+        model_config=cfg,
+        state=SimpleNamespace(sample_rate=24000),
+        assistant_prefix_rows=torch.tensor(
+            [[10, 1024, 1024]],
+            dtype=torch.long,
+        ),
+        output_rows=[
+            torch.tensor([12, 1, 2], dtype=torch.long),
+            torch.tensor([12, 3, 4], dtype=torch.long),
+        ],
+        streamed_row_count=0,
+    )
+
+    def fail_stack(*args, **kwargs):
+        raise AssertionError("stream builder must not stack the full row history")
+
+    monkeypatch.setattr(torch, "stack", fail_stack)
+
+    messages = builder("req", data, SimpleNamespace(data=12))
+
+    assert [msg.data.tolist() for msg in messages] == [[1, 2], [3, 4]]
+    assert data.streamed_row_count == 2
+
+
 def test_moss_delay_codec_splits_non_pad_segments() -> None:
     delayed = torch.tensor(
         [
@@ -1010,9 +1076,9 @@ def test_moss_preprocess_discards_handoff_after_abort(
         rb.set_moss_tts_preprocessing_context(processor=object())
         prepared_payload = rb.preprocess_moss_tts_payload(payload)
         assert rb._MOSS_TTS_PREPARED_INLINE not in prepared_payload.data
-        with rb._PREPARED_REQUESTS_LOCK:
-            assert "abort-me" not in rb._PREPARED_REQUESTS
-            assert not rb._PREPARED_REQUESTS
+        with rb._PREPROCESSING_LOCK:
+            assert "abort-me" not in rb._INFLIGHT_REQUESTS
+            assert not rb._ABORTED_REQUESTS
     finally:
         rb.clear_moss_tts_preprocessing_context()
 
@@ -1082,15 +1148,14 @@ def test_moss_preprocess_pre_start_abort_does_not_block(
         rb.set_moss_tts_preprocessing_context(processor=object())
         # Abort for a request that never started preprocessing: no tombstone.
         rb.cleanup_prepared_moss_tts_request("ghost")
-        with rb._PREPARED_REQUESTS_LOCK:
+        with rb._PREPROCESSING_LOCK:
             assert not rb._ABORTED_REQUESTS
         # The same id can still run a normal preprocess and publish its handoff.
         prepared_payload = rb.preprocess_moss_tts_payload(
             make_payload(inputs="hello", request_id="ghost")
         )
         assert rb._MOSS_TTS_PREPARED_INLINE in prepared_payload.data
-        with rb._PREPARED_REQUESTS_LOCK:
-            assert "ghost" not in rb._PREPARED_REQUESTS
+        with rb._PREPROCESSING_LOCK:
             assert not rb._ABORTED_REQUESTS
             assert not rb._INFLIGHT_REQUESTS
     finally:

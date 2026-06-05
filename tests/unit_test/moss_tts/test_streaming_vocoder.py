@@ -11,8 +11,8 @@ from sglang_omni.models.moss_tts.codec import split_moss_audio_segments
 from sglang_omni.models.moss_tts.payload_types import MossTTSState
 from sglang_omni.models.moss_tts.streaming_vocoder import (
     MossStreamingVocoderScheduler,
-    _MossStreamState,
     _decode_stream_delta,
+    _MossStreamState,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
@@ -181,6 +181,34 @@ def test_moss_streaming_vocoder_does_not_full_decode_terminal_payload() -> None:
     assert messages[-1].type == "result"
     assert messages[-1].data.data["usage"]["completion_tokens"] == 4
     assert all(not bool((call == 42).all()) for call in processor.calls)
+
+
+def test_moss_streaming_vocoder_preserves_chunks_when_done_precedes_payload() -> None:
+    scheduler = MossStreamingVocoderScheduler(
+        _FakeMossProcessor(),
+        device="cpu",
+        stream_stride=8,
+        stream_followup_stride=8,
+        stream_overlap_tokens=0,
+        stream_holdback_tokens=0,
+        max_batch_wait_ms=0,
+    )
+
+    scheduler._on_chunk("req", _row_item(0))
+    scheduler._on_chunk("req", _row_item(1))
+    scheduler._on_done("req")
+
+    assert _drain_outbox(scheduler) == []
+    assert "req" in scheduler._stream_states
+    assert len(scheduler._stream_states["req"].delayed_rows) == 2
+
+    scheduler._on_streaming_new_request("req", _streaming_payload("req"))
+    messages = _drain_outbox(scheduler)
+
+    assert [msg.type for msg in messages] == ["stream", "result"]
+    audio = _audio_tensor(messages[0].data)
+    assert audio.numel() > 0
+    assert messages[-1].data.data["sample_rate"] == 24000
 
 
 def _streaming_payload(request_id: str) -> StagePayload:
