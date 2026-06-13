@@ -12,7 +12,9 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import torch
 
@@ -20,8 +22,10 @@ from sglang_omni.models.moss_tts.payload_types import (
     MossTTSState,
     resolve_moss_audio_pad_code,
 )
+from sglang_omni.preprocessing.cache_key import hash_bytes
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
+from sglang_omni.scheduling.stage_cache import StageOutputCache
 from sglang_omni.scheduling.types import ARRequestData
 
 MOSS_TTS_DEFAULT_MAX_NEW_TOKENS = 4096
@@ -31,6 +35,14 @@ _TOKEN_PREFIX_START_RE = re.compile(r"^\$\{token:")
 _DATA_URI_RE = re.compile(r"^data:audio/[^;,]+;base64,(?P<data>.+)$", re.DOTALL)
 _INF_DELAY = -1
 _MOSS_TTS_SAMPLING_SEED_MASK = 0x7FFFFFFF
+_MOSS_REF_CACHE_MAX_ITEMS = 256
+_MOSS_REF_CACHE_MAX_BYTES = 256 * 1024 * 1024
+_MOSS_PATH_HASH_MEMO_MAX_ITEMS = 1024
+_MOSS_PATH_HASH_SENTINEL_BYTES = 8192
+_MOSS_PATH_HASH_MEMO: collections.OrderedDict[str, tuple[str, str]] = (
+    collections.OrderedDict()
+)
+_MOSS_PATH_HASH_MEMO_LOCK = threading.Lock()
 
 
 def _new_moss_tts_sampling_seed() -> int:
@@ -115,11 +127,14 @@ class MossTTSPreparedRequest:
     input_ids: torch.Tensor
     prompt_rows: torch.Tensor
     gen_kwargs: dict[str, Any]
+    reference_artifact_key: str | None = None
 
 
 @dataclass
 class MossTTSPreprocessingContext:
     processor: Any
+    reference_cache: StageOutputCache | None = None
+    reference_cache_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 _PREPROCESSING_CONTEXT: MossTTSPreprocessingContext | None = None
@@ -130,12 +145,31 @@ _ABORTED_REQUESTS: set[str] = set()
 _PREPROCESSING_LOCK = threading.Lock()
 
 
-def set_moss_tts_preprocessing_context(*, processor: Any) -> None:
+def set_moss_tts_preprocessing_context(
+    *,
+    processor: Any,
+    reference_cache_max_items: int | None = _MOSS_REF_CACHE_MAX_ITEMS,
+    reference_cache_max_bytes: int | None = _MOSS_REF_CACHE_MAX_BYTES,
+) -> None:
     """Register the upstream MOSS processor used by preprocessing."""
 
     global _PREPROCESSING_CONTEXT
+    reference_cache = None
+    if reference_cache_max_items != 0:
+        reference_cache = StageOutputCache(
+            max_size=reference_cache_max_items,
+            max_bytes=(
+                reference_cache_max_bytes
+                if reference_cache_max_bytes and reference_cache_max_bytes > 0
+                else None
+            ),
+            cache_device="cpu",
+        )
     with _PREPROCESSING_LOCK:
-        _PREPROCESSING_CONTEXT = MossTTSPreprocessingContext(processor=processor)
+        _PREPROCESSING_CONTEXT = MossTTSPreprocessingContext(
+            processor=processor,
+            reference_cache=reference_cache,
+        )
         _INFLIGHT_REQUESTS.clear()
         _ABORTED_REQUESTS.clear()
 
@@ -174,13 +208,16 @@ def pop_prepared_moss_tts_request(
 
 
 def _prepared_to_payload(prepared: MossTTSPreparedRequest) -> dict[str, Any]:
-    return {
+    data = {
         "state": prepared.state.to_dict(),
         "input_ids_list": [int(token_id) for token_id in prepared.input_ids_list],
         "input_ids": prepared.input_ids.detach().to(dtype=torch.long, device="cpu"),
         "prompt_rows": prepared.prompt_rows.detach().to(dtype=torch.long, device="cpu"),
         "gen_kwargs": dict(prepared.gen_kwargs),
     }
+    if prepared.reference_artifact_key is not None:
+        data["reference_artifact_key"] = prepared.reference_artifact_key
+    return data
 
 
 def _prepared_from_payload(data: Any) -> MossTTSPreparedRequest:
@@ -196,6 +233,7 @@ def _prepared_from_payload(data: Any) -> MossTTSPreparedRequest:
         input_ids=input_ids.detach().cpu(),
         prompt_rows=prompt_rows.detach().cpu(),
         gen_kwargs=dict(gen_kwargs) if isinstance(gen_kwargs, dict) else {},
+        reference_artifact_key=data.get("reference_artifact_key"),
     )
 
 
@@ -420,7 +458,265 @@ def build_row_cache_key_ids(rows: torch.Tensor) -> list[int]:
     return key_ids
 
 
-def _reference_for_processor(processor: Any, ref_audio: Any | None) -> list[Any] | None:
+def _is_http_url(value: str) -> bool:
+    return urlparse(value).scheme in ("http", "https")
+
+
+def _moss_reference_path_hash_memo_key(path: Path) -> tuple[str, int] | None:
+    try:
+        if not path.is_file():
+            return None
+        stat_result = path.stat()
+        memo_key = (
+            f"{path.resolve()}:"
+            f"{stat_result.st_size}:"
+            f"{stat_result.st_mtime_ns}:"
+            f"{stat_result.st_ctime_ns}"
+        )
+        return memo_key, int(stat_result.st_size)
+    except OSError:
+        return None
+
+
+def _moss_reference_path_sentinel(path: Path, file_size: int) -> str | None:
+    try:
+        chunk_size = min(_MOSS_PATH_HASH_SENTINEL_BYTES, file_size)
+        with path.open("rb") as f:
+            chunks = [f.read(chunk_size)]
+            if file_size > _MOSS_PATH_HASH_SENTINEL_BYTES:
+                middle_offset = max((file_size - chunk_size) // 2, 0)
+                f.seek(middle_offset)
+                chunks.append(f.read(chunk_size))
+            if file_size > 2 * _MOSS_PATH_HASH_SENTINEL_BYTES:
+                f.seek(max(file_size - chunk_size, 0))
+                chunks.append(f.read(chunk_size))
+        return hash_bytes(b"".join(chunks) + f"|size:{file_size}".encode())
+    except OSError:
+        return None
+
+
+def _get_moss_reference_path_hash(memo_key: str, sentinel: str) -> str | None:
+    with _MOSS_PATH_HASH_MEMO_LOCK:
+        cached = _MOSS_PATH_HASH_MEMO.get(memo_key)
+        if cached is None:
+            return None
+        cached_sentinel, digest = cached
+        if cached_sentinel != sentinel:
+            _MOSS_PATH_HASH_MEMO.pop(memo_key, None)
+            return None
+        _MOSS_PATH_HASH_MEMO.move_to_end(memo_key)
+        return digest
+
+
+def _put_moss_reference_path_hash(
+    memo_key: str,
+    sentinel: str,
+    digest: str,
+) -> None:
+    with _MOSS_PATH_HASH_MEMO_LOCK:
+        _MOSS_PATH_HASH_MEMO[memo_key] = (sentinel, digest)
+        _MOSS_PATH_HASH_MEMO.move_to_end(memo_key)
+        while len(_MOSS_PATH_HASH_MEMO) > _MOSS_PATH_HASH_MEMO_MAX_ITEMS:
+            _MOSS_PATH_HASH_MEMO.popitem(last=False)
+
+
+def _moss_reference_path_cache_key(path_like: str | Path) -> str | None:
+    path = Path(str(path_like)).expanduser()
+    memo = _moss_reference_path_hash_memo_key(path)
+    if memo is None:
+        return None
+    memo_key, file_size = memo
+    sentinel = _moss_reference_path_sentinel(path, file_size)
+    if sentinel is None:
+        return None
+    digest = _get_moss_reference_path_hash(memo_key, sentinel)
+    if digest is not None:
+        return f"file:{digest}"
+    try:
+        digest = hash_bytes(path.read_bytes())
+    except OSError:
+        return None
+    if _moss_reference_path_hash_memo_key(path) == memo:
+        _put_moss_reference_path_hash(memo_key, sentinel, digest)
+    return f"file:{digest}"
+
+
+def _decode_moss_reference_data_uri(value: str) -> bytes | None:
+    match = _DATA_URI_RE.match(value)
+    if match is None:
+        return None
+    try:
+        return base64.b64decode(match.group("data"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _decode_moss_reference_base64(value: Any) -> bytes | None:
+    if isinstance(value, str):
+        data_uri = _decode_moss_reference_data_uri(value)
+        if data_uri is not None:
+            return data_uri
+        try:
+            return base64.b64decode(value)
+        except (ValueError, TypeError):
+            return None
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value)
+    return None
+
+
+def _moss_reference_inline_bytes(ref_audio: Any) -> bytes | None:
+    if isinstance(ref_audio, str):
+        return _decode_moss_reference_data_uri(ref_audio)
+    if isinstance(ref_audio, (bytes, bytearray, memoryview)):
+        return bytes(ref_audio)
+    if not isinstance(ref_audio, dict):
+        return None
+    if "bytes" in ref_audio:
+        data = ref_audio["bytes"]
+        if isinstance(data, str):
+            return data.encode()
+        if isinstance(data, (bytes, bytearray, memoryview)):
+            return bytes(data)
+        return None
+    encoded = ref_audio.get("base64")
+    if encoded is None:
+        encoded = ref_audio.get("data")
+    if encoded is None:
+        return None
+    return _decode_moss_reference_base64(encoded)
+
+
+def _moss_reference_path_like(ref_audio: Any) -> str | Path | None:
+    if isinstance(ref_audio, Path):
+        return ref_audio
+    if isinstance(ref_audio, str):
+        if _DATA_URI_RE.match(ref_audio) or _is_http_url(ref_audio):
+            return None
+        return ref_audio
+    if isinstance(ref_audio, dict):
+        path = ref_audio.get("audio_path") or ref_audio.get("path")
+        return path if isinstance(path, (str, Path)) else None
+    return None
+
+
+def _moss_reference_audio_cache_key(ref_audio: Any) -> str | None:
+    """Stable content key for cacheable MOSS-TTS reference audio."""
+
+    inline = _moss_reference_inline_bytes(ref_audio)
+    if inline is not None:
+        return f"bytes:{hash_bytes(inline)}"
+    path = _moss_reference_path_like(ref_audio)
+    if path is None:
+        return None
+    return _moss_reference_path_cache_key(path)
+
+
+def _moss_processor_config_part(processor: Any, name: str) -> str | None:
+    model_config = getattr(processor, "model_config", None)
+    candidates = [
+        model_config,
+        getattr(processor, "audio_tokenizer_config", None),
+        getattr(model_config, "audio_tokenizer_config", None),
+    ]
+    for candidate in candidates:
+        value = getattr(candidate, name, None) if candidate is not None else None
+        if value is not None:
+            return str(value)
+    return None
+
+
+def _moss_reference_artifact_key(audio_key: str, processor: Any) -> str:
+    parts = ["moss-ref-v1", f"audio={audio_key}"]
+    for attr in ("sampling_rate", "audio_vocab_size"):
+        value = _moss_processor_config_part(processor, attr)
+        if value is not None:
+            parts.append(f"{attr}={value}")
+    digest = hashlib.blake2b("|".join(parts).encode("utf-8"), digest_size=16)
+    return f"moss-ref-v1:{digest.hexdigest()}"
+
+
+def _clone_reference_artifact(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().clone()
+    if isinstance(value, list):
+        return [_clone_reference_artifact(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_reference_artifact(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _clone_reference_artifact(item) for key, item in value.items()}
+    return value
+
+
+def _load_moss_reference_wav_from_bytes(
+    data: bytes,
+    *,
+    strict: bool,
+) -> tuple[torch.Tensor, int] | None:
+    try:
+        import soundfile as sf
+    except ImportError as exc:
+        if strict:
+            raise RuntimeError(
+                "MOSS-TTS base64 reference audio requires soundfile to decode "
+                "inline audio"
+            ) from exc
+        return None
+
+    try:
+        audio, sample_rate = sf.read(io.BytesIO(data), dtype="float32", always_2d=True)
+    except Exception:
+        if strict:
+            raise
+        return None
+    return torch.from_numpy(audio.T), int(sample_rate)
+
+
+def _load_moss_reference_wav_from_path(
+    path_like: str | Path,
+) -> tuple[torch.Tensor, int] | None:
+    try:
+        import soundfile as sf
+    except ImportError:
+        return None
+
+    try:
+        audio, sample_rate = sf.read(
+            str(Path(str(path_like)).expanduser()),
+            dtype="float32",
+            always_2d=True,
+        )
+    except Exception:
+        return None
+    return torch.from_numpy(audio.T), int(sample_rate)
+
+
+def _encode_moss_reference_for_cache(
+    processor: Any,
+    ref_audio: Any,
+) -> Any | None:
+    inline = _moss_reference_inline_bytes(ref_audio)
+    if inline is not None:
+        strict_inline = (
+            isinstance(ref_audio, str) and _DATA_URI_RE.match(ref_audio) is not None
+        )
+        loaded = _load_moss_reference_wav_from_bytes(
+            inline,
+            strict=strict_inline,
+        )
+    else:
+        path = _moss_reference_path_like(ref_audio)
+        loaded = _load_moss_reference_wav_from_path(path) if path is not None else None
+    if loaded is None:
+        return None
+    wav, sample_rate = loaded
+    return processor.encode_audios_from_wav([wav], int(sample_rate))[0]
+
+
+def _fallback_reference_for_processor(
+    processor: Any,
+    ref_audio: Any | None,
+) -> list[Any] | None:
     if ref_audio is None:
         return None
     if not isinstance(ref_audio, str):
@@ -443,25 +739,54 @@ def _reference_for_processor(processor: Any, ref_audio: Any | None) -> list[Any]
     return [codes]
 
 
-def _build_processor_message(processor: Any, state: MossTTSState) -> dict[str, Any]:
-    reference = _reference_for_processor(processor, state.ref_audio)
-    return processor.build_user_message(
+def _reference_for_processor(
+    context: MossTTSPreprocessingContext,
+    ref_audio: Any | None,
+) -> tuple[list[Any] | None, str | None]:
+    if ref_audio is None:
+        return None, None
+    audio_key = _moss_reference_audio_cache_key(ref_audio)
+    if audio_key is None or context.reference_cache is None:
+        return _fallback_reference_for_processor(context.processor, ref_audio), None
+
+    artifact_key = _moss_reference_artifact_key(audio_key, context.processor)
+    with context.reference_cache_lock:
+        cached = context.reference_cache.get(artifact_key)
+    if cached is not None:
+        return [_clone_reference_artifact(cached)], artifact_key
+
+    encoded = _encode_moss_reference_for_cache(context.processor, ref_audio)
+    if encoded is None:
+        return _fallback_reference_for_processor(context.processor, ref_audio), None
+    stored = _clone_reference_artifact(encoded)
+    with context.reference_cache_lock:
+        context.reference_cache.put(artifact_key, stored)
+    return [_clone_reference_artifact(stored)], artifact_key
+
+
+def _build_processor_message(
+    context: MossTTSPreprocessingContext,
+    state: MossTTSState,
+) -> tuple[dict[str, Any], str | None]:
+    reference, artifact_key = _reference_for_processor(context, state.ref_audio)
+    message = context.processor.build_user_message(
         text=state.text,
         reference=reference,
         instruction=state.instructions,
         tokens=state.token_count,
         language=state.language,
     )
+    return message, artifact_key
 
 
 def _prepare_moss_tts_request(
     payload: StagePayload,
     *,
-    processor: Any,
+    context: MossTTSPreprocessingContext,
 ) -> MossTTSPreparedRequest:
     state = build_moss_tts_state(payload)
-    message = _build_processor_message(processor, state)
-    batch = processor([[message]], mode="generation")
+    message, reference_artifact_key = _build_processor_message(context, state)
+    batch = context.processor([[message]], mode="generation")
     input_rows = batch["input_ids"]
     if input_rows.ndim != 3 or int(input_rows.shape[0]) != 1:
         raise ValueError(
@@ -475,6 +800,7 @@ def _prepare_moss_tts_request(
         input_ids=torch.tensor(input_ids_list, dtype=torch.long),
         prompt_rows=prompt_rows,
         gen_kwargs=state.generation_kwargs,
+        reference_artifact_key=reference_artifact_key,
     )
 
 
@@ -493,7 +819,7 @@ def preprocess_moss_tts_payload(payload: StagePayload) -> StagePayload:
         )
 
     try:
-        prepared = _prepare_moss_tts_request(payload, processor=context.processor)
+        prepared = _prepare_moss_tts_request(payload, context=context)
     except BaseException:
         with _PREPROCESSING_LOCK:
             _INFLIGHT_REQUESTS.discard(rid)
@@ -801,6 +1127,11 @@ def build_sglang_moss_tts_request(
     sampling_params.normalize(None)
     sampling_params.verify(int(cfg.vocab_size_list[0]))
 
+    extra_key = (
+        f"moss_tts_ref:{prepared.reference_artifact_key}"
+        if prepared.reference_artifact_key
+        else None
+    )
     req = Req(
         rid=payload.request_id,
         origin_input_text="",
@@ -808,6 +1139,7 @@ def build_sglang_moss_tts_request(
         sampling_params=sampling_params,
         eos_token_ids={int(cfg.im_end_token_id)},
         vocab_size=int(cfg.vocab_size_list[0]),
+        extra_key=extra_key,
     )
     req.tokenizer = None
     req._input_embeds_are_projected = True

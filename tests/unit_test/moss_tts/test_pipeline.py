@@ -21,6 +21,7 @@ from benchmarks.tasks.tts import (
     _handle_raw_pcm_streaming_response,
     estimate_moss_tts_duration_tokens,
 )
+from sglang_omni.models.moss_tts import request_builders as rb
 from sglang_omni.models.moss_tts.codec import split_moss_audio_segments
 from sglang_omni.models.moss_tts.config import MossTTSPipelineConfig
 from sglang_omni.models.moss_tts.payload_types import MossTTSState
@@ -52,13 +53,13 @@ def install_fake_sglang(monkeypatch: pytest.MonkeyPatch) -> None:
             vocab_size=None,
             **kwargs,
         ) -> None:
-            del kwargs
             self.rid = rid
             self.origin_input_text = origin_input_text
             self.origin_input_ids = origin_input_ids
             self.sampling_params = sampling_params
             self.eos_token_ids = eos_token_ids
             self.vocab_size = vocab_size
+            self.extra_key = kwargs.get("extra_key")
             self.output_ids = []
             self.prefix_indices = []
             self.extend_input_len = len(origin_input_ids)
@@ -477,6 +478,206 @@ def test_moss_row_cache_keys_are_content_based() -> None:
     assert build_row_cache_key_ids(rows) != build_row_cache_key_ids(different)
 
 
+def test_moss_reference_cache_key_tracks_content(tmp_path) -> None:
+    rb._MOSS_PATH_HASH_MEMO.clear()
+    ref_audio = tmp_path / "ref.wav"
+    ref_audio.write_bytes(b"a")
+    first_key = rb._moss_reference_audio_cache_key(ref_audio)
+
+    assert first_key == rb._moss_reference_audio_cache_key(ref_audio)
+
+    ref_audio.write_bytes(b"longer")
+    second_key = rb._moss_reference_audio_cache_key(ref_audio)
+
+    assert first_key is not None and first_key.startswith("file:")
+    assert second_key is not None and second_key.startswith("file:")
+    assert first_key != second_key
+
+
+def test_moss_reference_cache_key_same_size_edit_and_inline_bytes(tmp_path) -> None:
+    rb._MOSS_PATH_HASH_MEMO.clear()
+    head, tail = b"H" * 8192, b"T" * 8192
+    ref_audio = tmp_path / "ref.wav"
+    ref_audio.write_bytes(head + b"a" * 4096 + tail)
+    first_key = rb._moss_reference_audio_cache_key(ref_audio)
+    ref_audio.write_bytes(head + b"b" * 4096 + tail)
+
+    assert first_key is not None
+    assert first_key != rb._moss_reference_audio_cache_key(ref_audio)
+    assert rb._moss_reference_audio_cache_key("https://example.com/ref.wav") is None
+    assert rb._moss_reference_audio_cache_key(str(tmp_path / "missing.wav")) is None
+
+    raw = b"\x01\x02fake-audio-bytes"
+    encoded = base64.b64encode(raw).decode()
+    assert rb._moss_reference_audio_cache_key({"bytes": raw}) == (
+        rb._moss_reference_audio_cache_key({"base64": encoded})
+    )
+    assert rb._moss_reference_audio_cache_key({"bytes": raw}) == (
+        rb._moss_reference_audio_cache_key(f"data:audio/wav;base64,{encoded}")
+    )
+
+
+def test_moss_reference_cache_key_memoizes_stable_file_hash(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    ref_audio = tmp_path / "ref.wav"
+    ref_audio.write_bytes(b"fake wav bytes")
+    rb._MOSS_PATH_HASH_MEMO.clear()
+    read_calls = 0
+    original_read_bytes = rb.Path.read_bytes
+
+    def counting_read_bytes(path):
+        nonlocal read_calls
+        if path == ref_audio:
+            read_calls += 1
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(rb.Path, "read_bytes", counting_read_bytes)
+
+    first_key = rb._moss_reference_audio_cache_key(ref_audio)
+    second_key = rb._moss_reference_audio_cache_key(ref_audio)
+
+    assert first_key == second_key
+    assert read_calls == 1
+
+
+def test_moss_reference_cache_reuses_encoded_local_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    ref_audio = tmp_path / "ref.wav"
+    ref_audio.write_bytes(b"fake wav bytes")
+
+    def fake_load_reference(path):
+        assert str(path) == str(ref_audio)
+        return torch.zeros(1, 16), 24000
+
+    monkeypatch.setattr(
+        rb,
+        "_load_moss_reference_wav_from_path",
+        fake_load_reference,
+    )
+
+    class FakeProcessor:
+        model_config = SimpleNamespace(sampling_rate=24000, audio_vocab_size=1024)
+
+        def __init__(self) -> None:
+            self.encode_calls = 0
+            self.references = []
+
+        def encode_audios_from_wav(self, wavs, sample_rate):
+            assert len(wavs) == 1
+            assert sample_rate == 24000
+            self.encode_calls += 1
+            return [torch.tensor([[self.encode_calls, 7]], dtype=torch.long)]
+
+        def build_user_message(self, **kwargs):
+            self.references.append(kwargs["reference"])
+            return {"role": "user", **kwargs}
+
+        def __call__(self, conversations, mode):
+            assert mode == "generation"
+            text_len = len(conversations[0][0]["text"])
+            return {
+                "input_ids": torch.tensor(
+                    [[[text_len, 1024, 1024], [151644, 1024, 1024]]],
+                    dtype=torch.long,
+                )
+            }
+
+    processor = FakeProcessor()
+    try:
+        rb.set_moss_tts_preprocessing_context(processor=processor)
+        first = rb.preprocess_moss_tts_payload(
+            make_payload(
+                inputs={
+                    "text": "hello",
+                    "references": [{"audio_path": str(ref_audio), "text": "ref"}],
+                },
+                request_id="first",
+            )
+        )
+        second = rb.preprocess_moss_tts_payload(
+            make_payload(
+                inputs={
+                    "text": "different target",
+                    "references": [{"audio_path": str(ref_audio), "text": "ref"}],
+                },
+                request_id="second",
+            )
+        )
+    finally:
+        rb.clear_moss_tts_preprocessing_context()
+
+    first_inline = first.data[rb._MOSS_TTS_PREPARED_INLINE]
+    second_inline = second.data[rb._MOSS_TTS_PREPARED_INLINE]
+    assert processor.encode_calls == 1
+    assert first_inline["reference_artifact_key"] == second_inline[
+        "reference_artifact_key"
+    ]
+    assert torch.equal(processor.references[0][0], processor.references[1][0])
+    assert (
+        processor.references[0][0].data_ptr()
+        != processor.references[1][0].data_ptr()
+    )
+
+
+def test_moss_reference_cache_fallback_preserves_http_url() -> None:
+    class FakeProcessor:
+        def encode_audios_from_wav(self, wavs, sample_rate):
+            raise AssertionError("HTTP URL fallback must not pre-encode")
+
+    context = rb.MossTTSPreprocessingContext(
+        processor=FakeProcessor(),
+        reference_cache=rb.StageOutputCache(max_size=8),
+    )
+
+    reference, artifact_key = rb._reference_for_processor(
+        context,
+        "https://example.com/ref.wav",
+    )
+
+    assert reference == ["https://example.com/ref.wav"]
+    assert artifact_key is None
+
+
+def test_moss_prepared_reference_artifact_key_round_trip_and_extra_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_sglang(monkeypatch)
+    prepared = rb.MossTTSPreparedRequest(
+        state=MossTTSState(),
+        input_ids_list=[1, 2],
+        input_ids=torch.tensor([1, 2], dtype=torch.long),
+        prompt_rows=torch.tensor([[1, 1024], [2, 1024]], dtype=torch.long),
+        gen_kwargs={"max_new_tokens": 4},
+        reference_artifact_key="moss-ref-v1:abc",
+    )
+    inline = rb._prepared_to_payload(prepared)
+    restored = rb._prepared_from_payload(inline)
+    assert restored.reference_artifact_key == "moss-ref-v1:abc"
+
+    payload = StagePayload(
+        request_id="req",
+        request=OmniRequest(inputs="hello", params={}),
+        data={rb._MOSS_TTS_PREPARED_INLINE: inline},
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            vocab_size_list=[200000, 1025],
+            im_end_token_id=151645,
+            im_start_token_id=151644,
+            audio_start_token_id=151652,
+            audio_assistant_gen_slot_token_id=151656,
+        )
+    )
+
+    data = build_sglang_moss_tts_request(payload, model=model)
+
+    assert data.req.extra_key == "moss_tts_ref:moss-ref-v1:abc"
+
+
 def test_moss_preprocess_and_sglang_request_handoff(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -541,6 +742,7 @@ def test_moss_preprocess_and_sglang_request_handoff(
     assert data.prompt_rows.shape == (3, 3)
     assert data.state.assistant_start_length == 0
     assert data.req.sampling_params.stop_token_ids == [151645]
+    assert data.req.extra_key is None
 
 
 def test_moss_delay_runner_samples_audio_and_appends_feedback() -> None:
@@ -1060,8 +1262,9 @@ def test_moss_preprocess_discards_handoff_after_abort(
 
     payload = make_payload(inputs="hello", request_id="abort-me")
 
-    def fake_prepare(pl, *, processor):
+    def fake_prepare(pl, *, context):
         # The abort fires while preprocessing is still running.
+        assert context.processor is not None
         rb.cleanup_prepared_moss_tts_request(pl.request_id)
         return rb.MossTTSPreparedRequest(
             state=MossTTSState(),
@@ -1134,7 +1337,8 @@ def test_moss_preprocess_pre_start_abort_does_not_block(
 ) -> None:
     from sglang_omni.models.moss_tts import request_builders as rb
 
-    def fake_prepare(pl, *, processor):
+    def fake_prepare(pl, *, context):
+        assert context.processor is not None
         return rb.MossTTSPreparedRequest(
             state=MossTTSState(),
             input_ids_list=[],

@@ -211,6 +211,50 @@ def test_moss_streaming_vocoder_preserves_chunks_when_done_precedes_payload() ->
     assert messages[-1].data.data["sample_rate"] == 24000
 
 
+def test_moss_streaming_holdback_first_chunk_waits_one_row() -> None:
+    processor = _FakeMossProcessor()
+    state = _MossStreamState(n_vq=2, audio_pad_code=99, sample_rate=24)
+    rows = [
+        torch.tensor([1, 2], dtype=torch.long),
+        torch.tensor([3, 4], dtype=torch.long),
+        torch.tensor([5, 6], dtype=torch.long),
+    ]
+
+    for row in rows[:2]:
+        state.delayed_rows.append(row)
+        outputs = _decode_stream_delta(
+            state,
+            processor=processor,
+            device=torch.device("cpu"),
+            stream_stride=2,
+            stream_followup_stride=8,
+            stream_overlap_tokens=0,
+            stream_holdback_tokens=1,
+            samples_per_frame=3,
+            is_final=False,
+        )
+        assert outputs == []
+
+    assert state.next_decode_rows == 3
+
+    state.delayed_rows.append(rows[2])
+    outputs = _decode_stream_delta(
+        state,
+        processor=processor,
+        device=torch.device("cpu"),
+        stream_stride=2,
+        stream_followup_stride=8,
+        stream_overlap_tokens=0,
+        stream_holdback_tokens=1,
+        samples_per_frame=3,
+        is_final=False,
+    )
+
+    assert len(outputs) == 1
+    assert _audio_tensor(outputs[0]).numel() > 0
+    assert state.has_emitted is True
+
+
 def _streaming_payload(request_id: str) -> StagePayload:
     state = MossTTSState(text="hi", delayed_audio_codes=None)
     return StagePayload(

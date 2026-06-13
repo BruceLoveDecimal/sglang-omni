@@ -8,10 +8,17 @@ from typing import Any
 
 import torch
 
-from sglang_omni.models.moss_tts.codec import split_moss_audio_segments
+from sglang_omni.models.moss_tts.codec import (
+    IncrementalDeDelay,
+    split_moss_audio_segments,
+)
 from sglang_omni.models.moss_tts.payload_types import (
     MossTTSState,
     resolve_moss_audio_pad_code,
+)
+from sglang_omni.models.moss_tts.stateful_codec import (
+    StatefulMossCodec,
+    build_stateful_codec_from_processor,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import StagePayload
@@ -37,6 +44,13 @@ class _MossStreamState:
     # Latched once from the first decoded window so every chunk trims on the
     # same samples-per-frame and the stream stays gap-free.
     samples_per_frame: int | None = None
+    # Stateful-codec mode only: incremental de-delay + per-segment codec cache.
+    dedelay: IncrementalDeDelay | None = None
+    codec_state: Any = None
+    # Coalescing buffer: completed frames of the open segment awaiting decode.
+    # Decoding once per ``stream_stride`` frames (instead of per frame) keeps the
+    # KV-cache result identical while cutting GPU-call count ~stride x.
+    pending_frames: list[torch.Tensor] = field(default_factory=list)
 
 
 def _as_audio_tensor(value: Any) -> torch.Tensor:
@@ -137,7 +151,13 @@ def _decode_stream_delta(
     if not is_final and stream_holdback_tokens > 0:
         emit_until_raw = max(0, raw_total - stream_holdback_tokens)
     if emit_until_raw <= 0:
-        state.next_decode_rows = delayed_count + stream_followup_stride
+        if not is_final and stream_holdback_tokens > 0:
+            state.next_decode_rows = max(
+                delayed_count + 1,
+                int(n_vq) + int(stream_holdback_tokens),
+            )
+        else:
+            state.next_decode_rows = delayed_count + stream_followup_stride
         return []
 
     rows_end = emit_until_raw + n_vq - 1
@@ -219,6 +239,7 @@ class MossStreamingVocoderScheduler(StreamingSimpleScheduler):
         stream_followup_stride: int = 8,
         stream_overlap_tokens: int = 2,
         stream_holdback_tokens: int = 1,
+        stream_codec_mode: str = "overlap",
         max_batch_size: int = 8,
         max_batch_wait_ms: int = 2,
     ) -> None:
@@ -228,12 +249,20 @@ class MossStreamingVocoderScheduler(StreamingSimpleScheduler):
             raise ValueError(
                 "stream_overlap_tokens and stream_holdback_tokens must be >= 0"
             )
+        if stream_codec_mode not in ("overlap", "stateful"):
+            raise ValueError(
+                f"stream_codec_mode must be 'overlap' or 'stateful', got "
+                f"{stream_codec_mode!r}"
+            )
         self._processor = processor
         self._device = torch.device(device)
         self._stream_stride = int(stream_stride)
         self._stream_followup_stride = int(stream_followup_stride)
         self._stream_overlap_tokens = int(stream_overlap_tokens)
         self._stream_holdback_tokens = int(stream_holdback_tokens)
+        self._stream_codec_mode = stream_codec_mode
+        # Built lazily on first stateful use (needs n_vq from the stream).
+        self._stateful_codec: StatefulMossCodec | None = None
         self._sample_rate = _resolve_sample_rate(processor)
         self._samples_per_frame = _resolve_samples_per_frame(
             processor, self._sample_rate
@@ -285,8 +314,11 @@ class MossStreamingVocoderScheduler(StreamingSimpleScheduler):
                 f"MOSS-TTS stream row for {request_id!r} has {int(row.shape[0])} "
                 f"codebooks, expected {int(n_vq)}"
             )
-        stream_state.delayed_rows.append(row.detach().cpu())
-        chunks = self._decode_stream_state(stream_state, is_final=False)
+        if self._stream_codec_mode == "stateful":
+            chunks = self._stateful_decode_rows(stream_state, [row.detach().cpu()])
+        else:
+            stream_state.delayed_rows.append(row.detach().cpu())
+            chunks = self._decode_stream_state(stream_state, is_final=False)
         return [
             OutgoingMessage(
                 request_id=request_id,
@@ -299,7 +331,10 @@ class MossStreamingVocoderScheduler(StreamingSimpleScheduler):
 
     def on_stream_done(self, request_id: str) -> list[OutgoingMessage]:
         stream_state = self._stream_states.setdefault(request_id, _MossStreamState())
-        chunks = self._decode_stream_state(stream_state, is_final=True)
+        if self._stream_codec_mode == "stateful":
+            chunks = self._stateful_finalize(stream_state)
+        else:
+            chunks = self._decode_stream_state(stream_state, is_final=True)
         messages = [
             OutgoingMessage(
                 request_id=request_id,
@@ -321,6 +356,96 @@ class MossStreamingVocoderScheduler(StreamingSimpleScheduler):
 
     def clear_stream_state(self, request_id: str) -> None:
         self._stream_states.pop(request_id, None)
+
+    # ------------------------------------------------------------------
+    # Stateful KV-cache codec path (RFC §5.4/§5.5)
+    # ------------------------------------------------------------------
+
+    def _ensure_stateful_codec(self, n_vq: int) -> StatefulMossCodec:
+        if self._stateful_codec is None:
+            model = build_stateful_codec_from_processor(
+                self._processor, device=self._device
+            )
+            self._stateful_codec = StatefulMossCodec(model, n_vq=int(n_vq))
+        return self._stateful_codec
+
+    def _stateful_decode_rows(
+        self, state: _MossStreamState, rows: list[torch.Tensor]
+    ) -> list[dict[str, Any]]:
+        if state.n_vq is None or state.audio_pad_code is None:
+            raise RuntimeError("MOSS stream metadata is missing n_vq or audio_pad_code")
+        codec = self._ensure_stateful_codec(int(state.n_vq))
+        if state.dedelay is None:
+            # Streaming rows are already post-prefix, so trim length is 0 here —
+            # matching the overlap path (which passes assistant_start_length=0).
+            state.dedelay = IncrementalDeDelay(
+                n_vq=int(state.n_vq),
+                audio_pad_code=int(state.audio_pad_code),
+                assistant_start_length=0,
+            )
+        events: list[tuple] = []
+        for row in rows:
+            events.extend(state.dedelay.push(row))
+        return self._stateful_consume_events(state, codec, events)
+
+    def _stateful_finalize(self, state: _MossStreamState) -> list[dict[str, Any]]:
+        if state.dedelay is None:
+            return []
+        codec = self._ensure_stateful_codec(int(state.n_vq))
+        events = state.dedelay.finalize()
+        return self._stateful_consume_events(state, codec, events, last=True)
+
+    def _stateful_consume_events(
+        self,
+        state: _MossStreamState,
+        codec: StatefulMossCodec,
+        events: list[tuple],
+        *,
+        last: bool = False,
+    ) -> list[dict[str, Any]]:
+        chunks: list[dict[str, Any]] = []
+        buf = state.pending_frames
+
+        def flush(close: bool) -> None:
+            if buf:
+                if state.codec_state is None:
+                    state.codec_state = codec.new_state()
+                frames = torch.stack(buf, dim=0)  # [T, n_vq]
+                wav = codec.decode_stream(
+                    frames, state.codec_state, last_chunk=close or last
+                )
+                buf.clear()
+                if wav.numel():
+                    state.has_emitted = True
+                    chunks.append(
+                        audio_waveform_payload(
+                            wav,
+                            sample_rate=state.sample_rate,
+                            modality="audio",
+                            source_hint="MOSS-TTS streaming",
+                        )
+                    )
+
+        for ev in events:
+            if ev[0] == "frame":
+                buf.append(ev[1])
+                # Coalesce: only decode once a full stride has accumulated. The KV
+                # cache makes the multi-frame decode identical to per-frame, so
+                # this is correctness-neutral and amortizes the heavy decoder.
+                if len(buf) >= self._stream_stride:
+                    flush(close=False)
+            elif ev[0] == "close":
+                # The causal codec produces each frame's final samples on decode,
+                # so closing a segment needs no tail flush — just decode whatever
+                # is buffered and reset the cache so the next segment decodes
+                # independently (offline parity).
+                flush(close=True)
+                state.codec_state = None
+        # On the final flush (stream done) drain the remainder; otherwise leave a
+        # sub-stride remainder buffered for the next chunk.
+        if last:
+            flush(close=False)
+        return chunks
 
     def _decode_stream_state(
         self, state: _MossStreamState, *, is_final: bool

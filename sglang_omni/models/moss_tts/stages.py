@@ -15,6 +15,8 @@ from sglang_omni.models.moss_tts.payload_types import (
     moss_tts_special_token_defaults,
 )
 from sglang_omni.models.moss_tts.request_builders import (
+    _MOSS_REF_CACHE_MAX_BYTES,
+    _MOSS_REF_CACHE_MAX_ITEMS,
     cleanup_prepared_moss_tts_request,
     make_moss_tts_stream_output_builder,
     make_moss_tts_scheduler_adapters,
@@ -163,10 +165,18 @@ def _load_moss_processor(
 
 
 def create_preprocessing_executor(
-    model_path: str, *, max_concurrency: int = 8
+    model_path: str,
+    *,
+    max_concurrency: int = 8,
+    reference_cache_max_items: int | None = _MOSS_REF_CACHE_MAX_ITEMS,
+    reference_cache_max_bytes: int | None = _MOSS_REF_CACHE_MAX_BYTES,
 ) -> SimpleScheduler:
     processor = _load_moss_processor(model_path, device="cpu", dtype="float32")
-    set_moss_tts_preprocessing_context(processor=processor)
+    set_moss_tts_preprocessing_context(
+        processor=processor,
+        reference_cache_max_items=reference_cache_max_items,
+        reference_cache_max_bytes=reference_cache_max_bytes,
+    )
     # Preprocessing is CPU-heavy: every request tokenizes text and encodes the
     # reference audio through the MOSS audio tokenizer. Serial execution
     # (max_concurrency=1) lets the codec encode dominate wall-clock and starves
@@ -298,9 +308,14 @@ def create_vocoder_executor(
     stream_followup_stride: int = 8,
     stream_overlap_tokens: int = 2,
     stream_holdback_tokens: int = 1,
+    stream_codec_mode: str | None = None,
 ) -> MossStreamingVocoderScheduler:
     if gpu_id is not None:
         device = f"cuda:{gpu_id}"
+    if stream_codec_mode is None:
+        # Default stays "overlap"; opt into the stateful KV-cache codec with
+        # MOSS_TTS_STREAM_CODEC_MODE=stateful (RFC rollout §9).
+        stream_codec_mode = os.environ.get("MOSS_TTS_STREAM_CODEC_MODE", "overlap")
     processor = _load_moss_processor(model_path, device=device, dtype=dtype)
     return MossStreamingVocoderScheduler(
         processor,
@@ -309,6 +324,7 @@ def create_vocoder_executor(
         stream_followup_stride=stream_followup_stride,
         stream_overlap_tokens=stream_overlap_tokens,
         stream_holdback_tokens=stream_holdback_tokens,
+        stream_codec_mode=stream_codec_mode,
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
     )
