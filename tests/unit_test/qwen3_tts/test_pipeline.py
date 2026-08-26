@@ -21,6 +21,7 @@ from sglang_omni.models.qwen3_tts import request_builders as qwen3_request_build
 from sglang_omni.models.qwen3_tts import stages as qwen3_stages
 from sglang_omni.models.qwen3_tts import streaming_vocoder as qwen3_streaming_vocoder
 from sglang_omni.models.qwen3_tts.config import Qwen3TTSPipelineConfig
+from sglang_omni.models.qwen3_tts.incremental_codec import Qwen3TTSIncrementalCodecState
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
 from sglang_omni.models.qwen3_tts.request_builders import (
     Qwen3TTSPreparedRequest,
@@ -1405,6 +1406,141 @@ class _FakeQwen3TTSTokenizer:
             for item in encoded
         ]
         return waveforms, self.get_output_sample_rate()
+
+
+class _FakeIncrementalQwen3TTSDecoder:
+    def __init__(self, decoder, *, fail_on_call: int | None = None) -> None:
+        self._decoder = decoder
+        self._fail_on_call = fail_on_call
+        self.decode_inputs: list[torch.Tensor] = []
+
+    def decode(
+        self,
+        codes: torch.Tensor,
+        state: Qwen3TTSIncrementalCodecState,
+    ) -> torch.Tensor:
+        self.decode_inputs.append(codes.detach().clone())
+        if len(self.decode_inputs) == self._fail_on_call:
+            raise RuntimeError("injected incremental decode failure")
+        state.frame_position += int(codes.shape[-1])
+        return (
+            codes[:, :1]
+            .to(torch.float32)
+            .repeat_interleave(self._decoder.total_upsample, dim=-1)
+        )
+
+
+def _stateful_qwen3_tts_scheduler(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    fail_on_call: int | None = None,
+    stream_left_context_frames: int = 1,
+) -> tuple[Qwen3TTSStreamingVocoderScheduler, _FakeIncrementalQwen3TTSDecoder]:
+    created = []
+
+    def make_incremental(decoder):
+        incremental = _FakeIncrementalQwen3TTSDecoder(
+            decoder, fail_on_call=fail_on_call
+        )
+        created.append(incremental)
+        return incremental
+
+    monkeypatch.setattr(
+        qwen3_streaming_vocoder,
+        "Qwen3TTSIncrementalDecoder",
+        make_incremental,
+    )
+    scheduler = Qwen3TTSStreamingVocoderScheduler(
+        _FakeQwen3TTSTokenizer(),
+        device="cpu",
+        async_decode=True,
+        initial_cuda_graph=True,
+        stream_left_context_frames=stream_left_context_frames,
+        enable_stateful_codec_decoder=True,
+    )
+    return scheduler, created[0]
+
+
+def test_qwen3_tts_stateful_codec_uses_reference_once_then_fresh_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler, incremental = _stateful_qwen3_tts_scheduler(monkeypatch)
+    state = scheduler.create_stream_state("request")
+    state.ref_frames = 2
+    state.code_chunks.append(
+        torch.tensor([[10, 1], [20, 2], [30, 3]], dtype=torch.long)
+    )
+    state.total_frames = 3
+
+    first = scheduler.decode_delta("request", state, is_final=False)
+    state.code_chunks.append(torch.tensor([[40, 4], [50, 5]], dtype=torch.long))
+    state.total_frames = 5
+    second = scheduler.decode_delta("request", state, is_final=False)
+
+    assert scheduler._async_decode is False
+    assert scheduler._initial_decode_graphs._enabled is False
+    assert first is not None
+    assert first.tolist() == [30.0] * 4
+    assert second is not None
+    assert second.tolist() == [40.0] * 4 + [50.0] * 4
+    assert [tuple(item.shape) for item in incremental.decode_inputs] == [
+        (1, 2, 3),
+        (1, 2, 2),
+    ]
+    assert state.incremental_codec_state is not None
+    assert state.incremental_codec_state.frame_position == 5
+    assert state.emitted_generated_frames == 3
+    assert state.pruned_frames == 3
+
+
+def test_qwen3_tts_stateful_codec_failure_falls_back_without_committing_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler, incremental = _stateful_qwen3_tts_scheduler(monkeypatch, fail_on_call=2)
+    state = scheduler.create_stream_state("request")
+    state.code_chunks.append(torch.tensor([[10, 1]], dtype=torch.long))
+    state.total_frames = 1
+    first = scheduler.decode_delta("request", state, is_final=False)
+    state.code_chunks.append(torch.tensor([[20, 2]], dtype=torch.long))
+    state.total_frames = 2
+
+    second = scheduler.decode_delta("request", state, is_final=False)
+
+    assert first is not None
+    assert first.tolist() == [10.0] * 4
+    assert second is not None
+    assert second.tolist() == [20.0] * 4
+    assert state.incremental_codec_fallback is True
+    assert state.incremental_codec_state is not None
+    assert state.incremental_codec_state.frame_position == 1
+    assert state.emitted_generated_frames == 2
+    assert len(incremental.decode_inputs) == 2
+    assert len(scheduler._decoder.decode_inputs) == 1
+
+    state.code_chunks.append(torch.tensor([[30, 3]], dtype=torch.long))
+    state.total_frames = 3
+    third = scheduler.decode_delta("request", state, is_final=True)
+
+    assert third is not None
+    assert third.tolist() == [30.0] * 4
+    assert len(incremental.decode_inputs) == 2
+
+
+def test_qwen3_tts_stateful_codec_terminal_without_fresh_frames_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler, incremental = _stateful_qwen3_tts_scheduler(monkeypatch)
+    state = scheduler.create_stream_state("request")
+    state.code_chunks.append(torch.tensor([[10, 1]], dtype=torch.long))
+    state.total_frames = 1
+
+    delta = scheduler.decode_delta("request", state, is_final=True)
+    terminal = scheduler.decode_delta("request", state, is_final=True)
+
+    assert delta is not None
+    assert delta.numel() == scheduler._samples_per_frame
+    assert terminal is None
+    assert len(incremental.decode_inputs) == 1
 
 
 class _FakeDecodeStream:

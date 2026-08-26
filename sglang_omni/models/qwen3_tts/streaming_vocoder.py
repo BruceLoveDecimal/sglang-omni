@@ -13,6 +13,10 @@ from typing import Any, Mapping
 
 import torch
 
+from sglang_omni.models.qwen3_tts.incremental_codec import (
+    Qwen3TTSIncrementalCodecState,
+    Qwen3TTSIncrementalDecoder,
+)
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
@@ -51,6 +55,8 @@ class _Qwen3TTSStreamState:
     followup_pending: bool = False
     final_pending: bool = False
     playback_deadline_s: float = 0.0
+    incremental_codec_state: Qwen3TTSIncrementalCodecState | None = None
+    incremental_codec_fallback: bool = False
 
 
 class _Qwen3TTSInvalidCodeRows(ValueError):
@@ -349,6 +355,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         followup_batch_wait_ms: int = 1,
         initial_cuda_graph: bool = True,
         enable_deterministic_inference: bool = False,
+        enable_stateful_codec_decoder: bool = False,
     ) -> None:
         if stream_stride <= 0 or stream_followup_stride <= 0:
             raise ValueError("stream strides must be > 0")
@@ -372,13 +379,23 @@ class Qwen3TTSStreamingVocoderScheduler(
         decoder_config = getattr(tokenizer_config, "decoder_config", tokenizer_config)
         num_quantizers = int(getattr(decoder_config, "num_quantizers", 0) or 0)
         self._deterministic_inference = bool(enable_deterministic_inference)
+        self._enable_stateful_codec_decoder = bool(enable_stateful_codec_decoder)
+        self._incremental_decoder = (
+            Qwen3TTSIncrementalDecoder(self._decoder)
+            if self._enable_stateful_codec_decoder
+            else None
+        )
         self._initial_decode_graphs = _Qwen3TTSInitialDecodeGraphs(
             self._decoder,
             device=self._device,
             num_quantizers=num_quantizers,
             input_frames=int(stream_left_context_frames) + int(initial_chunk_frames),
             batch_sizes=(1,) if self._deterministic_inference else (1, 2, 4, 8),
-            enabled=bool(initial_cuda_graph and num_quantizers > 0),
+            enabled=bool(
+                initial_cuda_graph
+                and num_quantizers > 0
+                and not self._enable_stateful_codec_decoder
+            ),
         )
         self._samples_per_frame = int(self._decoder.total_upsample)
         self._stream_stride = int(stream_stride)
@@ -398,7 +415,13 @@ class Qwen3TTSStreamingVocoderScheduler(
         self._default_initial_chunk_frames = int(initial_chunk_frames)
         self._stream_left_context_frames = int(stream_left_context_frames)
         self._async_decode = (
-            self._device.type == "cuda" if async_decode is None else bool(async_decode)
+            False
+            if self._enable_stateful_codec_decoder
+            else (
+                self._device.type == "cuda"
+                if async_decode is None
+                else bool(async_decode)
+            )
         )
         self._decode_staging = threading.local()
         self._pinned_staging_disabled = self._device.type != "cuda"
@@ -626,13 +649,123 @@ class Qwen3TTSStreamingVocoderScheduler(
         *,
         is_final: bool,
     ) -> torch.Tensor | None:
-        del request_id
+        if self._enable_stateful_codec_decoder and not state.incremental_codec_fallback:
+            try:
+                incremental = self._decode_incremental_eager(state)
+            except Exception:
+                state.incremental_codec_fallback = True
+                logger.warning(
+                    "Qwen3-TTS stateful codec decode failed for %r; using the "
+                    "legacy left-context decoder for the rest of the request",
+                    request_id,
+                    exc_info=True,
+                )
+            else:
+                if incremental is None:
+                    return None
+                plan, candidate_state, delta = incremental
+                delta = self._commit_decode_plan(state, plan, delta)
+                state.incremental_codec_state = candidate_state
+                self._prune_incremental_codes(state)
+                return delta
+
         plan = self._build_decode_plan(state, is_final=is_final)
         if plan is None:
             return None
         handle = self._launch_decode_plans([plan], stream=self._decode_stream)
         deltas = handle.resolve()
         return self._commit_decode_plan(state, plan, deltas[0])
+
+    def _decode_incremental_eager(
+        self,
+        state: _Qwen3TTSStreamState,
+    ) -> (
+        tuple[
+            _Qwen3TTSDecodePlan,
+            Qwen3TTSIncrementalCodecState,
+            torch.Tensor,
+        ]
+        | None
+    ):
+        available_generated_frames = state.total_frames - state.ref_frames
+        if available_generated_frames <= state.emitted_generated_frames:
+            return None
+
+        committed_state = state.incremental_codec_state
+        candidate_state = (
+            Qwen3TTSIncrementalCodecState()
+            if committed_state is None
+            else committed_state.clone()
+        )
+        consumed_frames = candidate_state.frame_position
+        expected_consumed_frames = state.ref_frames + state.emitted_generated_frames
+        if consumed_frames != expected_consumed_frames:
+            raise RuntimeError(
+                "Qwen3-TTS incremental codec position does not match emitted frames"
+            )
+        end_frame = state.ref_frames + available_generated_frames
+        if consumed_frames < state.pruned_frames:
+            raise RuntimeError(
+                "Qwen3-TTS incremental codec codes were pruned too early"
+            )
+        codes = torch.cat(state.code_chunks, dim=0)
+        decoder_input = (
+            codes[
+                consumed_frames - state.pruned_frames : end_frame - state.pruned_frames
+            ]
+            .transpose(0, 1)
+            .unsqueeze(0)
+        )
+        bad_rows = self._screen_out_of_range_codes(decoder_input)
+        _raise_for_bad_rows(bad_rows, 1)
+        incremental_decoder = self._incremental_decoder
+        if incremental_decoder is None:
+            raise RuntimeError("Qwen3-TTS incremental codec decoder is unavailable")
+        with torch.inference_mode():
+            waveform = incremental_decoder.decode(
+                decoder_input.to(self._device), candidate_state
+            )
+        if candidate_state.frame_position != end_frame:
+            raise RuntimeError(
+                "Qwen3-TTS incremental codec position did not advance to the decode end"
+            )
+        waveform = self._split_batch_waveform(waveform, 1)[0]
+        reference_frames = max(0, state.ref_frames - consumed_frames)
+        trim_samples = reference_frames * self._samples_per_frame
+        emit_frames = available_generated_frames - state.emitted_generated_frames
+        emit_samples = emit_frames * self._samples_per_frame
+        delta = (
+            waveform[trim_samples : trim_samples + emit_samples]
+            .detach()
+            .to(dtype=torch.float32, device="cpu")
+            .contiguous()
+        )
+        if int(delta.numel()) != emit_samples:
+            raise RuntimeError(
+                "Qwen3-TTS incremental codec decoder returned the wrong delta length"
+            )
+        plan = _Qwen3TTSDecodePlan(
+            decoder_input=decoder_input,
+            absolute_emitted_frames=expected_consumed_frames,
+            generated_frames=available_generated_frames,
+            window_start=consumed_frames,
+            emitted_generated_frames=state.emitted_generated_frames,
+        )
+        return plan, candidate_state, delta
+
+    def _prune_incremental_codes(self, state: _Qwen3TTSStreamState) -> None:
+        committed_state = state.incremental_codec_state
+        assert committed_state is not None
+        retention_start = max(
+            0,
+            committed_state.frame_position - self._stream_left_context_frames,
+        )
+        while (
+            state.code_chunks
+            and state.pruned_frames + int(state.code_chunks[0].shape[0])
+            <= retention_start
+        ):
+            state.pruned_frames += int(state.code_chunks.pop(0).shape[0])
 
     def _build_decode_plan(
         self,
