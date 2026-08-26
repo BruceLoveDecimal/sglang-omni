@@ -26,7 +26,7 @@ class Nemotron3_5ASRRequest:
     started_at_s: float = 0.0
 
 
-def _normalize_language(
+def normalize_nemotron_language(
     value: Any,
     prompt_dictionary: Mapping[str, int],
 ) -> str:
@@ -50,7 +50,7 @@ def _normalize_language(
     return resolved
 
 
-def _validate_greedy_params(params: Mapping[str, Any]) -> int | None:
+def validate_nemotron_greedy_params(params: Mapping[str, Any]) -> int | None:
     try:
         temperature = float(params.get("temperature") or 0.0)
     except (TypeError, ValueError) as exc:
@@ -81,6 +81,12 @@ def _validate_greedy_params(params: Mapping[str, Any]) -> int | None:
     return raw_max_new_tokens
 
 
+# Keep the pre-Phase-3 private names importable for downstream tests and local
+# integrations that used the original offline builder helpers.
+_normalize_language = normalize_nemotron_language
+_validate_greedy_params = validate_nemotron_greedy_params
+
+
 def make_nemotron3_5_asr_request_builder(
     *, prompt_dictionary: Mapping[str, int]
 ) -> Callable[[StagePayload], Nemotron3_5ASRRequest]:
@@ -93,8 +99,10 @@ def make_nemotron3_5_asr_request_builder(
     def request_builder(payload: StagePayload) -> Nemotron3_5ASRRequest:
         started_at_s = time.perf_counter()
         params = payload.request.params or {}
-        max_new_tokens = _validate_greedy_params(params)
-        language = _normalize_language(params.get("language"), prompt_dictionary)
+        max_new_tokens = validate_nemotron_greedy_params(params)
+        language = normalize_nemotron_language(
+            params.get("language"), prompt_dictionary
+        )
         prepared = prepare_audio(
             payload,
             source_name="Nemotron 3.5 ASR",
@@ -116,4 +124,6 @@ __all__ = [
     "NEMOTRON_ASR_SAMPLE_RATE",
     "Nemotron3_5ASRRequest",
     "make_nemotron3_5_asr_request_builder",
+    "normalize_nemotron_language",
+    "validate_nemotron_greedy_params",
 ]

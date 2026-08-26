@@ -15,6 +15,7 @@ from sglang_omni.models.nemotron3_5_asr.config import (
 )
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 from sglang_omni.scheduling.messages import IncomingMessage
+from sglang_omni.scheduling.streaming_simple_scheduler import StreamingSimpleScheduler
 
 
 def test_config_registers_one_terminal_non_engine_stage() -> None:
@@ -30,6 +31,7 @@ def test_config_registers_one_terminal_non_engine_stage() -> None:
     assert stage.factory.dtype == "float32"
     assert stage.factory.max_batch_size == 8
     assert stage.factory.max_batch_wait_ms == 2.0
+    assert stage.factory.max_pending_stream_messages == 256
     assert (
         PIPELINE_CONFIG_REGISTRY.get_config("Nemotron3_5AsrForRNNT")
         is Nemotron3_5ASRPipelineConfig
@@ -47,8 +49,22 @@ def test_stage_factory_uses_serial_true_batch_scheduler(monkeypatch) -> None:
     class FakeRunner:
         prompt_dictionary = {"auto": 101, "en-US": 0}
 
+        streaming_chunk_spec = {
+            "sample_rate": 16000,
+            "first_samples": 4,
+            "subsequent_samples": 8,
+            "first_frames": 1,
+            "subsequent_frames": 2,
+            "hop_length": 2,
+            "n_fft": 4,
+            "streaming_latency_ms": 10,
+        }
+
         def __init__(self, model_path, **kwargs):
             calls["load"] = (model_path, kwargs)
+
+        def new_streaming_decode_state(self):
+            return SimpleNamespace(tokens=[0], durations=[0])
 
         def run_one(self, request):
             calls["one"] = request
@@ -75,10 +91,10 @@ def test_stage_factory_uses_serial_true_batch_scheduler(monkeypatch) -> None:
         max_batch_wait_ms=5,
     )
 
+    assert isinstance(scheduler, StreamingSimpleScheduler)
     assert scheduler._batch_fn is not None
     assert scheduler._max_batch_size == 4
     assert scheduler._max_batch_wait_s == 0.005
-    assert scheduler._max_concurrency == 1
     assert scheduler._fn("one").payload == "one"
     assert [item.payload for item in scheduler._batch_fn(["a", "b"])] == ["a", "b"]
     assert len(calls["batch"]) == 2
@@ -90,6 +106,19 @@ def test_stage_factory_uses_serial_true_batch_scheduler(monkeypatch) -> None:
 def test_batch_request_build_failure_does_not_poison_valid_peer(monkeypatch) -> None:
     class FakeRunner:
         prompt_dictionary = {"auto": 101}
+        streaming_chunk_spec = {
+            "sample_rate": 16000,
+            "first_samples": 4,
+            "subsequent_samples": 8,
+            "first_frames": 1,
+            "subsequent_frames": 2,
+            "hop_length": 2,
+            "n_fft": 4,
+            "streaming_latency_ms": 10,
+        }
+
+        def new_streaming_decode_state(self):
+            return SimpleNamespace(tokens=[0], durations=[0])
 
         def __init__(self, *args, **kwargs):
             pass
@@ -119,7 +148,7 @@ def test_batch_request_build_failure_does_not_poison_valid_peer(monkeypatch) -> 
     )
     loop = asyncio.new_event_loop()
     try:
-        scheduler._run_batch(
+        scheduler._run_non_streaming_batch(
             [
                 IncomingMessage("good", "new_request", "good"),
                 IncomingMessage("bad", "new_request", "bad"),

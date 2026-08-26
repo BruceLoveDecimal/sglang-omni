@@ -19,6 +19,7 @@ class Nemotron3_5ASRFactoryArgs(FactoryArgs):
     num_lookahead_tokens: Literal[0, 3, 6, 13] | None = 3
     max_batch_size: int | None = Field(default=8, ge=1)
     max_batch_wait_ms: float | None = Field(default=2.0, ge=0)
+    max_pending_stream_messages: int | None = Field(default=256, ge=1)
 
 
 class Nemotron3_5ASRStageConfig(StageConfig):
