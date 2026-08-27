@@ -17,6 +17,7 @@ from sglang_omni.models.qwen3_tts.request_builders import (
     preprocess_qwen3_tts_payload,
 )
 from sglang_omni.models.qwen3_tts.streaming_vocoder import (
+    DEFAULT_QWEN3_TTS_CODEC_STATE_SLOTS,
     DEFAULT_QWEN3_TTS_INITIAL_CHUNK_FRAMES,
     DEFAULT_QWEN3_TTS_LEFT_CONTEXT_FRAMES,
     DEFAULT_QWEN3_TTS_STREAM_FOLLOWUP_STRIDE,
@@ -184,6 +185,7 @@ def create_vocoder_executor(
     initial_cuda_graph: bool = True,
     enable_deterministic_inference: bool = False,
     enable_stateful_codec_decoder: bool = False,
+    codec_state_slots: int = DEFAULT_QWEN3_TTS_CODEC_STATE_SLOTS,
 ) -> SimpleScheduler:
     device = resolve_device_spec(device, gpu_id)
     tokenizer = _load_qwen3_tts_tokenizer(
@@ -210,4 +212,5 @@ def create_vocoder_executor(
         initial_cuda_graph=initial_cuda_graph,
         enable_deterministic_inference=enable_deterministic_inference,
         enable_stateful_codec_decoder=enable_stateful_codec_decoder,
+        codec_state_slots=codec_state_slots,
     )
