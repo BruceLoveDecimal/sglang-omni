@@ -532,7 +532,7 @@ def test_arena_cohort_matches_per_stream_decodes() -> None:
     """
     torch.manual_seed(14)
     decoder = _Decoder()
-    incremental, arena = _make_arena(decoder)
+    incremental, arena = _make_arena(decoder, slots=8)
 
     warmups = [0, 3, 9]
     fresh = 2
