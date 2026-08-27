@@ -939,10 +939,6 @@ class Qwen3TTSStreamingVocoderScheduler(
                 return None
             state.codec_slot = slot
             state.codec_frame_position = 0
-        # Note (liuqihao): claim the slot for a decode now, while _state_lock is
-        # held. An abort that lands between here and the launch then defers the
-        # release instead of handing the slot to another stream mid-decode.
-        self._mark_codec_slots_in_flight([state.codec_slot])
 
         consumed_frames = state.codec_frame_position
         expected_consumed_frames = (
@@ -973,6 +969,12 @@ class Qwen3TTSStreamingVocoderScheduler(
                 f"{fresh_frames} fresh frames but sliced "
                 f"{int(decoder_input.shape[-1])}"
             )
+        # Note (liuqihao): claim the slot for this launch while _state_lock is
+        # still held, and only once the plan is certain. An abort landing
+        # between here and the launch then defers the release instead of
+        # handing a live slot to another stream; a planning failure above
+        # leaves the slot unclaimed so it is released immediately.
+        self._mark_codec_slots_in_flight([state.codec_slot])
         return _IncrementalDecodePlan(
             decoder_input=decoder_input,
             slot=state.codec_slot,
