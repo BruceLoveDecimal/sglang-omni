@@ -44,20 +44,32 @@ merely equal to it. Accuracy reports must therefore carry three rows —
 full-sequence, current streaming, incremental streaming — or the difference gets
 misread as a regression.
 
-Measured on the real `Qwen3-TTS-12Hz-1.7B-Base` Codec decoder (RTX 4080 SUPER,
-float32, 100 random codec frames, deviation from a whole-sequence
-`chunked_decode`):
+Measured on the real `Qwen3-TTS-12Hz-1.7B-Base` Codec decoder (RTX 4080 SUPER),
+decoding 99 codec frames encoded from a real speech clip and comparing each
+streaming path against a whole-sequence `chunked_decode`:
 
-| path | mean abs | rms | max abs |
-| :--- | ---: | ---: | ---: |
-| incremental | 5.3e-5 | 1.4e-4 | 7.4e-3 |
-| left-context streaming (16 frames) | 2.77e-2 | 6.7e-2 | 1.105 |
+| dtype | path | mean abs | rms | correlation |
+| :--- | :--- | ---: | ---: | ---: |
+| float32 | incremental | 7.6e-6 | 1.5e-5 | **1.000000** |
+| float32 | left-context streaming (16 frames) | 4.9e-3 | 1.5e-2 | **0.885** |
+| bfloat16 | incremental | 2.7e-4 | 6.0e-4 | 0.999787 |
+| bfloat16 | left-context streaming (16 frames) | 6.5e-3 | 1.7e-2 | 0.825 |
 
-The shipped streaming path sits roughly **500x further from full-sequence
-decoding** than the incremental path does. Random codec ids are the worst case:
-they decode to noise, and the terminal `SnakeBeta` (`x + sin^2(a*x)/b`)
-amplifies small perturbations, which is why the max column sits far above the
-mean. Repeat on real generated codes before quoting these numbers.
+The incremental path reproduces whole-sequence decoding to float32 rounding.
+The shipped streaming path does not: its output correlates only ~0.83-0.89 with
+what a whole-sequence decode of the same codec tokens produces. So a waveform
+diff between the two paths measures the *shipped* path's truncation error, and
+the incremental path is the corrected one — this is the headline number, and
+without it the diff reads as a regression.
+
+Use real codec tokens for this. Random codec ids decode to noise and the
+terminal `SnakeBeta` (`x + sin^2(a*x)/b`) amplifies perturbations through it:
+the same incremental comparison on random ids reports mean 5.3e-5 rather than
+7.6e-6, and a max of 7.4e-3 rather than 3.3e-4.
+
+End to end, with a fixed seed so the Talker emits identical codec tokens both
+times, the two paths produce byte-identical-length audio whose waveforms
+correlate 0.758 — consistent with the per-path numbers above.
 
 Batching is a second, separate source of deviation. A cohort is **not** bitwise
 equal to the same rows decoded alone, because batched matmuls reduce in a
