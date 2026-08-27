@@ -44,6 +44,28 @@ merely equal to it. Accuracy reports must therefore carry three rows —
 full-sequence, current streaming, incremental streaming — or the difference gets
 misread as a regression.
 
+Measured on the real `Qwen3-TTS-12Hz-1.7B-Base` Codec decoder (RTX 4080 SUPER,
+float32, 100 random codec frames, deviation from a whole-sequence
+`chunked_decode`):
+
+| path | mean abs | rms | max abs |
+| :--- | ---: | ---: | ---: |
+| incremental | 5.3e-5 | 1.4e-4 | 7.4e-3 |
+| left-context streaming (16 frames) | 2.77e-2 | 6.7e-2 | 1.105 |
+
+The shipped streaming path sits roughly **500x further from full-sequence
+decoding** than the incremental path does. Random codec ids are the worst case:
+they decode to noise, and the terminal `SnakeBeta` (`x + sin^2(a*x)/b`)
+amplifies small perturbations, which is why the max column sits far above the
+mean. Repeat on real generated codes before quoting these numbers.
+
+Batching is a second, separate source of deviation. A cohort is **not** bitwise
+equal to the same rows decoded alone, because batched matmuls reduce in a
+different order: measured against solo decodes, float32 mean 2.5e-5 / max
+1.0e-3, bf16 mean 6.6e-4 / max 4.3e-2. The error scales with the dtype and stays
+below the incremental path's own deviation from full-sequence decoding, but any
+parity test that runs with batching on must assert a tolerance, never equality.
+
 ## Decoder structure and state inventory
 
 `Qwen3TTSTokenizerV2Decoder.forward` is
