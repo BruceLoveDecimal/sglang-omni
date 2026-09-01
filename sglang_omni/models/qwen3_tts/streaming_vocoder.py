@@ -38,6 +38,7 @@ DEFAULT_QWEN3_TTS_STREAM_INITIAL_FOLLOWUP_STRIDE = 8
 DEFAULT_QWEN3_TTS_INITIAL_CHUNK_FRAMES = 8
 DEFAULT_QWEN3_TTS_LEFT_CONTEXT_FRAMES = 16
 DEFAULT_QWEN3_TTS_CODEC_STATE_SLOTS = 64
+_CODEC_STATS_LOG_INTERVAL_S = 60.0
 _QWEN3_TTS_CODEBOOK_SIZE = 2048
 
 
@@ -584,6 +585,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         )
         self._codec_arena = self._build_codec_arena(int(codec_state_slots))
         self._codec_fallback_count = 0
+        self._codec_stats_last_log_s = time.monotonic()
         self._codec_lock = threading.Lock()
         # Slots handed to a launch that has not resolved yet, and slots whose
         # request ended while their decode was still in flight. A deferred slot
@@ -659,13 +661,30 @@ class Qwen3TTSStreamingVocoderScheduler(
         return arena
 
     def codec_state_stats(self) -> dict[str, Any]:
-        """Report incremental Codec state usage for the serving stats surface."""
+        """Snapshot of incremental Codec state usage.
+
+        Logged periodically by ``_maybe_log_codec_stats`` on the incremental
+        decode path, the same surface the reference-encoder cache uses.
+        """
         if self._codec_arena is None:
             return {"enabled": False}
         stats = self._codec_arena.describe()
         stats["enabled"] = True
         stats["left_context_fallbacks"] = self._codec_fallback_count
         return stats
+
+    def _maybe_log_codec_stats(self) -> None:
+        """Rate-limited serving-log line so operators see arena saturation
+        (``active_slots`` nearing ``slots``) before requests start falling
+        back to the left-context decoder."""
+        now = time.monotonic()
+        if now - self._codec_stats_last_log_s < _CODEC_STATS_LOG_INTERVAL_S:
+            return
+        with self._codec_lock:
+            if now - self._codec_stats_last_log_s < _CODEC_STATS_LOG_INTERVAL_S:
+                return
+            self._codec_stats_last_log_s = now
+        logger.info("Qwen3-TTS incremental Codec state: %s", self.codec_state_stats())
 
     def start(self) -> None:
         try:
@@ -1873,6 +1892,7 @@ class Qwen3TTSStreamingVocoderScheduler(
             # Every slot claimed by planning is released here exactly once,
             # including slots whose stream was aborted or fell back mid-decode.
             self._finish_codec_slots(claimed_slots)
+            self._maybe_log_codec_stats()
 
     def _decode_incremental_cohorts(
         self,
