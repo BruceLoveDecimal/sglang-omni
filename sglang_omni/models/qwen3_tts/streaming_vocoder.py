@@ -61,9 +61,9 @@ class _Qwen3TTSStreamState:
     incremental_codec_state: Qwen3TTSIncrementalCodecState | None = None
     incremental_codec_fallback: bool = False
     codec_slot: int | None = None
-    # Host mirror of the slot's absolute frame position. The arena also keeps
-    # it on device, but reading that back would sync; the cohort's positions
-    # are built from this instead.
+    # Note (Qihao Liu): host mirror of the slot's absolute frame position. The
+    # arena also keeps it on device, but reading that back would sync; the
+    # cohort's positions are built from this instead.
     codec_frame_position: int = 0
 
 
@@ -79,9 +79,9 @@ class _Qwen3TTSInvalidCodeRows(ValueError):
 class _IncrementalDecodePlan:
     """One stream's fresh-frame decode against its arena slot.
 
-    ``generated_frames`` and ``emitted_generated_frames`` carry the same
-    meaning as on ``_Qwen3TTSDecodePlan`` so ``_commit_decode_plan`` accepts
-    either kind of plan unchanged.
+    ``generated_frames`` and ``emitted_generated_frames`` keep the meaning they
+    have on ``_Qwen3TTSDecodePlan``, so the shared commit path reads them the
+    same way for both plan kinds.
     """
 
     decoder_input: torch.Tensor
@@ -230,9 +230,8 @@ class _Qwen3TTSDecodeHandle:
         ``resolve()`` discards every delta when any row held out-of-range codec
         ids, because its caller can simply re-run the survivors. A decode that
         advanced per-row incremental state cannot re-run anything, so this
-        keeps the good rows' deltas and merely names the bad ones. Rows that
-        needed clamping are still never emitted: they are reported here and the
-        caller fails those streams.
+        keeps the good rows' deltas and only names the bad ones, which the
+        caller then fails.
         """
         if self._done:
             if self._failure is not None:
@@ -275,7 +274,7 @@ class _Qwen3TTSDecodeHandle:
                 slot.broken = True
                 if self.owner is not None:
                     self.owner._cuda_decode_failed = True
-                # Note (liuqihao): the decode may still be writing this
+                # Note (Qihao Liu): the decode may still be writing this
                 # cohort's arena rows, so those slots can never be handed to
                 # later work either.
                 if self.incremental is not None:
@@ -570,10 +569,10 @@ class Qwen3TTSStreamingVocoderScheduler(
         self._followup_batch_wait_s = float(followup_batch_wait_ms) / 1000.0
         self._default_initial_chunk_frames = int(initial_chunk_frames)
         self._stream_left_context_frames = int(stream_left_context_frames)
-        # Note (liuqihao): T-PR7 kept the incremental path synchronous while it
-        # was B=1 only. With arena-backed state the follow-up worker batches it,
-        # so only deterministic inference still forces the synchronous path,
-        # where each request must decode alone anyway (#1475).
+        # Note (Qihao Liu): the incremental path was synchronous while its state
+        # was per-request and B=1 only. Arena-backed state lets the async
+        # workers batch it, so only deterministic inference still forces the
+        # synchronous path, where each request decodes alone anyway (#1475).
         self._async_decode = (
             False
             if (self._enable_stateful_codec_decoder and self._deterministic_inference)
@@ -587,9 +586,9 @@ class Qwen3TTSStreamingVocoderScheduler(
         self._codec_fallback_count = 0
         self._codec_stats_last_log_s = time.monotonic()
         self._codec_lock = threading.Lock()
-        # Slots handed to a launch that has not resolved yet, and slots whose
-        # request ended while their decode was still in flight. A deferred slot
-        # only returns to the arena once the decode that touched it is proven
+        # Note (Qihao Liu): in-flight holds slots handed to a launch that has
+        # not resolved; deferred holds slots whose request ended mid-decode. A
+        # deferred slot only returns to the arena once that decode is proven
         # complete, so a reused slot can never be zeroed underneath live work.
         self._codec_slots_in_flight: set[int] = set()
         self._codec_slots_deferred: set[int] = set()
@@ -636,7 +635,6 @@ class Qwen3TTSStreamingVocoderScheduler(
         )
 
     def _build_codec_arena(self, num_slots: int) -> Qwen3TTSCodecStateArena | None:
-        """Preallocate incremental state for up to ``num_slots`` streams."""
         if self._incremental_decoder is None:
             return None
         parameters = getattr(self._decoder, "parameters", None)
@@ -661,11 +659,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         return arena
 
     def codec_state_stats(self) -> dict[str, Any]:
-        """Snapshot of incremental Codec state usage.
-
-        Logged periodically by ``_maybe_log_codec_stats`` on the incremental
-        decode path, the same surface the reference-encoder cache uses.
-        """
+        """Snapshot of incremental Codec state usage."""
         if self._codec_arena is None:
             return {"enabled": False}
         stats = self._codec_arena.describe()
@@ -674,9 +668,12 @@ class Qwen3TTSStreamingVocoderScheduler(
         return stats
 
     def _maybe_log_codec_stats(self) -> None:
-        """Rate-limited serving-log line so operators see arena saturation
-        (``active_slots`` nearing ``slots``) before requests start falling
-        back to the left-context decoder."""
+        """Log arena usage at most once per interval.
+
+        Note (Qihao Liu): saturation (``active_slots`` nearing ``slots``) is the
+        only warning operators get before requests start falling back to the
+        left-context decoder.
+        """
         now = time.monotonic()
         if now - self._codec_stats_last_log_s < _CODEC_STATS_LOG_INTERVAL_S:
             return
@@ -879,7 +876,7 @@ class Qwen3TTSStreamingVocoderScheduler(
         if (
             self._enable_stateful_codec_decoder
             and not state.incremental_codec_fallback
-            # Note (liuqihao): a stream that owns an arena slot is driven by the
+            # Note (Qihao Liu): a stream that owns an arena slot is driven by the
             # async cohort path; this synchronous path must not advance the same
             # state from a second place.
             and state.codec_slot is None
@@ -1071,7 +1068,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                 f"{fresh_frames} fresh frames but sliced "
                 f"{int(decoder_input.shape[-1])}"
             )
-        # Note (liuqihao): claim the slot for this launch while _state_lock is
+        # Note (Qihao Liu): claim the slot for this launch while _state_lock is
         # still held, and only once the plan is certain. An abort landing
         # between here and the launch then defers the release instead of
         # handing a live slot to another stream; a planning failure above
@@ -1139,8 +1136,9 @@ class Qwen3TTSStreamingVocoderScheduler(
     ) -> None:
         """Drop consumed codes but keep a left-context window.
 
-        The retained window is what lets an incremental failure fall back to
-        the left-context decoder mid-request instead of restarting it.
+        Note (Qihao Liu): the retained window is what lets an incremental
+        failure fall back to the left-context decoder mid-request instead of
+        restarting the request.
         """
         retention_start = max(0, frame_position - self._stream_left_context_frames)
         while (
@@ -1240,7 +1238,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                 "stream failure"
             )
         if incremental is not None and self._deterministic_inference and len(plans) > 1:
-            # Note (liuqihao): an incremental cohort cannot be split into
+            # Note (Qihao Liu): an incremental cohort cannot be split into
             # per-plan decodes, because each plan advances its own arena slot
             # exactly once. Deterministic inference keeps the incremental path
             # synchronous and B=1 instead, so this should be unreachable.
@@ -1266,9 +1264,6 @@ class Qwen3TTSStreamingVocoderScheduler(
         bad_rows = self._screen_out_of_range_codes(decoder_input)
         with torch.inference_mode():
             if stream is None:
-                # Screening raises before anything is decoded here, so an
-                # incremental cohort's arena state is left untouched and the
-                # survivors can be retried.
                 _raise_for_bad_rows(bad_rows, len(plans))
                 if incremental is not None:
                     waveform = incremental.decoder.decode(
@@ -1329,7 +1324,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                     waveform = incremental.decoder.decode(
                         gpu_input, incremental.cohort_state
                     )
-                    # Note (liuqihao): the scatter is enqueued on the decode
+                    # Note (Qihao Liu): the scatter is enqueued on the decode
                     # stream right behind the decode that produced it, so the
                     # arena rows are written in stream order. The next decode
                     # for these slots is only scheduled after resolve(), which
@@ -1728,10 +1723,12 @@ class Qwen3TTSStreamingVocoderScheduler(
     ) -> tuple[Any, bool]:
         """Plan one decode, preferring the incremental path.
 
-        Returns ``(plan, is_incremental)``. A ``None`` plan means there is no
-        work yet; the incremental flag still says which planner produced it, so
-        an exhausted arena degrades this request to the left-context planner
-        without disturbing the others. Must be called under ``_state_lock``.
+        Returns ``(plan, is_incremental)``; a ``None`` plan means there is no
+        work yet. Must be called under ``_state_lock``.
+
+        Note (Qihao Liu): the flag still says which planner produced the plan,
+        so an exhausted arena degrades this request to the left-context planner
+        without disturbing the others.
         """
         if self._use_incremental_path(state):
             try:
@@ -1796,7 +1793,7 @@ class Qwen3TTSStreamingVocoderScheduler(
                 else:
                     planned.append((request_id, state, plan))
 
-        # Note (liuqihao): a bootstrap decode consumes ref_frames + the first
+        # Note (Qihao Liu): a bootstrap decode consumes ref_frames + the first
         # chunk, and reference length is per request, so these shapes are
         # inherently ragged. Keep them at B=1 rather than padding; only the
         # uniform follow-up decodes are worth cohorting.
@@ -1853,11 +1850,11 @@ class Qwen3TTSStreamingVocoderScheduler(
     ) -> list[list[tuple[str, _Qwen3TTSStreamState, _IncrementalDecodePlan]]]:
         """Cohort by fresh frame count alone.
 
-        Arena-backed state is always the full retained width with per-row
-        positions, so a cold stream and a warm stream have the same execution
-        shape and differ only in their attention mask. Fresh frames are the
-        only thing that changes the shape, which is why playback position does
-        not need to enter the key.
+        Note (Qihao Liu): arena-backed state is always the full retained width
+        with per-row positions, so a cold stream and a warm stream have the
+        same execution shape and differ only in their attention mask. Fresh
+        frames are the only thing that changes the shape, which is why playback
+        position does not enter the key.
         """
         groups: dict[
             int, list[tuple[str, _Qwen3TTSStreamState, _IncrementalDecodePlan]]
@@ -1875,12 +1872,13 @@ class Qwen3TTSStreamingVocoderScheduler(
         tuple[list[tuple[str, _Qwen3TTSStreamState, _IncrementalDecodePlan]], list]
         | None
     ):
-        """Gather a cohort's slots, decode once, scatter, and split failures.
+        """Decode a cohort and return the surviving entries with their deltas.
 
         Rows that held out-of-range codec ids fail their streams; unlike the
         left-context path the survivors are not re-run, because their arena
         state has already advanced. Any other failure falls the whole cohort
-        back to the left-context decoder instead of killing the streams.
+        back to the left-context decoder instead of killing the streams. Every
+        slot claimed by planning is released here exactly once.
         """
         arena = self._codec_arena
         decoder = self._incremental_decoder
@@ -1889,8 +1887,6 @@ class Qwen3TTSStreamingVocoderScheduler(
         try:
             return self._decode_incremental_cohorts(group, stream=stream)
         finally:
-            # Every slot claimed by planning is released here exactly once,
-            # including slots whose stream was aborted or fell back mid-decode.
             self._finish_codec_slots(claimed_slots)
             self._maybe_log_codec_stats()
 
@@ -1909,8 +1905,8 @@ class Qwen3TTSStreamingVocoderScheduler(
         while group:
             slots = [entry[2].slot for entry in group]
             try:
-                # Gathering is inside the guard too: a failure here must
-                # degrade the cohort, not kill the worker thread.
+                # Note (Qihao Liu): gathering is inside the guard too: a failure
+                # here must degrade the cohort, not kill the worker thread.
                 cohort_state = arena.gather(slots)
                 cohort_state.frame_positions = torch.tensor(
                     [entry[1].codec_frame_position for entry in group],
@@ -1930,8 +1926,9 @@ class Qwen3TTSStreamingVocoderScheduler(
                 )
                 deltas, bad_indices = handle.resolve_partial()
             except _Qwen3TTSInvalidCodeRows as exc:
-                # Raised by the synchronous path before anything was decoded,
-                # so the survivors' slots are untouched and can be retried.
+                # Note (Qihao Liu): raised by the synchronous path before
+                # anything was decoded, so the survivors' slots are untouched
+                # and can be retried.
                 bad = set(exc.indices)
                 for index, (request_id, state, _) in enumerate(group):
                     if index in bad:
@@ -1969,8 +1966,9 @@ class Qwen3TTSStreamingVocoderScheduler(
     ) -> None:
         """Retire a stream's incremental slot and re-queue it on the old path.
 
-        The left-context codes were retained for exactly this case, so the
-        request continues from the same emitted position instead of aborting.
+        Note (Qihao Liu): the left-context codes were retained for exactly this
+        case, so the request continues from the same emitted position instead
+        of aborting.
         """
         logger.warning(
             "Qwen3-TTS incremental Codec decode failed for %r (%s); using the "
@@ -1986,8 +1984,9 @@ class Qwen3TTSStreamingVocoderScheduler(
             state.incremental_codec_fallback = True
             self._codec_fallback_count += 1
             self._release_codec_slot(state)
-            # Nothing was committed, so re-arm whichever stage was running or
-            # the stream would stall with its pending flag still set.
+            # Note (Qihao Liu): nothing was committed, so re-arm whichever stage
+            # was running or the stream would stall with its pending flag still
+            # set.
             if state.decoded_chunks:
                 state.followup_pending = False
                 self._schedule_followup(request_id, state)

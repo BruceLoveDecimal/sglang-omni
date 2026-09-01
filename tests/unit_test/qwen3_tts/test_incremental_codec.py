@@ -602,7 +602,8 @@ def test_arena_reports_exhaustion_and_retirement() -> None:
     arena.retire(reused)
     assert arena.acquire() is None
     assert arena.active_slots() == 0
-    # A retired slot stays withdrawn even if its owner releases it later.
+    # Note (Qihao Liu): a retired slot stays withdrawn even if its owner
+    # releases it later.
     arena.release(reused)
     assert arena.acquire() is None
     assert arena.describe()["bytes_per_slot"] == arena.bytes_per_slot

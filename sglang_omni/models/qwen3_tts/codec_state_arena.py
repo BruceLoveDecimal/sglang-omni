@@ -18,18 +18,14 @@ from sglang_omni.models.qwen3_tts.incremental_codec import (
 class Qwen3TTSCodecStateArena:
     """Bounded, reusable storage for per-stream incremental Codec state.
 
-    Layout:
-        every buffer from ``Qwen3TTSIncrementalDecoder.state_spec`` carries a
-        leading slot dimension, so the arena is exactly the state a decode of
-        ``num_slots`` rows would use. ``gather`` selects a cohort's rows into a
-        contiguous state, ``scatter`` writes the advanced state back.
+    Every buffer from ``Qwen3TTSIncrementalDecoder.state_spec`` carries a
+    leading slot dimension, so the arena is exactly the state a decode of
+    ``num_slots`` rows would use: ``gather`` selects a cohort's rows into a
+    contiguous state and ``scatter`` writes the advanced state back.
 
-    Lifecycle:
-        ``acquire`` zeroes a slot before handing it out, so a reused slot is
-        provably a cold start. ``release`` returns it without clearing, because
-        the next ``acquire`` clears. ``retire`` removes a slot permanently, for
-        the case where a decode's CUDA completion could not be proven and the
-        memory must never be handed to later work.
+    Note (Qihao Liu): ``acquire`` zeroes a slot before handing it out, so a
+    reused slot is provably a cold start; ``release`` therefore returns a slot
+    without clearing it.
     """
 
     def __init__(
@@ -99,9 +95,8 @@ class Qwen3TTSCodecStateArena:
     def retire(self, slot: int) -> None:
         """Withdraw a slot for the life of the process.
 
-        Used when a decode that touched the slot could not be proven complete,
-        mirroring how the vocoder retains pinned staging buffers it can no
-        longer trust.
+        Note (Qihao Liu): used when a decode that touched the slot could not be
+        proven complete, so its memory must never be handed to later work.
         """
         with self._lock:
             self._retired.add(slot)

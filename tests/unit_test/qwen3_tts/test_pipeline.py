@@ -1662,8 +1662,8 @@ def test_qwen3_tts_stateful_codec_uses_reference_once_then_fresh_frames(
     state.total_frames = 5
     second = scheduler.decode_delta("request", state, is_final=False)
 
-    # T-PR8 batches follow-up incremental decodes through the async workers,
-    # so the path is no longer forced synchronous.
+    # Note (Qihao Liu): incremental decodes now run through the async workers,
+    # so enabling the stateful Codec no longer forces synchronous decoding.
     assert scheduler._async_decode is True
     assert scheduler._initial_decode_graphs._enabled is False
     assert first is not None
@@ -5610,7 +5610,6 @@ def test_qwen3_tts_codec_slot_is_released_when_the_stream_finishes(
     assert slot is not None
     assert arena.active_slots() == 1
 
-    # The cohort that plan belongs to resolves, then the stream finishes.
     scheduler._finish_codec_slots([slot])
     scheduler.clear_stream_state("request")
     assert state.codec_slot is None
@@ -5636,11 +5635,9 @@ def test_qwen3_tts_codec_slot_release_waits_for_an_in_flight_decode(
     assert plan is not None
     slot = state.codec_slot
     assert slot is not None
-    # Planning claims the slot for the launch it just produced.
     assert slot in scheduler._codec_slots_in_flight
 
     scheduler.clear_stream_state("request")
-    # Deferred, not free: acquiring must not hand this slot out again.
     assert arena.acquire() != slot
 
     scheduler._finish_codec_slots([slot])

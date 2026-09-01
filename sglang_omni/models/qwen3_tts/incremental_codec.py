@@ -9,8 +9,6 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-_DTYPE_BYTES_FALLBACK = 4
-
 
 @dataclass(frozen=True)
 class Qwen3TTSIncrementalCodecStateSpec:
@@ -30,7 +28,7 @@ class Qwen3TTSIncrementalCodecStateSpec:
     retained_context: int
 
     def bytes_per_stream(self, dtype: torch.dtype) -> int:
-        itemsize = getattr(dtype, "itemsize", _DTYPE_BYTES_FALLBACK)
+        itemsize = torch.empty((), dtype=dtype).element_size()
         elements = sum(channels * length for _, channels, length in self.conv_histories)
         elements += sum(
             channels * length for _, channels, length in self.transconv_overlaps
@@ -53,7 +51,7 @@ class Qwen3TTSIncrementalCodecState:
     transformer_values: dict[int, torch.Tensor] = field(default_factory=dict)
     conv_histories: dict[str, torch.Tensor] = field(default_factory=dict)
     transconv_overlaps: dict[str, torch.Tensor] = field(default_factory=dict)
-    # Note (liuqihao): absolute frame position per batch row. ``None`` means
+    # Note (Qihao Liu): absolute frame position per batch row. ``None`` means
     # every row shares ``frame_position``, which is the single-request case.
     # A cohort assembled from a state arena sets this so streams at different
     # playback positions can execute in one launch.
@@ -247,14 +245,13 @@ def _incremental_attention(
     scores = torch.matmul(query, repeated_key.transpose(2, 3)) * float(
         attention.scaling
     )
-    # [B, 1, K] <= [B, Q, 1] -> [B, Q, K]; broadcast over heads on masked_fill.
     keys_by_row = key_positions.unsqueeze(1)
     queries_by_row = query_positions.unsqueeze(2)
     allowed = keys_by_row <= queries_by_row
     sliding_window = int(attention.sliding_window)
     if sliding_window > 0:
         allowed &= keys_by_row > (queries_by_row - sliding_window)
-    # Note (liuqihao): a right-aligned K/V buffer that a stream has not filled
+    # Note (Qihao Liu): a right-aligned K/V buffer that a stream has not filled
     # yet holds zeros whose nominal absolute position is negative. Those slots
     # would otherwise satisfy both tests above for an early query, so mask them
     # explicitly. This is what lets a cold and a warm stream share one cohort.
@@ -279,10 +276,11 @@ def _incremental_transformer(
     fresh_frames = int(hidden_states.shape[1])
     device = hidden_states.device
     frame_positions = state.row_frame_positions(batch_size, device)
-    # The retained buffer is right-aligned: slot j of a buffer of length P holds
-    # absolute position frame_position - P + j. Deriving P from the buffer
-    # rather than from transformer_context_length keeps this correct when an
-    # arena hands over a full-width buffer that a cold stream has not filled.
+    # Note (Qihao Liu): the retained buffer is right-aligned: slot j of a buffer
+    # of length P holds absolute position frame_position - P + j. Deriving P
+    # from the buffer rather than from transformer_context_length keeps this
+    # correct when an arena hands over a full-width buffer that a cold stream
+    # has not filled.
     prior_key = state.transformer_keys.get(0)
     prior_length = 0 if prior_key is None else int(prior_key.shape[-2])
     key_offsets = torch.arange(
@@ -472,11 +470,10 @@ class Qwen3TTSIncrementalDecoder:
     def state_spec(self) -> Qwen3TTSIncrementalCodecStateSpec:
         """Describe one stream's state without running a decode.
 
-        The lazy buffers in ``decode`` only materialize once activations have
-        flowed through, so a state arena cannot preallocate from them. This
-        walks the validated module tree in the same order ``decode`` does and
-        derives every key and shape statically. Zero-length entries are kept so
-        the key set does not depend on kernel sizes.
+        Note (Qihao Liu): the lazy buffers in ``decode`` only materialize once
+        activations have flowed through, so a state arena cannot preallocate
+        from them. This walks the validated module tree in the same order
+        ``decode`` does and derives every key and shape statically.
         """
         if self._state_spec is None:
             self._state_spec = self._build_state_spec()
@@ -535,10 +532,11 @@ class Qwen3TTSIncrementalDecoder:
     ) -> Qwen3TTSIncrementalCodecState:
         """Allocate a zeroed state with full-width buffers.
 
-        Unlike the lazily grown state, the Transformer K/V buffers start at
-        their retained width. A stream that has not filled them yet reads zeros
-        at negative nominal positions, which ``_incremental_attention`` masks
-        out, so a cold and a warm stream share one execution shape.
+        Note (Qihao Liu): unlike the lazily grown state, the Transformer K/V
+        buffers start at their retained width. A stream that has not filled
+        them yet reads zeros at negative nominal positions, which
+        ``_incremental_attention`` masks out, so a cold and a warm stream share
+        one execution shape.
         """
         spec = self.state_spec()
         state = Qwen3TTSIncrementalCodecState(
