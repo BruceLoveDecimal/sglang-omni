@@ -582,7 +582,11 @@ class Qwen3TTSStreamingVocoderScheduler(
                 else bool(async_decode)
             )
         )
-        self._codec_arena = self._build_codec_arena(int(codec_state_slots))
+        self._codec_arena = (
+            self._build_codec_arena(int(codec_state_slots))
+            if self._async_decode
+            else None
+        )
         self._codec_fallback_count = 0
         self._codec_stats_last_log_s = time.monotonic()
         self._codec_lock = threading.Lock()

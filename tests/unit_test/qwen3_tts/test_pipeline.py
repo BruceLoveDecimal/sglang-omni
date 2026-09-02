@@ -1619,6 +1619,7 @@ def _stateful_qwen3_tts_scheduler(
     fail_on_call: int | None = None,
     stream_left_context_frames: int = 1,
     stream_followup_stride: int = DEFAULT_QWEN3_TTS_STREAM_FOLLOWUP_STRIDE,
+    async_decode: bool = True,
 ) -> tuple[Qwen3TTSStreamingVocoderScheduler, _FakeIncrementalQwen3TTSDecoder]:
     created = []
 
@@ -1637,13 +1638,24 @@ def _stateful_qwen3_tts_scheduler(
     scheduler = Qwen3TTSStreamingVocoderScheduler(
         _FakeQwen3TTSTokenizer(),
         device="cpu",
-        async_decode=True,
+        async_decode=async_decode,
         initial_cuda_graph=True,
         stream_left_context_frames=stream_left_context_frames,
         stream_followup_stride=stream_followup_stride,
         enable_stateful_codec_decoder=True,
     )
     return scheduler, created[0]
+
+
+def test_qwen3_tts_synchronous_stateful_codec_does_not_allocate_arena(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler, _ = _stateful_qwen3_tts_scheduler(
+        monkeypatch,
+        async_decode=False,
+    )
+
+    assert scheduler._codec_arena is None
 
 
 def test_qwen3_tts_stateful_codec_uses_reference_once_then_fresh_frames(

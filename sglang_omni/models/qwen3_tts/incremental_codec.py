@@ -40,7 +40,8 @@ class Qwen3TTSIncrementalCodecStateSpec:
             * self.retained_context
             * self.head_dim
         )
-        return int(elements * itemsize)
+        frame_position_bytes = torch.empty((), dtype=torch.long).element_size()
+        return int(elements * itemsize + frame_position_bytes)
 
 
 @dataclass

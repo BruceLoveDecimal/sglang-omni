@@ -491,6 +491,29 @@ def test_state_spec_covers_every_key_the_decode_creates() -> None:
     assert spec.bytes_per_stream(torch.float32) > 0
 
 
+def test_state_spec_reports_every_allocated_state_byte() -> None:
+    incremental = Qwen3TTSIncrementalDecoder(_Decoder())
+    state = incremental.init_state(
+        1,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    tensors = [
+        state.frame_positions,
+        *state.conv_histories.values(),
+        *state.transconv_overlaps.values(),
+        *state.transformer_keys.values(),
+        *state.transformer_values.values(),
+    ]
+    actual_bytes = sum(
+        tensor.numel() * tensor.element_size()
+        for tensor in tensors
+        if tensor is not None
+    )
+
+    assert incremental.state_bytes_per_stream(torch.float32) == actual_bytes
+
+
 def test_arena_backed_decode_matches_the_lazy_state() -> None:
     """Full-width buffers plus negative-position masking must be exact.
 
