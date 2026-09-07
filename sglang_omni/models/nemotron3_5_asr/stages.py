@@ -32,14 +32,28 @@ def create_nemotron3_5_asr_executor(
         raise ValueError("max_batch_wait_ms must be non-negative")
 
     resolved_device = resolve_device_spec(device, gpu_id)
-    runner = Nemotron3_5ASRModelRunner(
+    from sglang.srt.utils.tensor_bridge import use_mlx
+
+    runner_class = Nemotron3_5ASRModelRunner
+    if use_mlx():
+        from sglang_omni.platforms import current_platform
+
+        if not current_platform.is_mps() or not resolved_device.startswith("mps"):
+            raise RuntimeError("SGLANG_USE_MLX=1 requires the Apple Metal platform")
+        from .mlx.runner import Nemotron3_5ASRMLXRunner
+
+        runner_class = Nemotron3_5ASRMLXRunner
+        # Encode and decode one request at a time; queued requests remain isolated.
+        max_batch_size = 1
+    runner = runner_class(
         model_path,
         device=resolved_device,
         dtype=dtype,
         num_lookahead_tokens=num_lookahead_tokens,
     )
     build_request = make_nemotron3_5_asr_request_builder(
-        prompt_dictionary=runner.prompt_dictionary
+        prompt_dictionary=runner.prompt_dictionary,
+        max_duration_s=60.0 if use_mlx() else None,
     )
 
     def run_one(payload: StagePayload) -> StagePayload:

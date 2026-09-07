@@ -96,18 +96,12 @@ class Nemotron3_5ASRModelRunner:
             padding="longest",
             return_tensors="pt",
         )
-        model_inputs = _move_model_inputs(
-            dict(processor_inputs), device=self.device, dtype=self.dtype
-        )
-        generate_kwargs: dict[str, Any] = {"return_dict_in_generate": True}
-        if max_new_tokens is not None:
-            generate_kwargs["max_new_tokens"] = max_new_tokens
-
         started_at_s = time.perf_counter()
-        with self._model_lock, torch.inference_mode():
-            generated = self.model.generate(**model_inputs, **generate_kwargs)
+        with self._model_lock:
+            sequences = self._generate_sequences(
+                dict(processor_inputs), max_new_tokens=max_new_tokens
+            )
         elapsed_s = time.perf_counter() - started_at_s
-        sequences = generated.sequences.detach().to("cpu")
         raw_texts = self.processor.batch_decode(
             sequences,
             skip_special_tokens=False,
@@ -143,6 +137,17 @@ class Nemotron3_5ASRModelRunner:
                 )
             )
         return results
+
+    def _generate_sequences(self, processor_inputs, *, max_new_tokens):
+        model_inputs = _move_model_inputs(
+            processor_inputs, device=self.device, dtype=self.dtype
+        )
+        kwargs = {"return_dict_in_generate": True}
+        if max_new_tokens is not None:
+            kwargs["max_new_tokens"] = max_new_tokens
+        with torch.inference_mode():
+            generated = self.model.generate(**model_inputs, **kwargs)
+        return generated.sequences.detach().to("cpu")
 
     def run_batch(
         self, requests: Sequence[Nemotron3_5ASRRequest]

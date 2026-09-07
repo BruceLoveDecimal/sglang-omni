@@ -17,6 +17,13 @@ from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 from sglang_omni.scheduling.messages import IncomingMessage
 
 
+@pytest.fixture(autouse=True)
+def torch_backend(monkeypatch):
+    from sglang.srt.utils import tensor_bridge
+
+    monkeypatch.setattr(tensor_bridge, "use_mlx", lambda: False)
+
+
 def test_config_registers_one_terminal_non_engine_stage() -> None:
     config = Nemotron3_5ASRPipelineConfig(model_path="nvidia/nemotron")
 
