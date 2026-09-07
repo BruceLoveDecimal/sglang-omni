@@ -48,6 +48,7 @@ def test_builder_reuses_16khz_preparation_and_preserves_duration(monkeypatch) ->
     assert calls["kwargs"] == {
         "source_name": "Nemotron 3.5 ASR",
         "target_sample_rate": 16000,
+        "max_duration_s": None,
     }
 
 
@@ -61,7 +62,7 @@ def test_builder_defaults_missing_or_empty_language_to_auto(monkeypatch) -> None
 def test_builder_rejects_unknown_language_before_model_inference(monkeypatch) -> None:
     builder, _ = make_builder(monkeypatch)
 
-    with pytest.raises(ValueError, match="Unknown language"):
+    with pytest.raises(ValueError, match="Unsupported language"):
         builder(make_payload(language="xx-XX"))
 
 
@@ -80,3 +81,63 @@ def test_builder_rejects_unsupported_generation_modes(
 
     with pytest.raises(ValueError, match=message):
         builder(make_payload(**params))
+
+
+@pytest.mark.parametrize("waveform", [np.array([]), np.array([float("nan")])])
+def test_builder_rejects_empty_or_nonfinite_audio(monkeypatch, waveform):
+    monkeypatch.setattr(
+        request_builders,
+        "prepare_audio",
+        lambda *args, **kwargs: SimpleNamespace(waveform=waveform, duration_s=0),
+    )
+    builder = request_builders.make_nemotron3_5_asr_request_builder(
+        prompt_dictionary={"auto": 101}
+    )
+    with pytest.raises(ValueError, match="requires"):
+        builder(make_payload())
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"language": "xx-XX"},
+        {"temperature": 0.5},
+        {"prompt": "context"},
+        {"task": "translate"},
+    ],
+)
+def test_validation_errors_survive_string_only_worker_transport(monkeypatch, params):
+    from sglang_omni.serve.openai_errors import is_bad_request_error
+
+    builder, _ = make_builder(monkeypatch)
+    with pytest.raises(ValueError) as caught:
+        builder(make_payload(**params))
+    assert is_bad_request_error(RuntimeError(str(caught.value)))
+    assert not is_bad_request_error(RuntimeError("Metal allocation failed"))
+
+
+@pytest.mark.parametrize("decode_error", [True, False])
+def test_audio_error_mapping_preserves_operational_failures(monkeypatch, decode_error):
+    from sglang_omni.serve.openai_errors import is_bad_request_error
+    from sglang_omni.utils.audio import AudioDecodeError
+
+    error = (
+        AudioDecodeError("invalid container")
+        if decode_error
+        else RuntimeError("decoder allocation failed")
+    )
+
+    def fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(request_builders, "prepare_audio", fail)
+    builder = request_builders.make_nemotron3_5_asr_request_builder(
+        prompt_dictionary={"auto": 101}
+    )
+    with pytest.raises(Exception) as caught:
+        builder(make_payload())
+    assert is_bad_request_error(RuntimeError(str(caught.value))) == decode_error
+    if not decode_error:
+        assert caught.value is error
+    else:
+        assert caught.value.__cause__ is error

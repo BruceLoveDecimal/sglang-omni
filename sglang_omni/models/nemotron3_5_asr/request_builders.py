@@ -11,6 +11,7 @@ import numpy as np
 
 from sglang_omni.preprocessing.transcription import prepare_audio
 from sglang_omni.proto import StagePayload
+from sglang_omni.utils.audio import AudioDecodeError
 
 from .text import clean_nemotron_text, resolve_nemotron_locale
 
@@ -42,7 +43,7 @@ def normalize_nemotron_language(
     resolved = canonical.get(language.casefold())
     if resolved is None:
         raise ValueError(
-            f"Unknown language={language!r}. Supported values: "
+            f"Unsupported language: {language!r}. Supported values: "
             f"{sorted(prompt_dictionary)}"
         )
     return resolved
@@ -80,7 +81,7 @@ def validate_nemotron_greedy_params(params: Mapping[str, object]) -> int | None:
 
 
 def make_nemotron3_5_asr_request_builder(
-    *, prompt_dictionary: Mapping[str, int]
+    *, prompt_dictionary: Mapping[str, int], max_duration_s: float | None = None
 ) -> Callable[[StagePayload], Nemotron3_5ASRRequest]:
     """Build requests using the processor's authoritative locale mapping."""
 
@@ -95,11 +96,21 @@ def make_nemotron3_5_asr_request_builder(
         language = normalize_nemotron_language(
             params.get("language"), prompt_dictionary
         )
-        prepared = prepare_audio(
-            payload,
-            source_name="Nemotron 3.5 ASR",
-            target_sample_rate=NEMOTRON_ASR_SAMPLE_RATE,
-        )
+        try:
+            prepared = prepare_audio(
+                payload,
+                source_name="Nemotron 3.5 ASR",
+                target_sample_rate=NEMOTRON_ASR_SAMPLE_RATE,
+                max_duration_s=max_duration_s,
+            )
+        except AudioDecodeError as exc:
+            raise ValueError(
+                "Nemotron 3.5 ASR could not decode the uploaded audio"
+            ) from exc
+        if prepared.waveform.size == 0:
+            raise ValueError("Nemotron 3.5 ASR requires non-empty audio")
+        if not np.isfinite(prepared.waveform).all():
+            raise ValueError("Nemotron 3.5 ASR requires finite audio samples")
         return Nemotron3_5ASRRequest(
             waveform=prepared.waveform,
             duration_s=prepared.duration_s,
