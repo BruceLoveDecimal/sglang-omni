@@ -43,6 +43,17 @@ from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.speaker_cache import get_speaker_artifact_cache
 
 
+@pytest.fixture
+def cuda_backend(monkeypatch):
+    """CUDA policy tests must not inherit the host's Apple backend choice."""
+    from sglang.srt.utils import tensor_bridge
+
+    from sglang_omni.platforms import current_platform
+
+    monkeypatch.setattr(tensor_bridge, "use_mlx", lambda: False)
+    monkeypatch.setattr(current_platform, "is_mps", lambda: False)
+
+
 def test_higgs_streaming_pipeline_routes_chunks_to_vocoder() -> None:
     config = HiggsTtsPipelineConfig(model_path="fake-model")
     stages_by_name = {stage.name: stage for stage in config.stages}
@@ -340,6 +351,7 @@ def _install_higgs_engine_build_fakes(monkeypatch) -> dict[str, object]:
 
 def test_higgs_tts_engine_default_enables_breakable_prefill_graphs(
     monkeypatch,
+    cuda_backend,
 ) -> None:
     from sglang_omni.scheduling.generation_batch_policy import (
         build_default_prefill_cuda_graph_bs,
@@ -405,6 +417,7 @@ def test_higgs_tts_engine_default_enables_breakable_prefill_graphs(
 
 def test_higgs_tts_engine_prefill_disable_keeps_decode_graphs(
     monkeypatch,
+    cuda_backend,
 ) -> None:
     from sglang_omni.models.higgs_tts.engine_builder import HiggsTtsEngineBuilder
 
@@ -431,7 +444,7 @@ def test_higgs_tts_engine_prefill_disable_keeps_decode_graphs(
     assert records["init_graph_calls"] == [True]
 
 
-def test_higgs_tts_engine_lifecycle_callbacks_require_model() -> None:
+def test_higgs_tts_engine_lifecycle_callbacks_require_model(cuda_backend) -> None:
     from sglang_omni.models.higgs_tts.engine_builder import HiggsTtsEngineBuilder
 
     builder = HiggsTtsEngineBuilder(
@@ -470,7 +483,7 @@ def _make_higgs_builder(**kwargs):
     )
 
 
-def test_higgs_tts_engine_prefill_backend_policy() -> None:
+def test_higgs_tts_engine_prefill_backend_policy(cuda_backend) -> None:
     from sglang_omni.models.higgs_tts import CAPABILITIES
     from sglang_omni.scheduling.generation_batch_policy import (
         build_default_prefill_cuda_graph_bs,
@@ -500,7 +513,7 @@ def test_higgs_tts_engine_rejects_out_of_range_memory_fraction(fraction) -> None
         _make_higgs_builder(total_gpu_memory_fraction=fraction)
 
 
-def test_higgs_tts_engine_memory_budget_override_is_loud(caplog) -> None:
+def test_higgs_tts_engine_memory_budget_override_is_loud(caplog, cuda_backend) -> None:
     builder = _make_higgs_builder(total_gpu_memory_fraction=0.8)
     assert builder.generation_defaults(dtype="bfloat16")["mem_fraction_static"] == 0.8
 
@@ -1557,6 +1570,7 @@ def test_higgs_vocoder_fails_startup_when_cuda_graph_capture_fails(
         def capture_decode_cuda_graphs(self, _frame_counts) -> None:
             raise RuntimeError("capture failed")
 
+    monkeypatch.setattr(stages, "resolve_device_spec", lambda device: "cuda")
     monkeypatch.setattr(stages, "resolve_checkpoint", lambda path: path)
     monkeypatch.setattr(
         stages,
@@ -1567,6 +1581,7 @@ def test_higgs_vocoder_fails_startup_when_cuda_graph_capture_fails(
     with pytest.raises(RuntimeError, match="capture failed"):
         stages.create_vocoder_executor(
             "fake-model",
+            device="cuda",
             decode_cuda_graph_frame_counts=(1, 2),
         )
 

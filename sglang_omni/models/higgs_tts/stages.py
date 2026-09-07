@@ -379,7 +379,7 @@ def create_preprocessing_executor(
 def create_audio_encoder_executor(
     model_path: str,
     *,
-    device: str = "cuda:0",
+    device: str | None = None,
     gpu_id: int | None = None,
     dtype: str = "bfloat16",
     num_codebooks: int = 8,
@@ -391,15 +391,18 @@ def create_audio_encoder_executor(
     the TTS checkpoint itself (bundled at ``tied.embedding.modality_embeddings``).
     """
     device = resolve_device_spec(device, gpu_id)
+    if torch.device(device).type == "mps":
+        dtype = "float32"
     checkpoint_dir = resolve_checkpoint(model_path)
     raw = Tokenizer.from_file(os.path.join(checkpoint_dir, "tokenizer.json"))
     tokenizer = PreTrainedTokenizerFast(tokenizer_object=raw)
     adapter = HiggsTokenizerAdapter(tokenizer)
 
     codec = get_or_load_codec(checkpoint_dir, device, dtype)
-    codec.model.acoustic_encoder = torch.compile(
-        codec.model.acoustic_encoder, mode="default", dynamic=True
-    )
+    if torch.device(device).type == "cuda":
+        codec.model.acoustic_encoder = torch.compile(
+            codec.model.acoustic_encoder, mode="default", dynamic=True
+        )
     codec.encode_reference(
         torch.zeros(codec.SAMPLE_RATE), sample_rate=codec.SAMPLE_RATE
     )
@@ -463,7 +466,7 @@ def create_audio_encoder_executor(
 def create_sglang_tts_engine_executor(
     model_path: str,
     *,
-    device: str = "cuda:0",
+    device: str | None = None,
     max_new_tokens: int | None = 2048,
     max_running_requests: int = 64,
     cuda_graph_max_bs: int = 64,
@@ -502,7 +505,7 @@ def create_sglang_tts_engine_executor(
 def create_vocoder_executor(
     model_path: str,
     *,
-    device: str = "cuda:0",
+    device: str | None = None,
     dtype: str = "bfloat16",
     vocoder_decode_batch_size: int = 16,
     max_batch_wait_ms: int = 2,
@@ -522,6 +525,13 @@ def create_vocoder_executor(
         raise ValueError(
             "compile_decode and decode_cuda_graph_frame_counts are mutually exclusive"
         )
+    device = resolve_device_spec(device)
+    if torch.device(device).type == "mps":
+        dtype = "float32"
+        if compile_decode or decode_cuda_graph_frame_counts:
+            raise ValueError(
+                "Higgs MPS codec requires eager decode without CUDA graphs"
+            )
     # decode_cuda_graph_frame_counts must cover every window size the streaming
     # scheduler can submit, or those windows fall back to eager decode (warned
     # only once per distinct missed frame count, so easy to miss in serving

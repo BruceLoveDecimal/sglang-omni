@@ -46,7 +46,7 @@ class HiggsTtsPipelineConfig(PipelineConfig):
             name="audio_encoder",
             process="tts_frontend",
             factory_path=f"{_PKG}.stages.create_audio_encoder_executor",
-            factory=FactoryArgs(device="cuda"),
+            factory=FactoryArgs(device=None),
             gpu=0,
             gpu_memory_fraction=0.03,
             next="tts_engine",
@@ -56,7 +56,7 @@ class HiggsTtsPipelineConfig(PipelineConfig):
             process="pipeline",
             factory_path=f"{_PKG}.stages.create_sglang_tts_engine_executor",
             factory=FactoryArgs(
-                device="cuda", max_new_tokens=2048, enable_async_decode=True
+                device=None, max_new_tokens=2048, enable_async_decode=True
             ),
             gpu=0,
             gpu_memory_fraction=0.85,
@@ -70,7 +70,7 @@ class HiggsTtsPipelineConfig(PipelineConfig):
             # serving concurrency and prevents decode/vocoder overlap.
             process="pipeline",
             factory_path=f"{_PKG}.stages.create_vocoder_executor",
-            factory=FactoryArgs(device="cuda"),
+            factory=FactoryArgs(device=None),
             gpu=0,
             gpu_memory_fraction=0.10,
             terminal=True,
@@ -96,6 +96,10 @@ class HiggsTtsPipelineConfig(PipelineConfig):
                 if key in vocoder_extra
             }
         if stage_name == "vocoder":
+            from sglang_omni.platforms import current_platform
+
+            if current_platform.is_mps():
+                return {"compile_decode": False, "decode_cuda_graph_frame_counts": ()}
             return {
                 "compile_decode": False,
                 # Before the steady cursor is established, a decode window is
@@ -109,6 +113,13 @@ class HiggsTtsPipelineConfig(PipelineConfig):
     def model_post_init(self, __context: Any = None) -> None:
         super().model_post_init(__context)
         stages = {stage.name: stage for stage in self.stages}
+        from sglang_omni.platforms import current_platform
+
+        if current_platform.is_mps():
+            for name in ("audio_encoder", "vocoder"):
+                # The existing codec's convolutions run in FP32 on Metal.
+                stages[name].factory.dtype = "float32"
+            stages["tts_engine"].factory.enable_async_decode = False
         preprocessing = stages["preprocessing"]
         if "OMP_NUM_THREADS" not in self.env_defaults:
             preprocessing.env.setdefault(

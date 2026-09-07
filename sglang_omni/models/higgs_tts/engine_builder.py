@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import math
 from typing import Any
 
 from sglang_omni.models.higgs_tts import request_builders
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 class HiggsTtsEngineBuilder(TtsEngineBuilder):
     model_name = "Higgs TTS"
+    model_arch_override = "HiggsMultimodalQwen3ForConditionalGeneration"
     context_length = 4096
     supports_breakable_prefill_cuda_graph = True
 
@@ -69,6 +71,29 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         *,
         dtype: str,
     ) -> dict[str, Any]:
+        from sglang.srt.utils.tensor_bridge import use_mlx
+
+        from sglang_omni.platforms import current_platform
+
+        if use_mlx():
+            if not current_platform.is_mps():
+                raise ValueError("Higgs MLX requires Apple Silicon")
+            return {
+                "max_running_requests": 1,
+                "disable_cuda_graph": True,
+                "disable_overlap_schedule": True,
+                "disable_radix_cache": True,
+                "enable_torch_compile": False,
+                "max_total_tokens": self.context_length,
+                "max_prefill_tokens": self.context_length,
+                "chunked_prefill_size": -1,
+                "mem_fraction_static": self.total_gpu_memory_fraction or 0.8,
+                "dtype": dtype,
+            }
+        if current_platform.is_mps():
+            raise ValueError(
+                "Higgs Audio v3 on Apple Silicon requires SGLANG_USE_MLX=1"
+            )
         del dtype
         # note (luojiaxuan): Radix cache is namespaced per ref-audio via
         # Req.extra_key (set in build_sglang_higgs_request); shared -100
@@ -106,6 +131,31 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
             expected,
         )
 
+    def validate_before_infrastructure(self, server_args: Any) -> None:
+        from sglang.srt.utils.tensor_bridge import use_mlx
+
+        if not use_mlx():
+            return
+        if server_args.max_running_requests != 1:
+            raise ValueError("Higgs MLX requires max_running_requests=1")
+        if (
+            not server_args.disable_radix_cache
+            or server_args.chunked_prefill_size != -1
+        ):
+            raise ValueError(
+                "Higgs MLX requires disabled radix cache and chunked prefill"
+            )
+        if server_args.mlx_enable_sampling:
+            raise ValueError(
+                "Higgs MLX owns codebook sampling; disable mlx_enable_sampling"
+            )
+        if server_args.tp_size != 1:
+            raise ValueError("Higgs MLX requires tensor parallel size 1")
+        if server_args.enable_torch_compile or not server_args.disable_cuda_graph:
+            raise ValueError(
+                "Higgs MLX requires disabled Torch compilation and CUDA graphs"
+            )
+
     def customize_server_args(self, server_args: Any) -> None:
         override_server_args(
             server_args,
@@ -123,13 +173,28 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         server_args: Any,
     ) -> None:
         del checkpoint_dir, device, gpu_id, server_args
-        self.model = model_worker.model_runner.model
-        higgs_utils.truncate_rope_to_bf16(self.model)
+        from sglang.srt.utils.tensor_bridge import use_mlx
+
+        if use_mlx():
+            self.model = model_worker._mlx_runner
+        else:
+            self.model = model_worker.model_runner.model
+            higgs_utils.truncate_rope_to_bf16(self.model)
 
     def get_model_buffer_bs(self, model: Any) -> int | None:
-        return model.sampler_pool_max_running_requests
+        from sglang.srt.utils.tensor_bridge import use_mlx
+
+        return 1 if use_mlx() else model.sampler_pool_max_running_requests
 
     def make_model_runner(self, model_worker: Any, output_proc: Any) -> Any:
+        from sglang.srt.utils.tensor_bridge import use_mlx
+
+        if use_mlx():
+            from sglang_omni.models.higgs_tts.mlx.scheduler_runner import (
+                HiggsMlxSchedulerRunner,
+            )
+
+            return HiggsMlxSchedulerRunner(model_worker, output_proc)
         model_runner_mod = importlib.import_module(
             "sglang_omni.models.higgs_tts.model_runner"
         )
@@ -138,22 +203,59 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
 
     def make_adapters(self, model: Any) -> tuple[Any, Any]:
         del model
-        return request_builders.make_higgs_scheduler_adapters(
+        adapters = request_builders.make_higgs_scheduler_adapters(
             max_new_tokens_cap=self.max_new_tokens,
             stream_stride=self.stream_stride,
             stream_followup_stride=self.stream_followup_stride,
             initial_chunk_frames=self.initial_chunk_frames,
         )
 
+        from sglang.srt.utils.tensor_bridge import use_mlx
+
+        if not use_mlx():
+            return adapters
+        build_request, adapt_result = adapters
+
+        def build_mlx_request(payload):
+            data = build_request(payload)
+            if not math.isfinite(data.temperature) or data.temperature < 0:
+                raise ValueError(
+                    "Higgs MLX temperature must be finite and non-negative"
+                )
+            data.req.sampling_params.verify(vocab_size=151936)
+            if not len(data.input_ids) or data.max_new_tokens < 1:
+                raise ValueError(
+                    "Higgs MLX requires a nonempty prompt and a positive output budget"
+                )
+            if data.return_logprob or data.return_omni_rollout:
+                raise ValueError("Higgs MLX does not support rollout/logprob capture")
+            if data.num_codebooks != 8 or data.codebook_size != 1026:
+                raise ValueError("Higgs Audio v3 requires 8 codebooks of size 1026")
+            if len(data.input_ids) + data.max_new_tokens > self.context_length:
+                raise ValueError(
+                    f"Higgs MLX prompt plus output budget exceeds {self.context_length} tokens"
+                )
+            return data
+
+        return build_mlx_request, adapt_result
+
     def make_abort_callback(self) -> Any | None:
         assert self.model is not None
-        return self.model.reset_request
+        from sglang.srt.utils.tensor_bridge import use_mlx
+
+        return self.model.remove_request if use_mlx() else self.model.reset_request
 
     def make_request_finished_callback(self) -> Any | None:
         assert self.model is not None
-        return self.model.reset_request
+        from sglang.srt.utils.tensor_bridge import use_mlx
+
+        return self.model.remove_request if use_mlx() else self.model.reset_request
 
     def extra_scheduler_kwargs(self) -> dict[str, Any]:
+        from sglang.srt.utils.tensor_bridge import use_mlx
+
+        if use_mlx():
+            return {"enable_async_decode": False}
         return {
             "enable_async_decode": self.enable_async_decode,
             "async_decode_min_batch_size": self.async_decode_min_batch_size,

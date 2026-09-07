@@ -61,6 +61,81 @@ sgl-omni serve \
 The voice-cloning examples below use local reference clips from
 `docs/_static/audio`.
 
+## Apple Silicon (experimental)
+
+Select the native MLX autoregressive backend with `SGLANG_USE_MLX=1`:
+
+```bash
+./install.sh --non-interactive
+source .venv/bin/activate
+
+SGLANG_USE_MLX=1 sgl-omni serve \
+  --model-path bosonai/higgs-audio-v3-tts-4b \
+  --allowed-local-media-path docs/_static/audio \
+  --port 8000
+```
+
+This is a hybrid pipeline: the Qwen3 backbone, audio embeddings, multi-codebook
+head, and sampling run in MLX; reference encoding and waveform decoding reuse
+the existing Higgs codec in Torch/MPS FP32. Preprocessing, reference caches,
+request scheduling, delayed-codebook streaming, and the speech API are shared
+with the existing pipeline. There is no `mlx-audio` runtime dependency.
+
+Use the official unquantized checkpoint, including its bundled codec and
+`tokenizer.json`. No conversion is required. Quantized artifacts and on-load
+quantization are not supported by this initial implementation. The checkpoint
+is approximately 9.3 GB; additional memory is needed for KV caches, codec
+weights, and activations.
+
+The initial backend profile has these limits:
+
+- One active generation request; additional requests queue in the shared
+  scheduler. Tensor parallelism and asynchronous decode are disabled.
+- A 4,096-token context budget for the prompt and requested output combined;
+  the default output cap is 2,048 delayed-codebook rows. Longer requests are
+  rejected, and the scheduler also enforces the available KV capacity.
+- Greedy decoding (`temperature=0`) and temperature/top-k/top-p sampling are
+  supported. A request `seed` is reproducible within this backend; matching
+  seeds across Torch and MLX do not promise identical sampled audio.
+- Reference audio, pre-encoded reference codes, and both streaming and
+  non-streaming output use the existing interfaces below.
+- Radix caching, chunked prefill, CUDA graphs, Torch compilation, and
+  rollout/logprob capture are disabled or rejected on this path.
+- A standalone Torch/MPS autoregressive backend is not implemented. Omitting
+  `SGLANG_USE_MLX=1` on Apple Silicon produces an explicit error.
+
+Validation covers native Metal model/cache/sampling tests, numerical agreement
+with a matched Torch Qwen3 model, SGLang worker/scheduler lifecycle tests, and
+codec encode/decode. Local HTTP E2E also passed with the official unquantized
+4B checkpoint on an Apple M1 Pro with 32 GB unified memory: English and Chinese
+WAV output, incremental PCM streaming, reference-audio input, queued requests
+with identical seeded outputs, and recovery after a streaming client disconnect.
+Outputs were checked for 24 kHz mono, finite samples, and non-silence. This is a
+functional smoke test, not a speech-quality or sustained-load benchmark. A longer
+Chinese sample also completed in both modes: 32.12 seconds of audio, about
+45 seconds for WAV output, and about 46 seconds for streaming with 11 chunks
+and a 2.03-second first chunk. These are single-run timings on the same host.
+
+With the server above running, reproduce the HTTP checks and save audio plus
+request timings:
+
+```bash
+python examples/higgs_tts/mlx_smoke.py \
+  --base-url http://127.0.0.1:8000 \
+  --output-dir /tmp/higgs-mlx-smoke
+```
+
+Run the focused regression tests in the installed environment:
+
+```bash
+SGLANG_USE_MLX=1 python -m pytest -q \
+  tests/unit_test/higgs_tts/test_mlx.py \
+  tests/unit_test/higgs_tts/test_pipeline.py \
+  tests/unit_test/higgs_tts/test_request_builders.py \
+  tests/unit_test/higgs_tts/test_audio_codec.py \
+  tests/unit_test/qwen3_asr/test_mlx_scheduler_runner.py
+```
+
 ## Synthesizing Speech
 
 ### Zero-shot
