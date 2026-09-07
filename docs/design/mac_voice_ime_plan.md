@@ -139,7 +139,7 @@
   可用但会随段长退化；由 VAD 分段（静音 500 ms）把段长压在 10 s 内基本可接受。
 - 价值：一周内跑通端到端，验证协议、VAD、客户端，并拿到延迟/准确率基线。
 
-**Step B：cache-aware 增量推理（M2，核心工作）**
+**Step B：cache-aware 增量推理（M2，核心工作；详细改写方案见 §5）**
 
 新增 `sglang_omni/models/nemotron3_5_asr/mlx/streaming.py`：
 
@@ -209,9 +209,172 @@ Mac arm64 原生），但 Silero 已够用且已集成，M1–M3 不换。
 
 ---
 
-## 5. 客户端实现方案（Swift 菜单栏 App）
+## 5. Chunk 流式改写方案（Nemotron MLX）
 
-### 5.1 模块
+本章把 §4.1 的 Step B 展开：如何把 `mlx/model.py` 从"整段一次前向"改写为"按固定 chunk 增量前向"，
+以及会话层如何切块、对齐、flush。黄金参考是 `hf_compat/modeling_nemotron_asr_streaming.py` 与
+`generation_nemotron_asr_streaming.py` 的 generator 输入路径，目标是**逐块 token 序列与参考完全一致**。
+
+### 5.1 为什么可以增量：离线前向里的因果结构
+
+当前 MLX 离线前向（`mlx/model.py`）里，所有时间方向的算子都是因果或"块内可见"的：
+
+| 算子 | 时间感受野 | 离线实现 | 增量实现需要缓存的内容 |
+|---|---|---|---|
+| Subsampling 3 层 `CausalConv2d(k=3, s=2)` | 左 2 帧/层 | 左填充 `kernel-1` | 每层输入的最后 2 帧（时间轴），首块用零 |
+| Conformer 块内 `depthwise Conv1d(k=9)` | 左 8 帧 | 左填充 8 | 每层 GLU 输出的最后 8 帧 |
+| 相对位置自注意力 | 左 70 帧 + 当前 chunk 内全部帧 | `chunks = arange(t)//(L+1)`，`0 ≤ diff ≤ 70//(L+1)` 的块级掩码 | 每层最近若干帧的 K、V，以及已见帧数（位置编码用） |
+| FFN / LayerNorm | 逐帧 | — | 无 |
+| RNN-T 预测网络 LSTM + Joint | 只依赖已发出 token | 整段循环 | LSTM (h, c)、上一个非 blank token、上一步 decoder 输出 |
+
+因此，只要每块携带"上一块留下的左上下文"，新块的输出与整段前向逐位相同（数值误差量级）。
+这就是 NeMo cache-aware streaming 的原理，也是 Torch 参考实现中三种 cache 的来源。
+
+### 5.2 块大小与对齐规则
+
+编码器帧 = 80 ms（8 个 10 ms mel 帧）。设 lookahead = L，一个编码器 chunk 含 `L+1` 帧。
+
+| 量 | 首块 | 后续块 | 说明 |
+|---|---|---|---|
+| mel 帧数 | `1 + 8L` | `8(L+1)` | 与 `_required_stream_chunk_frames` 一致 |
+| PCM 样本数（hop 160） | `160·(1+8L)` 附近，另加 STFT 窗补齐 | `160·8(L+1)` | L=3 → 后续块 5120 样本 = 320 ms |
+| 输出编码器帧 | `L+1` | `L+1` | 三次 `len//2+1`（首块）或 `len//2`（有 cache）都恰好得到 `L+1` |
+
+首块比后续块少 `8-1=7` 个 mel 帧，是因为第一层 Conv2d 在无 cache 时的左填充相当于"白送"了 2 帧，
+三层累计正好抵掉 7 帧；后续块的左填充来自 cache，所以必须凑满 `8(L+1)`。
+
+**特征提取按块做**：复用 `Nemotron3_5AsrProcessor(is_streaming=True, is_first_audio_chunk=...)`：
+首块 `center=True`（补半窗反射填充），后续块 `center=False` 并携带上一块尾部 `win_length - hop_length = 240` 个样本，
+这样逐块 STFT 结果与整段 STFT 完全一致。预加重跨块也要保留上一块最后 1 个样本。会话层保存 `pcm_carry`
+（240 + 1 个样本）即可。
+
+**结论**：会话层把 PCM 累积到"下一块所需样本数"再触发一次 `step`；不足一块的音频留在 carry 中，
+直到 `is_final` 时补零 flush。
+
+### 5.3 模型改写：`Encoder.step` 与 `Model.decode_step`
+
+新增 `mlx/streaming.py`，不改动离线路径的行为（离线 `encode/decode` 保留，用于验证与批量转写）。
+
+```python
+@dataclass
+class EncoderCache:
+    sub_conv: list[mx.array]        # 3 项，各为 (B, 2, F_i, C_i) 时间轴末尾 2 帧
+    block_conv: list[mx.array]      # 24 项，各为 (B, 8, D)
+    attn_k: list[mx.array]          # 24 项，各为 (B, H, C_keep, Dh)
+    attn_v: list[mx.array]
+    frames_seen: int                # 已进入注意力的编码器帧数（用于相对位置）
+
+class StreamingEncoder(Encoder):
+    def step(self, mel_chunk, cache: EncoderCache | None, lookahead: int):
+        x = self.subsampling.step(mel_chunk, cache)          # (B, L+1, D)
+        if c.scale_input: x = x * sqrt(D)
+        positions = self._rel_positions(cache.frames_seen, x.shape[1])
+        for i, layer in enumerate(self.layers):
+            x = layer.step(x, positions, cache, i)          # conv 用 block_conv[i]，attn 用 attn_k/v[i]
+        cache.frames_seen += x.shape[1]
+        mx.eval(x, *cache.attn_k, *cache.attn_v, *cache.block_conv, *cache.sub_conv)
+        return x
+```
+
+各部件的改写要点：
+
+1. **Subsampling**：`CausalConv2d.step(x, prev)` 把 `prev`（上块末 2 帧）拼到时间轴前面，代替零填充；
+   首块 `prev=None` 时仍用零填充。频率轴的填充不变。`valid` 掩码在流式下恒为全 1（块内无 padding）。
+2. **Conformer conv**：`Convolution.step(x, prev8)`：GLU 之后把 `prev8` 拼在前面再做 depthwise conv，
+   同时保存本块 GLU 输出的最后 8 帧作为下一块的 `prev8`。
+3. **注意力**：
+   - K/V：`k_all = concat(cache_k, k_new)`，`v_all` 同理；查询只有新块的 `L+1` 帧。
+   - 掩码：新块内所有帧互相可见（右上下文 = 块内），对 cache 帧全部可见。为与离线块级掩码逐位一致，
+     cache 只保留 `floor(70 / (L+1)) · (L+1)` 帧（L=3 → 68 帧，L=13 → 70 帧），而不是固定 70 帧。
+     这点要用 Torch 参考的 `chunked_limited_mask_function` 对拍确认。
+   - 相对位置：查询绝对位置 `[C, C+T)`，键绝对位置 `[0, C+T)`，相对偏移范围 `[-(T-1), C+T-1]`，
+     位置张量长度 `C + 2T - 1`；对应参考实现 `RelPositionalEncoding.forward(hidden_states, cached_frames)`。
+     现有 `Attention.__call__` 的 Transformer-XL rel-shift 需要改成"查询 T、键 C+T"的非方阵版本。
+   - 计算后把 `k_all/v_all` 截到保留帧数存回 cache。
+4. **Prompt projector / encoder projector**：逐帧算子，直接对新块调用。
+5. **解码**：
+
+```python
+@dataclass
+class DecoderState:
+    lstm: list[tuple[mx.array, mx.array]]
+    dec_out: mx.array          # 上一次预测网络输出（初始为 blank 的输出）
+    steps: int                 # 已用 RNN-T 步数（含 blank），用于 max_new_tokens
+
+def decode_step(self, encoded_chunk, state: DecoderState) -> list[int]:
+    new_tokens = []
+    for frame in range(encoded_chunk.shape[0]):
+        for _ in range(c.max_symbols_per_step):
+            token = argmax(joint(encoded_chunk[frame], state.dec_out))
+            state.steps += 1
+            if token == blank: break
+            new_tokens.append(token)
+            state.dec_out, state.lstm = self.decoder(token, state.lstm)
+    return new_tokens
+```
+
+与离线 `decode` 唯一的区别是状态从参数传入并回写，`tokens` 列表不再包含起始 blank。
+离线 `decode` 可以改为在内部调用 `decode_step` 一次，避免两套循环漂移。
+
+6. **flush（`is_final`）**：把 carry 里不足一块的 mel 补零到整块，跑一次 `step + decode_step`，
+   然后丢弃 state。参考实现 `keep_all_outputs=True` 的语义相同。补零可能吐出零星 token，
+   实测若出现可在会话层对 flush 产生的 token 做"仅接受块前半部分帧"的裁剪；默认先不裁。
+
+### 5.4 会话层数据流
+
+```
+PCM(80ms 包) ─► pcm_carry 累积 ─► 够一块? ─► processor(streaming) ─► mel_chunk
+      │                                                              │
+      │ is_final ──► 补零 flush                                       ▼
+      │                                        StreamingEncoder.step ─► decode_step ─► new_tokens
+      │                                                              │
+      └──────────── transcription.segment{text=累计, delta=新增} ◄── DecodeStream.step 逐 token 出字
+```
+
+- **token → 文本**：复用 processor 里已有的 `DecodeStream.step(tokenizer, token_id)`，
+  它按 SentencePiece 规则处理 `▁` 与多字节字符，天然给出 `delta`；累计文本由会话层拼接。
+- **locale 标签**：`language=auto` 时首个 token 可能是 `<xx-YY>`；沿用 `transcription_adapters/nemotron3_5_asr.py`
+  的剥离逻辑，同时把识别出的语言放进 `session.updated`/`segment` 的可选字段。
+- **状态表**：`stages.py` 的执行器持有 `dict[str, StreamState]`，键为 `session_id:segment_id`；
+  `input_audio_buffer.clear`、`speech_stopped` 完成 flush、会话断开、超过 TTL（如 60 s 无新块）时删除。
+- **调度**：MLX 下 `max_batch_size=1`，每次 `step` 是一个短请求（L=3 时约 10–30 ms），走现有
+  `SimpleScheduler` 即可；不同会话的 step 自然交错，无需批处理。
+- **运行时改 lookahead**：块大小和掩码都是 state 级参数，模型权重不变；只允许在段边界切换（新 segment 生效）。
+
+### 5.5 性能考虑
+
+| 项 | 现状（离线） | 流式改写 |
+|---|---|---|
+| `mx.eval` 次数 | 每层一次（24 次/段） | 每块一次 |
+| 解码同步 | 每 token 一次 `.item()` | 同上，但每块只有 L+1 帧；可把"blank 判断"改为先算一批 `argmax` 再取 `.item()` |
+| 注意力矩阵 | `T×T`（T 可达 750） | `(L+1)×(C+L+1)`，与段长无关 |
+| 内存 | 与段长线性 | 常数：≈ 24 层 × 70 帧 × 1024 × 2 × 4 B ≈ 14 MB/会话 |
+| 可选优化 | — | `mx.compile` 单块前向；编码器 BF16（在一致性测试通过后再开） |
+
+### 5.6 验证与测试
+
+1. **逐块一致性**（核心门槛）：同一音频，`hf_compat` Torch generator 路径（L ∈ {0,3,6,13}）与 MLX `step` 路径逐块比对
+   token 序列，要求 100% 一致；再与 MLX 离线 `encode/decode` 比对，确认改写没有破坏离线路径。
+   放在 `tests/unit_test/nemotron3_5_asr/test_mlx_streaming.py`，并加入 `verify_nemotron_mlx.py` 的 e2e 报告。
+2. **块边界性质测试**：把同一段音频按不同长度的 PCM 包（20 / 80 / 333 ms）喂入，结果必须相同，证明 carry 逻辑正确。
+3. **flush 测试**：在词中间截断并 `is_final`，检查补零不产生崩溃、状态被释放。
+4. **状态生命周期**：clear/断开/TTL 后 `StreamState` 表为空；两个会话交错 step 互不污染。
+5. **基准**：`benchmarks/eval/bench_nemotron_stream.py` 输出每块耗时分布、RTF、首字延迟、段末 flush 延迟，
+   分 L=3/6 记录，作为 §7 延迟预算的实测依据。
+
+### 5.7 分步落地顺序
+
+1. 先做解码器状态化（`decode_step`）并在离线路径中调用它 —— 无风险、马上可测。
+2. 做 Subsampling 与 Conformer conv 的 cache，用"整段 vs 分块但注意力仍看整段"的对拍验证卷积 cache。
+3. 做注意力 K/V cache 与非方阵 rel-shift，对拍 Torch 参考。
+4. 接入会话层（carry、flush、状态表、`delta` 事件）。
+5. 性能优化与 BF16。
+
+---
+
+## 6. 客户端实现方案（Swift 菜单栏 App）
+
+### 6.1 模块
 
 | 模块 | 实现 |
 |---|---|
@@ -225,7 +388,7 @@ Mac arm64 原生），但 Silero 已够用且已集成，M1–M3 不换。
 | 后处理 | 空格/首字母规则（中文不加空格、英文句末加空格）、命令词（"换行"/"new line"、"删除上一句"）、去 `<xx-YY>` 标签（服务端 adapter 已做） |
 | 设置 | 热键、语言（auto/zh-CN/en-US…）、引擎（Nemotron / Qwen3-ASR）、延迟档（lookahead）、注入方式、开机自启 |
 
-### 5.2 为什么先不做真 IMK 输入法
+### 6.2 为什么先不做真 IMK 输入法
 
 - 用户平时用中文 IME 时，切到"语音输入法"会失去拼音输入，需要频繁切换输入源，体验反而差；
   几乎所有成熟产品都因此选择热键 + 注入。
@@ -233,7 +396,7 @@ Mac arm64 原生），但 Silero 已够用且已集成，M1–M3 不换。
 - 热键方案在 M3 即可交付；IMK 作为 M5 增强：把 partial 通过 `setMarkedText` 显示为下划线文本，
   final 用 `insertText` 提交，获得与系统听写一致的原地合成体验。
 
-### 5.3 Python 原型（M1 用，之后弃用或保留为 CLI）
+### 6.3 Python 原型（M1 用，之后弃用或保留为 CLI）
 
 `playground/mac_voice_ime/dictate.py`：`sounddevice` 采集 → `websockets` 客户端 → 终端打印 partial → 松键
 （`pynput` 或 Quartz 监听 Fn）后 `pbcopy` + `osascript keystroke "v" using command down`。
@@ -241,7 +404,95 @@ Mac arm64 原生），但 Silero 已够用且已集成，M1–M3 不换。
 
 ---
 
-## 6. 延迟预算（目标：松键后 ≤ 400 ms 出最终文本，说话中 partial 滞后 ≤ 600 ms）
+### 6.4 麦克风采集方案
+
+**正式客户端（Swift）**：`AVAudioEngine` tap + 持久 `AVAudioConverter`，输出 16 kHz 单声道 Int16，按 80 ms（1280 样本）成块发送。
+
+流程：
+1. 权限：Info.plist 声明 `NSMicrophoneUsageDescription`；启动时 `AVCaptureDevice.requestAccess(for: .audio)`。权限归属 App 自身。
+2. 在 `inputNode` 上以设备原生格式（通常 48 kHz Float32）装 tap。macOS 上 `bufferSize` 参数基本不生效，实际每次回调约 100 ms，这是第一段固定延迟。
+3. 用一个跨回调复用的 `AVAudioConverter` 转成 16 kHz Int16；每块新建 converter 会在块边界产生重采样伪影。
+4. 累积到 1280 样本的整数倍（= 一个 Nemotron 编码器帧）后 base64 发 `input_audio_buffer.append`。服务端 VAD 按 512 样本切帧并自行处理余数，客户端只需对齐 80 ms。
+
+```swift
+final class AudioCapture {
+    private let engine = AVAudioEngine()
+    private var converter: AVAudioConverter!
+    private let target = AVAudioFormat(commonFormat: .pcmFormatInt16,
+                                       sampleRate: 16_000, channels: 1, interleaved: true)!
+    private var pending = [Int16]()
+    var onChunk: (([Int16]) -> Void)?          // 每 1280 样本（80 ms）回调一次
+
+    func start() throws {
+        let input = engine.inputNode
+        let native = input.outputFormat(forBus: 0)
+        converter = AVAudioConverter(from: native, to: target)
+        input.installTap(onBus: 0, bufferSize: 1024, format: native) { [weak self] buf, _ in
+            self?.handle(buf)
+        }
+        engine.prepare()
+        try engine.start()
+    }
+
+    private func handle(_ buf: AVAudioPCMBuffer) {
+        let ratio = target.sampleRate / buf.format.sampleRate
+        let cap = AVAudioFrameCount(Double(buf.frameLength) * ratio) + 32
+        let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: cap)!
+        var consumed = false
+        var err: NSError?
+        converter.convert(to: out, error: &err) { _, status in
+            if consumed { status.pointee = .noDataNow; return nil }
+            consumed = true; status.pointee = .haveData; return buf
+        }
+        guard err == nil else { return }
+        let n = Int(out.frameLength)
+        pending.append(contentsOf: UnsafeBufferPointer(start: out.int16ChannelData![0], count: n))
+        while pending.count >= 1280 {
+            onChunk?(Array(pending[..<1280]))
+            pending.removeFirst(1280)
+        }
+    }
+
+    func stop() {
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+    }
+}
+```
+
+实践细节：
+- **松键不丢尾巴**：停止时把 `pending` 中不足 80 ms 的部分补零发出，再发 `input_audio_buffer.commit`。
+- **引擎常驻 vs 按需启动**：`engine.start()` 冷启动 50–200 ms，会吃掉按住说话的第一个音节。
+  默认引擎常驻、tap 常开、仅在按键期间转发；代价是菜单栏常显橙色麦克风指示，设置里允许改为按需启动并依赖服务端 `prefix_padding_ms`。
+- **降噪**：`inputNode.setVoiceProcessingEnabled(true)` 开启 Apple AEC/AGC，适合外放场景；必须在 `installTap` 之前调用，
+  它会改变输入格式，converter 要按新格式重建。
+- **设备切换**：监听 `AVAudioEngineConfigurationChange`，AirPods 连接/断开时重建 tap 与 converter。
+- **更低延迟**：如 100 ms tap 缓冲不可接受，改用 `AVAudioSinkNode`（渲染线程回调，缓冲大小真实生效）或 HAL AudioUnit
+  把 `kAudioDevicePropertyBufferFrameSize` 设为 256–512 帧。M3 先用 tap，M4 按实测决定是否替换。
+- **电平反馈与静音短路**：对每块 Int16 算 RMS 供悬浮窗画波形；客户端做廉价的"全静音"判断，避免空按也持续发包。
+
+**Python 原型（M1）**：`sounddevice`，让 PortAudio/CoreAudio 直接重采样：
+
+```python
+import sounddevice as sd, queue
+q = queue.Queue()
+def cb(indata, frames, t, status):
+    q.put(bytes(indata))                     # int16 little-endian，即服务端 pcm16
+stream = sd.InputStream(samplerate=16000, channels=1, dtype="int16",
+                        blocksize=1280, latency="low", callback=cb)
+stream.start()
+```
+
+`blocksize=1280` 即 80 ms 一块，base64 后直接放进 `input_audio_buffer.append`。麦克风权限会弹给 Terminal/python 宿主，
+没有 voice processing，仅用于验证协议与延迟。
+
+**与服务端衔接**：`input_audio_format=pcm16`，16 kHz 单声道小端。VAD 帧 32 ms、Nemotron 块 320 ms（L=3），
+80 ms 发送粒度对两者都友好。按住说话模式 `turn_detection=null`，客户端负责按下时 `session.update`、松键时 `commit`；
+免提模式把端点检测交给服务端 VAD。
+
+---
+
+## 7. 延迟预算（目标：松键后 ≤ 400 ms 出最终文本，说话中 partial 滞后 ≤ 600 ms）
 
 | 环节 | 估计 | 说明 |
 |---|---|---|
@@ -257,7 +508,7 @@ Step A（全段重解码）阶段 partial 滞后为 `decode_interval + 段长相
 
 ---
 
-## 7. Milestones
+## 8. Milestones
 
 | 里程碑 | 目标 | 主要产出 | 验收 |
 |---|---|---|---|
@@ -272,7 +523,7 @@ M1 与 M3 的前半段（权限、采集、热键、悬浮窗）无依赖，可�
 
 ---
 
-## 8. 仓库改动清单（引擎侧）
+## 9. 仓库改动清单（引擎侧）
 
 ```
 sglang_omni/models/nemotron3_5_asr/
@@ -298,7 +549,7 @@ docs/cookbook/mac_voice_ime.md
 
 ---
 
-## 9. 风险与对策
+## 10. 风险与对策
 
 | 风险 | 影响 | 对策 |
 |---|---|---|
@@ -313,7 +564,7 @@ docs/cookbook/mac_voice_ime.md
 
 ---
 
-## 10. 待确认的决策
+## 11. 待确认的决策
 
 1. 默认引擎与语言：先按 Nemotron + `language=auto` 做，M4 后依据数据决定。
 2. 客户端代码放本仓库 `apps/` 还是独立仓库：建议独立仓库（Swift 工具链、签名、发布节奏不同），本仓库只保留 Python 原型与协议文档。
