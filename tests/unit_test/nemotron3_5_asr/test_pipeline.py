@@ -15,8 +15,16 @@ from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.messages import IncomingMessage
 
 
+@pytest.fixture(autouse=True)
+def torch_backend(monkeypatch):
+    from sglang.srt.hardware_backend.mlx import runtime
+
+    monkeypatch.setattr(runtime, "use_mlx", lambda: False)
+
+
 def test_config_leaves_defaults_to_factory() -> None:
     config = Nemotron3_5ASRPipelineConfig(model_path="checkpoint")
+
     assert config.entry_stage == "asr"
     assert config.terminal_stages == ["asr"]
     assert len(config.stages) == 1

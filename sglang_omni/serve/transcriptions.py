@@ -277,7 +277,7 @@ async def _transcribe_planned_upload(
             response_format=form.response_format,
             endpoint_path=TRANSCRIPTIONS_ENDPOINT,
             task="transcribe",
-            language=form.language,
+            language=result.language or form.language,
             audio_bytes=audio_bytes,
             architectures=getattr(app.state, "architectures", None),
             duration_s=duration_s,
