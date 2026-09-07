@@ -46,12 +46,39 @@ class DotsTTSEngineBuilder(TtsEngineBuilder):
         # tail is eager, so skip the process-global compile policy otherwise.
         # The policy must exist before SGLang builds the model; applying it in
         # setup_model nests Dynamo under FX.
-        if self.optimize and int(server_args.max_running_requests) == 1:
+        if (
+            not self._uses_mlx()
+            and self.optimize
+            and int(server_args.max_running_requests) == 1
+        ):
             from sglang_omni.models.dots_tts.stages import _configure_optimized_kernels
 
             _configure_optimized_kernels()
 
+    @staticmethod
+    def _uses_mlx() -> bool:
+        from sglang.srt.utils.tensor_bridge import use_mlx
+
+        return use_mlx()
+
     def generation_defaults(self, *, dtype: str) -> dict[str, Any]:
+        if self._uses_mlx():
+            from sglang_omni.platforms import current_platform
+
+            if not current_platform.is_mps():
+                raise ValueError("dots.tts MLX requires Apple Silicon")
+            return {
+                "disable_cuda_graph": True,
+                "disable_overlap_schedule": True,
+                "disable_radix_cache": True,
+                "enable_torch_compile": False,
+                "max_running_requests": 1,
+                "max_total_tokens": self.context_length,
+                "max_prefill_tokens": self.context_length,
+                "chunked_prefill_size": -1,
+                "dtype": dtype,
+                "trust_remote_code": False,
+            }
         return {
             "disable_cuda_graph": True,
             "disable_overlap_schedule": True,
@@ -65,6 +92,34 @@ class DotsTTSEngineBuilder(TtsEngineBuilder):
         }
 
     def adjust_overrides(self, overrides: dict[str, Any]) -> None:
+        if self._uses_mlx():
+            required = {
+                "max_running_requests": 1,
+                "disable_cuda_graph": True,
+                "disable_overlap_schedule": True,
+                "disable_radix_cache": True,
+                "enable_torch_compile": False,
+                "chunked_prefill_size": -1,
+            }
+            for key, value in required.items():
+                if overrides.get(key, value) != value:
+                    raise ValueError(f"dots.tts MLX requires {key}={value}")
+                overrides[key] = value
+            if overrides.get("quantization") or overrides.get("mlx_enable_sampling"):
+                raise ValueError(
+                    "dots.tts MLX uses official unquantized weights and no token sampling"
+                )
+            if (
+                int(overrides.get("max_total_tokens", self.context_length))
+                < self.context_length
+            ):
+                raise ValueError(
+                    "dots.tts MLX max_total_tokens must cover the context length"
+                )
+            if int(overrides.get("tp_size", 1)) != 1:
+                raise ValueError("dots.tts MLX requires tp_size=1")
+            self.max_running_requests = 1
+            return
         if int(overrides.get("tp_size", 1)) != 1:
             raise ValueError("dots.tts base support does not implement TP")
         requested = int(
@@ -85,6 +140,18 @@ class DotsTTSEngineBuilder(TtsEngineBuilder):
             # acoustic tail's per-step request.
             overrides["enable_return_hidden_states"] = True
 
+    def validate_before_infrastructure(self, server_args: Any) -> None:
+        if str(server_args.device).split(":")[0] == "mps" and not self._uses_mlx():
+            raise ValueError("dots.tts on Apple Silicon requires SGLANG_USE_MLX=1")
+        if self._uses_mlx() and server_args.dtype not in {
+            "float32",
+            "float16",
+            "bfloat16",
+        }:
+            raise ValueError(
+                "dots.tts MLX requires float32, float16 or bfloat16 precision"
+            )
+
     def setup_model(
         self,
         *,
@@ -96,6 +163,11 @@ class DotsTTSEngineBuilder(TtsEngineBuilder):
     ) -> None:
         del checkpoint_dir, device, gpu_id
         model = model_worker.model_runner.model
+        if self._uses_mlx():
+            logger.info(
+                "dots.tts backend: MLX Qwen2 + Torch/MPS acoustic tail (single request)"
+            )
+            return
         max_running_requests = int(server_args.max_running_requests)
         if not bool(server_args.disable_cuda_graph):
             from sglang_omni.scheduling.generation_batch_policy import (
@@ -151,7 +223,12 @@ class DotsTTSEngineBuilder(TtsEngineBuilder):
     def make_model_runner(self, model_worker: Any, output_proc: Any) -> Any:
         from sglang_omni.models.dots_tts.model_runner import DotsTTSModelRunner
 
-        self._model_runner = DotsTTSModelRunner(model_worker, output_proc)
+        if self._uses_mlx():
+            from sglang_omni.models.dots_tts.mlx_runner import DotsTTSMlxModelRunner
+
+            self._model_runner = DotsTTSMlxModelRunner(model_worker, output_proc)
+        else:
+            self._model_runner = DotsTTSModelRunner(model_worker, output_proc)
         return self._model_runner
 
     def make_adapters(self, model: Any) -> tuple[Any, Any]:

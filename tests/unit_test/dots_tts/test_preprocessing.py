@@ -92,7 +92,7 @@ def _preprocess(payload: StagePayload, tokenizer: _RecordingTokenizer) -> DotsTT
 
 
 def test_public_base_auto_and_generation_budget_reach_native_state(monkeypatch) -> None:
-    monkeypatch.setattr("dots_tts.utils.text.detect", lambda _text: "en")
+    monkeypatch.setattr("sglang_omni.models.dots_tts.text.detect", lambda _text: "en")
     tokenizer = _RecordingTokenizer()
 
     state = _preprocess(
@@ -171,3 +171,13 @@ def test_dots_direct_preprocessor_resolves_tokenizer_invariants(
     assert tokenizer.converted_tokens == tokenizer.audio_span_tokens
     assert state.audio_span_token_ids == [102, 103]
     assert state.vocab_size == 256
+
+
+def test_normalization_dependency_is_needed_only_when_requested(monkeypatch):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "dots_tts.utils.text", None)
+    state = _preprocess(_payload(), _RecordingTokenizer())
+    assert state.generation_schedule is not None
+    with pytest.raises(ValueError, match="requires WeTextProcessing and Pynini"):
+        _preprocess(_payload(params={"normalize_text": True}), _RecordingTokenizer())

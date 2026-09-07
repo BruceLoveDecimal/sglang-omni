@@ -169,10 +169,13 @@ def create_mlx_model_worker(
     tp_rank: int = 0,
 ):
     """Construct an MLX worker with the same scheduler-facing contract as Omni."""
-    if config.model_arch_override != "Qwen3ASRForConditionalGeneration":
+    if config.model_arch_override not in {
+        "Qwen3ASRForConditionalGeneration",
+        "DotsTTSForConditionalGeneration",
+    }:
         raise NotImplementedError(
             "Omni's MLX worker currently supports only "
-            "Qwen3ASRForConditionalGeneration"
+            "Qwen3ASRForConditionalGeneration and DotsTTSForConditionalGeneration"
         )
 
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -182,16 +185,24 @@ def create_mlx_model_worker(
     from sglang.srt.runtime_context import publish
     from sglang.srt.server_args import PortArgs
 
-    from sglang_omni.models.qwen3_asr.mlx.runner import make_qwen3_asr_mlx_runner_class
+    if config.model_arch_override == "DotsTTSForConditionalGeneration":
+        from sglang_omni.models.dots_tts.mlx_runner import DotsMlxWorkerRunner
 
-    class OmniQwen3ASRMlxWorker(MlxTpModelWorker):
+        runner_class = DotsMlxWorkerRunner
+    else:
+        from sglang_omni.models.qwen3_asr.mlx.runner import (
+            make_qwen3_asr_mlx_runner_class,
+        )
+
+        runner_class = make_qwen3_asr_mlx_runner_class()
+
+    class OmniMlxWorker(MlxTpModelWorker):
         @property
         def tp_rank(self) -> int:
             return self.ps.tp_rank
 
         def _init_model_runner(self):
             MlxModelRunnerStub.validate_startup_weight_load_mode(self.server_args)
-            runner_class = make_qwen3_asr_mlx_runner_class()
             init_kwargs = {
                 "model_path": self.server_args.model_path,
                 "trust_remote_code": self.server_args.trust_remote_code,
@@ -207,6 +218,8 @@ def create_mlx_model_worker(
             }
             if self.server_args.max_total_tokens is not None:
                 init_kwargs["pool_size"] = self.server_args.max_total_tokens
+            if config.model_arch_override == "DotsTTSForConditionalGeneration":
+                init_kwargs["dtype"] = self.server_args.dtype
             self._mlx_runner = runner_class(**init_kwargs)
             self._model_runner = MlxModelRunnerStub(
                 model_config=self.model_config,
@@ -221,6 +234,8 @@ def create_mlx_model_worker(
                 memory_pool_config=self.memory_pool_config,
                 mlx_pool_size=self._mlx_runner.pool_size,
             )
+            if config.model_arch_override == "DotsTTSForConditionalGeneration":
+                self._model_runner.model = self._mlx_runner.model
             self._mlx_active_rids = set()
             self._mlx_pool_initialized = False
 
@@ -269,7 +284,7 @@ def create_mlx_model_worker(
     # note (yexiaodong): MlxTpModelWorker reads the split runtime configuration
     # while building its model config, before the bookkeeping stub exists.
     publish(server_args, role="scheduler")
-    return OmniQwen3ASRMlxWorker(
+    return OmniMlxWorker(
         server_args=server_args,
         gpu_id=gpu_id,
         ps=ps,

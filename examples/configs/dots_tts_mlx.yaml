@@ -1,0 +1,32 @@
+# Apple Silicon: SGLANG_USE_MLX=1 sgl-omni serve --config examples/configs/dots_tts_mlx.yaml
+# MLX Qwen2 backbone; shared Torch/MPS acoustic tail and AudioVAE.
+config_cls: DotsTTSPipelineConfig
+model_path: dots-studio/dots.tts-mf
+
+shared:
+  - select:
+      stages: [preprocessing, latent_engine]
+    factory:
+      num_steps: 4
+      max_generate_length: 500
+
+stages:
+  reference_encode:
+    factory:
+      max_concurrency: 1
+      max_batch_size: 1
+  latent_engine:
+    factory:
+      optimize: false
+    engine:
+      max_running_requests: 1
+      max_total_tokens: 2048
+      disable_cuda_graph: true
+      disable_overlap_schedule: true
+      disable_radix_cache: true
+      chunked_prefill_size: -1
+  vocoder:
+    factory:
+      # Reuse eager vocoder chunk merging (four patches per decode).
+      optimize: true
+      max_batch_size: 1

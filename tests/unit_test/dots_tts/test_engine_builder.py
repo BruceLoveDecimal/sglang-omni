@@ -10,6 +10,11 @@ from sglang_omni.models.dots_tts.engine_builder import DotsTTSEngineBuilder
 from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
 
 
+@pytest.fixture(autouse=True)
+def torch_backend(monkeypatch):
+    monkeypatch.setattr(DotsTTSEngineBuilder, "_uses_mlx", staticmethod(lambda: False))
+
+
 def test_dots_engine_uses_shared_tts_builder() -> None:
     builder = DotsTTSEngineBuilder(optimize=True)
 

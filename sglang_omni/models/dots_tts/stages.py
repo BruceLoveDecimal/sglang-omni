@@ -29,9 +29,11 @@ _DEFAULT_CONTEXT_LENGTH = 2048
 
 
 def _device(device: str | None, gpu_id: int | None) -> str:
-    if device is not None and device != "cuda":
-        return device
-    return f"cuda:{int(gpu_id or 0)}"
+    from sglang_omni.utils.device import place_device_spec, resolve_device_spec
+
+    if device is None:
+        return resolve_device_spec(None, gpu_id)
+    return place_device_spec(device, gpu_id)
 
 
 def _configure_optimized_kernels() -> None:
@@ -111,16 +113,17 @@ def preprocess_dots_tts_payload(
         DEFAULT_TEXT_TO_AUDIO_TEMPLATE,
         DEFAULT_TRAIN_TEMPLATE,
     )
-    from dots_tts.utils.text import (
-        attach_language_tag,
-        detect,
-        normalize_language_code,
-        normalize_text,
-    )
     from dots_tts.utils.tokenizer import (
         AUDIO_COMP_SPAN_TOKEN,
         AUDIO_GEN_SPAN_TOKEN,
         require_token_id,
+    )
+
+    from sglang_omni.models.dots_tts.text import (
+        attach_language_tag,
+        detect,
+        normalize_language_code,
+        normalize_text,
     )
 
     inputs = _inputs(payload.request.inputs)
@@ -392,7 +395,7 @@ def create_preprocessing_executor(
 def create_reference_encode_executor(
     model_path: str,
     *,
-    device: str | None = "cuda",
+    device: str | None = None,
     gpu_id: int | None = None,
     max_concurrency: int = 8,
     max_batch_size: int = 1,
@@ -420,7 +423,7 @@ def create_sglang_latent_engine_executor(
     optimize: bool = True,
     max_generate_length: int = 500,
     num_steps: int = 4,
-    device: str | None = "cuda",
+    device: str | None = None,
     gpu_id: int | None = None,
     server_args_overrides: dict[str, Any] | None = None,
 ) -> OmniScheduler:
@@ -432,7 +435,7 @@ def create_sglang_latent_engine_executor(
         max_audio_patches=max_generate_length,
     ).build(
         model_path,
-        device=device or "cuda",
+        device=_device(device, gpu_id),
         gpu_id=gpu_id,
         dtype=precision,
         server_args_overrides=server_args_overrides,
@@ -442,7 +445,7 @@ def create_sglang_latent_engine_executor(
 def create_vocoder_executor(
     model_path: str,
     *,
-    device: str | None = "cuda",
+    device: str | None = None,
     gpu_id: int | None = None,
     optimize: bool = True,
     vocoder_merge_steps: int = 4,

@@ -21,6 +21,72 @@ dots.tts is a continuous-latent model, not a codec model. The backbone emits no 
 | [`dots-studio/dots.tts-soar`](https://huggingface.co/dots-studio/dots.tts-soar) | Flow matching. Single request at a time (`max_running_requests=1`) with CFG, `num_steps=10`. `examples/configs/dots_tts_soar.yaml` |
 | [`dots-studio/dots.tts-base`](https://huggingface.co/dots-studio/dots.tts-base) | Flow matching, same as SOAR. Serve it with `examples/configs/dots_tts_soar.yaml` and `--model-path dots-studio/dots.tts-base` |
 
+## Apple Silicon (MLX)
+
+The Apple path uses an **MLX Qwen2 backbone with the shared Torch/MPS acoustic
+head, reference encoder and AudioVAE**. It supports the official, unconverted
+`dots.tts-mf` checkpoint, voice cloning and 48 kHz PCM streaming. It does not
+require `mlx-audio`. This is a hybrid pipeline, not an entirely MLX model.
+
+After installing the Apple runtime with `bash install.sh`, activate its virtual
+environment and install the dots model package without its Linux-oriented
+text-normalization dependencies:
+
+```bash
+uv pip install --no-deps 'dots.tts==0.2.1'
+uv pip install loguru torchdiffeq 'langcodes[data]' lingua-language-detector
+```
+
+The default `normalize_text=False` works without Pynini. Enabling normalization
+requires the upstream WeTextProcessing/Pynini installation; otherwise supply
+already normalized text. Language names, automatic detection and language tags
+use the same rules as the other backend.
+
+Download from ModelScope, then launch with the Apple configuration:
+
+```bash
+uv pip install modelscope
+modelscope download --model dots-studio/dots.tts-mf --local_dir ./models/dots.tts-mf
+
+SGLANG_USE_MLX=1 sgl-omni serve \
+  --model-path ./models/dots.tts-mf \
+  --config examples/configs/dots_tts_mlx.yaml \
+  --allowed-local-media-path docs/_static/audio \
+  --port 8000
+```
+
+Use the voice-cloning and streaming requests below, setting `model` to the served
+model path. All component files are in the checkpoint, including
+`model.safetensors`, `vocoder.safetensors`, `speaker_encoder.safetensors`,
+`latent_stats.pt`, both configuration files and tokenizer files.
+
+The initial Apple profile requires `max_running_requests=1`, TP=1, full prefill,
+no radix cache, no CUDA graphs and no decode overlap. Concurrent clients queue
+through the existing scheduler. The backbone defaults to BF16; the reused MPS
+acoustic components run in FP32. Quantized checkpoints and a separate Torch/MPS
+backbone are not supported by this configuration. Use the dedicated MLX YAML;
+the CUDA YAML enables batching and graphs that this backend rejects.
+
+Run the opt-in real-model HTTP regression suite on Apple Silicon with:
+
+```bash
+DOTS_TTS_MLX_MODEL_PATH=./models/dots.tts-mf \
+DOTS_TTS_MLX_OUTPUT_DIR=./results/dots_tts_mlx \
+pytest -q -s tests/test_model/test_dots_tts_mlx.py
+```
+
+It launches and tears down a server, checks non-streaming WAV, streaming PCM,
+fixed-seed reproducibility, queued clients and recovery after a streaming client
+disconnects. The output directory retains audio, request timings and server logs.
+
+Validated on an Apple M1 Pro with 32 GiB memory, macOS 15.7.7, MLX 0.32.2,
+mlx-lm 0.31.3 and Torch 2.11.0 using the official ModelScope MF weights. All five
+HTTP tests passed. The example sentence produced 4.16 seconds of 48 kHz audio;
+the warm non-streaming request took 13.00 seconds and streaming delivered its
+first PCM bytes in 2.37 seconds. Both outputs transcribed to the requested text
+with Whisper tiny.en. These are single-sentence smoke measurements, not a
+corpus-level quality or performance benchmark.
+
 ## Prerequisites
 
 Install `sglang-omni` by following [Installation](../get_started/installation.md), then download and launch the server:
