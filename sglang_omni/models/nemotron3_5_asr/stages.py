@@ -76,9 +76,12 @@ def create_nemotron3_5_asr_executor(
             for (index, _), result in zip(valid, batch_results):
                 results[index] = result
 
-        if any(result is None for result in results):
-            raise RuntimeError("Nemotron batch result isolation was incomplete")
-        return [result for result in results if result is not None]
+        completed: list[StagePayload | BaseException] = []
+        for result in results:
+            if result is None:
+                raise RuntimeError("Nemotron batch result isolation was incomplete")
+            completed.append(result)
+        return completed
 
     return Nemotron3_5ASRStreamingScheduler(
         runner,

@@ -24,12 +24,14 @@ from .hf_compat import (
     Nemotron3_5AsrConfig,
     Nemotron3_5AsrForRNNT,
     Nemotron3_5AsrProcessor,
-)
-from .hf_compat.generation_nemotron3_5_asr import Nemotron3_5AsrRNNTDecoderCache
-from .hf_compat.modeling_nemotron_asr_streaming import (
+    Nemotron3_5AsrConfig,
+    Nemotron3_5AsrForRNNT,
+    Nemotron3_5AsrProcessor,
+    Nemotron3_5AsrRNNTDecoderCache,
     NemotronAsrStreamingEncoderCausalConvPaddingCache,
     NemotronAsrStreamingEncoderModelOutput,
 )
+
 from .request_builders import NEMOTRON_ASR_SAMPLE_RATE, Nemotron3_5ASRRequest
 from .text import clean_nemotron_text, resolve_nemotron_locale
 
@@ -393,6 +395,9 @@ class Nemotron3_5ASRModelRunner:
                     state.decoder_cache = split_decoder[row]
                     token = int(predicted[row])
                     state.tokens.append(token)
+                    # note (Li Gang): Keep this blank/advance state transition aligned with the offline RNNT
+                    # greedy path used by NemotronAsrStreamingGenerationMixin, including the
+                    # max_symbols_per_step forced advance and duration semantics.
                     is_blank = token == int(self.model.config.blank_token_id)
                     symbols = 0 if is_blank else state.symbols_at_frame + 1
                     force_advance = symbols >= int(self.model.max_symbols_per_step)

@@ -18,5 +18,8 @@ __all__ = [
     "Nemotron3_5AsrConfig",
     "Nemotron3_5AsrForRNNT",
     "Nemotron3_5AsrProcessor",
+    "Nemotron3_5AsrRNNTDecoderCache",
+    "NemotronAsrStreamingEncoderCausalConvPaddingCache",
+    "NemotronAsrStreamingEncoderModelOutput",
     "NemotronAsrStreamingFeatureExtractor",
 ]

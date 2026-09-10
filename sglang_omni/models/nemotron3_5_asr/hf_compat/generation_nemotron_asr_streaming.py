@@ -265,7 +265,9 @@ class NemotronAsrStreamingGenerationMixin(ParakeetRNNTGenerationMixin):
                 )
             self._streaming_num_lookahead_tokens = num_lookahead_tokens
         try:
-            # Parakeet's generate() runs the decoding loop and assembles sequences + per-step durations.
+            # note (Li Gang): Parakeet's generate() runs the decoding loop and assembles sequences + per-step durations.
+            # The external PCM batching path in model_runner.py mirrors the inherited
+            # blank/advance and max_symbols_per_step semantics used here.
             outputs = super().generate(
                 inputs=inputs, generation_config=generation_config, **kwargs
             )

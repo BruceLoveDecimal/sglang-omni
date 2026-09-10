@@ -81,12 +81,6 @@ def validate_nemotron_greedy_params(params: Mapping[str, Any]) -> int | None:
     return raw_max_new_tokens
 
 
-# Keep the pre-Phase-3 private names importable for downstream tests and local
-# integrations that used the original offline builder helpers.
-_normalize_language = normalize_nemotron_language
-_validate_greedy_params = validate_nemotron_greedy_params
-
-
 def make_nemotron3_5_asr_request_builder(
     *, prompt_dictionary: Mapping[str, int]
 ) -> Callable[[StagePayload], Nemotron3_5ASRRequest]:

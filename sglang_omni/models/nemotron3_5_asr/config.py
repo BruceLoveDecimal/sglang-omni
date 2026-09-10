@@ -15,11 +15,8 @@ _PKG = "sglang_omni.models.nemotron3_5_asr"
 class Nemotron3_5ASRFactoryArgs(FactoryArgs):
     """Deployment knobs for the model-owned RNN-T stage."""
 
-    dtype: str | None = "float32"
-    num_lookahead_tokens: Literal[0, 3, 6, 13] | None = 3
-    max_batch_size: int | None = Field(default=8, ge=1)
-    max_batch_wait_ms: float | None = Field(default=2.0, ge=0)
-    max_pending_stream_messages: int | None = Field(default=256, ge=1)
+    num_lookahead_tokens: int | None = None
+    max_pending_stream_messages: int | None = Field(default=None, ge=1)
 
 
 class Nemotron3_5ASRStageConfig(StageConfig):
