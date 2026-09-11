@@ -10,6 +10,10 @@ import torch
 from sglang_omni.models.auk import constants as C
 from sglang_omni.models.auk.hf_config import AuKRuntimeConfig
 from sglang_omni.models.auk.payload_types import AuKState
+from sglang_omni.models.auk.reference_cache import (
+    AuKReferenceEncoder,
+    AuKReferenceIdentity,
+)
 from sglang_omni.models.auk.stages import (
     _condition_batch,
     _decode_batch,
@@ -25,7 +29,8 @@ def test_batched_generation_preserves_request_boundaries_and_serializes_audio():
     device = torch.device("cpu")
 
     class PosteriorVAE(torch.nn.Module):
-        encoding_and_normalization = BigVGANFlowVAE.encoding_and_normalization
+        encode_posterior = BigVGANFlowVAE.encode_posterior
+        sample_and_normalize = BigVGANFlowVAE.sample_and_normalize
 
         def __init__(self):
             super().__init__()
@@ -64,9 +69,10 @@ def test_batched_generation_preserves_request_boundaries_and_serializes_audio():
         for index, frames in enumerate((151, 75, 151))
     ]
 
+    references = AuKReferenceEncoder(vae, device, AuKReferenceIdentity("stub", "cfg"))
     rng = torch.random.get_rng_state()
     conditioned = _condition_batch(
-        payloads, encoder, vae, fusion, device, torch.float32
+        payloads, encoder, references, fusion, device, torch.float32
     )
     states = [AuKState.from_dict(payload.data) for payload in conditioned]
     assert torch.equal(states[0].ref_latent, states[1].ref_latent)
@@ -74,6 +80,13 @@ def test_batched_generation_preserves_request_boundaries_and_serializes_audio():
     assert torch.equal(torch.random.get_rng_state(), rng)
     assert states[0].ref_length == 50
     assert states[0].ref_latent.stride() == (1, 51)
+    # One posterior encode served all three requests with the same reference.
+    assert references.stats() == {
+        **references.stats(),
+        "hits": 2,
+        "misses": 1,
+        "entries": 1,
+    }
     sampled = _sample_batch(conditioned, flow, device, torch.float32, 1500, {})
     assert len(flow.sample_batch.call_args.args[0]) == 3
     results = _decode_batch(sampled, vae, device)

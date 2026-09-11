@@ -11,7 +11,6 @@ from collections import defaultdict
 from contextlib import nullcontext
 from functools import lru_cache
 
-import numpy as np
 import torch
 from safetensors import safe_open
 
@@ -21,10 +20,18 @@ from sglang_omni.models.auk.flow_matching import (
     AuKFlowMatching,
     AuKSampleItem,
     fuse_hidden_states,
-    request_generator,
 )
 from sglang_omni.models.auk.hf_config import make_runtime_config
 from sglang_omni.models.auk.payload_types import AuKState
+from sglang_omni.models.auk.reference_cache import (
+    DEFAULT_AUDIO_CACHE_MAX_BYTES,
+    DEFAULT_AUDIO_CACHE_MAX_ITEMS,
+    DEFAULT_POSTERIOR_CACHE_MAX_BYTES,
+    DEFAULT_POSTERIOR_CACHE_MAX_ITEMS,
+    AuKReferenceEncoder,
+    AuKReferenceIdentity,
+    AuKReferenceLoader,
+)
 from sglang_omni.models.auk.reference_encode import AuKConditionEncoder, build_messages
 from sglang_omni.models.auk.request_builders import (
     AuKPreprocessingContext,
@@ -130,34 +137,33 @@ def create_preprocessing_executor(
     max_concurrency: int = 8,
     default_seconds: float = C.DEFAULT_SECONDS,
     max_seconds: float = C.MAX_SECONDS,
+    ref_audio_cache: bool = True,
+    ref_audio_cache_max_items: int | None = DEFAULT_AUDIO_CACHE_MAX_ITEMS,
+    ref_audio_cache_max_bytes: int | None = DEFAULT_AUDIO_CACHE_MAX_BYTES,
 ) -> SimpleScheduler:
+    """Build the request-mapping stage.
+
+    ``ref_audio_cache`` keeps decoded and resampled reference waveforms keyed by
+    their content, so repeated references skip decoding and resampling.
+    """
     config = make_runtime_config(resolve_checkpoint(model_path))
     set_auk_preprocessing_context(
         AuKPreprocessingContext(
             config=config,
             default_seconds=default_seconds,
             max_seconds=max_seconds,
+            reference_loader=AuKReferenceLoader(
+                config.sample_rate,
+                cache=ref_audio_cache,
+                max_items=ref_audio_cache_max_items,
+                max_bytes=ref_audio_cache_max_bytes,
+            ),
         )
     )
     return SimpleScheduler(preprocess_auk_payload, max_concurrency=max_concurrency)
 
 
-def _reference_latent(vae, device, audio, seed=None):
-    if audio is None:
-        return None, 0
-    waveform = torch.from_numpy(
-        np.asarray(audio, dtype=np.float32).reshape(1, 1, -1)
-    ).to(device)
-    lengths = torch.tensor(
-        [waveform.shape[-1] // vae.hop_size * vae.hop_size], device=device
-    )
-    latent, lengths = vae.encoding_and_normalization(
-        waveform, lengths, generator=request_generator(seed, device)
-    )
-    return latent[0], int(lengths[0])
-
-
-def _condition_batch(payloads, encoder, vae, fusion, device, dtype):
+def _condition_batch(payloads, encoder, references, fusion, device, dtype):
     started = time.perf_counter()
     states = [load_state(payload, AuKState) for payload in payloads]
     messages = [
@@ -165,9 +171,10 @@ def _condition_batch(payloads, encoder, vae, fusion, device, dtype):
         for state in states
     ]
     for state in states:
-        state.ref_latent, state.ref_length = _reference_latent(
-            vae, device, state.ref_audio, state.seed
-        )
+        if state.ref_audio is not None:
+            state.ref_latent, state.ref_length = references.encode(
+                state.ref_audio, state.seed
+            )
     with _autocast(device, dtype):
         encodings = encoder.encode_batch(
             messages, [state.qwen_audio for state in states]
@@ -191,7 +198,16 @@ def create_conditioning_executor(
     text_encoder_path: str = C.DEFAULT_TEXT_ENCODER,
     max_batch_size: int = 8,
     max_batch_wait_ms: int = 10,
+    ref_audio_cache: bool = True,
+    ref_audio_cache_max_items: int | None = DEFAULT_POSTERIOR_CACHE_MAX_ITEMS,
+    ref_audio_cache_max_bytes: int | None = DEFAULT_POSTERIOR_CACHE_MAX_BYTES,
 ) -> SimpleScheduler:
+    """Build the conditioning stage.
+
+    ``ref_audio_cache`` keeps the VAE posterior of each distinct reference
+    waveform across requests; the latent is still sampled per request from
+    the request seed (see docs/cookbook/auk.md, Reference Caching).
+    """
     compute_dtype = _resolve_dtype(field="dtype", name=dtype)
     device = resolve_concrete_device(device, gpu_id)
     checkpoint = resolve_checkpoint(model_path)
@@ -200,9 +216,20 @@ def create_conditioning_executor(
     )
     vae = _load_vae(checkpoint, str(device))
     fusion = _load_fusion(checkpoint, str(device))
+    references = AuKReferenceEncoder(
+        vae,
+        device,
+        (
+            AuKReferenceIdentity.of(checkpoint, make_runtime_config(checkpoint))
+            if ref_audio_cache
+            else None
+        ),
+        max_items=ref_audio_cache_max_items,
+        max_bytes=ref_audio_cache_max_bytes,
+    )
     return _scheduler(
         lambda payloads: _condition_batch(
-            payloads, encoder, vae, fusion, device, compute_dtype
+            payloads, encoder, references, fusion, device, compute_dtype
         ),
         device,
         max_batch_size,

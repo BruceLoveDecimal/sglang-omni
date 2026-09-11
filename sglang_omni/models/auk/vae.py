@@ -806,21 +806,26 @@ class BigVGANFlowVAE(nn.Module):
             self.ups[i].apply(init_weights)
         self.conv_post.apply(init_weights)
 
-    def encoding_and_normalization(
+    def encode_posterior(self, sample: torch.Tensor) -> torch.Tensor:
+        """Encode a ``(B, 1, samples)`` waveform to posterior statistics.
+
+        The result is ``(B, 2 * latent_dim, frames)``: the posterior mean
+        followed by its log standard deviation along the channel axis. It is
+        deterministic, so it can be cached and re-sampled per request.
+        """
+        with torch.autocast(device_type=sample.device.type, enabled=False):
+            return self.audio_encoder(sample.float())
+
+    def sample_and_normalize(
         self,
-        sample: torch.Tensor,
-        sample_lengths: torch.Tensor | None = None,
+        latent_stats: torch.Tensor,
+        sample_lengths: torch.Tensor,
         generator: torch.Generator | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Encode a waveform to a normalized latent."""
-        with torch.autocast(device_type=sample.device.type, enabled=False):
-            latent_stats = self.audio_encoder(sample.float())
-            if sample_lengths is None:
-                sample_lengths = torch.LongTensor(
-                    [sample.size(-1)] * sample.size(0)
-                ).to(sample.device)
+        """Draw a latent from ``encode_posterior`` output and normalize it."""
+        with torch.autocast(device_type=latent_stats.device.type, enabled=False):
             latent_lens = sample_lengths // self.hop_size
-            mean, log_std = latent_stats.chunk(2, 1)
+            mean, log_std = latent_stats.float().chunk(2, 1)
             noise = torch.randn(
                 mean.shape,
                 device=mean.device,
@@ -834,6 +839,21 @@ class BigVGANFlowVAE(nn.Module):
             )
             latent_lens = torch.clamp(latent_lens, max=latents.size(1))
         return latents, latent_lens
+
+    def encoding_and_normalization(
+        self,
+        sample: torch.Tensor,
+        sample_lengths: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode a waveform to a normalized latent."""
+        if sample_lengths is None:
+            sample_lengths = torch.LongTensor([sample.size(-1)] * sample.size(0)).to(
+                sample.device
+            )
+        return self.sample_and_normalize(
+            self.encode_posterior(sample), sample_lengths, generator=generator
+        )
 
     def denormalize(self, latents: torch.Tensor) -> torch.Tensor:
         latents = latents.float()

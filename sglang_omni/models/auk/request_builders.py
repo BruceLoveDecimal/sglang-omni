@@ -3,18 +3,16 @@
 
 from __future__ import annotations
 
-import io
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import unquote, urlparse
 
 import numpy as np
 
 from sglang_omni.models.auk import constants as C
 from sglang_omni.models.auk.hf_config import AuKRuntimeConfig
 from sglang_omni.models.auk.payload_types import AuKState
+from sglang_omni.models.auk.reference_cache import AuKReferenceLoader
 from sglang_omni.proto import StagePayload
-from sglang_omni.utils.audio import decode_audio_data_uri, load_audio
 from sglang_omni.utils.audio_payload import audio_data_uri_from_reference
 
 
@@ -23,6 +21,9 @@ class AuKPreprocessingContext:
     config: AuKRuntimeConfig
     default_seconds: float = C.DEFAULT_SECONDS
     max_seconds: float = C.MAX_SECONDS
+    # None decodes every request from scratch; the stage factory installs a
+    # content-keyed loader so repeated references are decoded once.
+    reference_loader: AuKReferenceLoader | None = None
 
 
 _CONTEXT: AuKPreprocessingContext | None = None
@@ -106,28 +107,9 @@ def _resolve_seed(raw: Any) -> int | None:
         raise ValueError(f"AuK seed must be an integer, got {raw!r}") from exc
 
 
-def _load_reference(source: Any, sample_rate: int) -> tuple[np.ndarray, np.ndarray]:
-    import librosa
-
-    if isinstance(source, str):
-        decoded = decode_audio_data_uri(source)
-        if decoded is not None:
-            source = decoded
-        elif source.startswith(("http://", "https://")):
-            import httpx
-
-            response = httpx.get(source, timeout=5, follow_redirects=True)
-            response.raise_for_status()
-            source = response.content
-        elif source.startswith("file://"):
-            source = unquote(urlparse(source).path)
-    vae_audio = load_audio(source, source_name="AuK", target_sample_rate=sample_rate)
-    qwen_audio, _ = librosa.load(
-        io.BytesIO(source) if isinstance(source, bytes) else source,
-        sr=C.QWEN_AUDIO_SAMPLE_RATE,
-        mono=True,
-    )
-    return np.asarray(vae_audio, dtype=np.float32).reshape(-1), qwen_audio
+def _reference_loader(config: AuKRuntimeConfig) -> AuKReferenceLoader:
+    loader = _CONTEXT.reference_loader if _CONTEXT is not None else None
+    return loader or AuKReferenceLoader(config.sample_rate, cache=False)
 
 
 def build_auk_state(payload: StagePayload, config: AuKRuntimeConfig) -> AuKState:
@@ -182,7 +164,8 @@ def build_auk_state(payload: StagePayload, config: AuKRuntimeConfig) -> AuKState
     qwen_audio: np.ndarray | None = None
     ref_seconds = 0.0
     if ref_source is not None:
-        ref_audio, qwen_audio = _load_reference(ref_source, config.sample_rate)
+        reference = _reference_loader(config).load(ref_source)
+        ref_audio, qwen_audio = reference.vae_audio, reference.qwen_audio
         ref_seconds = ref_audio.shape[-1] / float(config.sample_rate)
 
     if gen_seconds is None and is_speech:

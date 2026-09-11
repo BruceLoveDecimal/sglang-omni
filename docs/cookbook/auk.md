@@ -92,6 +92,19 @@ The DiT stores its weights in BF16 and runs without autocast by default (`--auk_
 
 Conditioning and DiT sampling use dynamic batching, with default maximum batch sizes of 8 and 16. VAE decoding groups equal-length latents (up to 4 requests) to preserve boundary behavior. The stages can overlap on separate CUDA streams and share VAE weights within the same process/device. Conditioning loads the Qwen encoder, the VAE and the two hidden-state fusion parameters; only the sampling stage loads the DiT. Set `--conditioning.factory.max_batch_size`, `--auk_engine.factory.max_batch_size`, or `--decode.factory.max_batch_size` to tune them. Audio is returned after decoding completes; incremental audio streaming is not implemented.
 
+## Reference Caching
+
+Voice-cloning traffic often reuses a small set of speaker references, so both stages that touch reference audio keep a content-keyed LRU cache (shared `ReferenceEncodeService`: byte budget, same-key single-flight, periodic hit/miss logging). Both caches are on by default and can be tuned or disabled per stage:
+
+| Stage | What is cached | Flags (defaults) |
+|---|---|---|
+| `preprocessing` | Decoded and resampled reference waveforms (24 kHz for the VAE, 16 kHz for Qwen) | `--preprocessing.factory.ref_audio_cache true`, `ref_audio_cache_max_items 256`, `ref_audio_cache_max_bytes 134217728` |
+| `conditioning` | VAE encoder posterior (`mean`, `log_std`) per reference waveform | `--conditioning.factory.ref_audio_cache true`, `ref_audio_cache_max_items 256`, `ref_audio_cache_max_bytes 67108864` |
+
+Keys are derived from content, never from the request string: HTTP(S) references are downloaded and hashed on every request (the cache saves decoding and resampling, not the download), data URLs and uploaded bytes are hashed directly, and local files are hashed in full and revalidated by size and modification time. The posterior key also includes the checkpoint path and VAE weight file, the VAE configuration, and the sample rate.
+
+The posterior is cached instead of the final reference latent because AuK samples `latent = mean + noise * exp(log_std)` for every request. Sampling and normalization run after the cache lookup, so unseeded requests remain random and a fixed `seed` produces the same latent whether or not the reference was cached. Each entry costs roughly 25 KiB per second of reference audio in the conditioning stage and 160 KiB per second in preprocessing.
+
 ## SeedTTS Evaluation
 
 The standard benchmark detects `tencent/AuK` and `tencent/AuK-Flash` and starts the server from `--model-path`. It defaults to the full English dataset, concurrency 1, one warmup, and seed 1234. It estimates duration from the reference audio and transcript, then automatically starts and stops the TTS and ASR servers:
