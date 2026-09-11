@@ -210,6 +210,18 @@ def test_scheduler_batches_one_window_per_request_and_cleans_state() -> None:
     scheduler._on_done("b")
     results = [scheduler.outbox.get_nowait(), scheduler.outbox.get_nowait()]
     assert all(message.type == "result" for message in results)
+    final_payloads = [message.data for message in results]
+    assert all(isinstance(payload, StagePayload) for payload in final_payloads)
+    assert all(payload.data["text"] == "word more" for payload in final_payloads)
+    assert all(
+        payload.data["raw_text"] == "<en-US> word more" for payload in final_payloads
+    )
+    assert all(payload.data["language"] == "en-US" for payload in final_payloads)
+    assert all("asr_latency_s" in payload.data for payload in final_payloads)
+    assert all(
+        payload.data["model_latency_s"] == pytest.approx(0.002)
+        for payload in final_payloads
+    )
     assert scheduler.stats()["active_streams"] == 0
 
 

@@ -13,6 +13,8 @@ import numpy as np
 from sglang_omni.preprocessing.transcription import prepare_audio
 from sglang_omni.proto import StagePayload
 
+from .text import clean_nemotron_text, resolve_nemotron_locale
+
 NEMOTRON_ASR_SAMPLE_RATE = 16000
 
 
@@ -114,9 +116,43 @@ def make_nemotron3_5_asr_request_builder(
     return request_builder
 
 
+def build_nemotron3_5_asr_result(
+    payload: StagePayload,
+    *,
+    raw_text: str,
+    requested_language: str | None,
+    duration_s: float,
+    asr_latency_s: float,
+    model_latency_s: float,
+    extra_data: Mapping[str, Any] | None = None,
+) -> StagePayload:
+    """Build the common final payload for offline and streaming ASR."""
+
+    raw_text = str(raw_text).strip()
+    data: dict[str, Any] = {
+        "text": clean_nemotron_text(raw_text),
+        "raw_text": raw_text,
+        "language": resolve_nemotron_locale(raw_text, requested_language),
+        "duration_s": duration_s,
+        "asr_latency_s": asr_latency_s,
+        "model_latency_s": model_latency_s,
+        "usage": {"engine_time_s": model_latency_s},
+        "modality": "text",
+    }
+    if extra_data:
+        data.update(extra_data)
+
+    return StagePayload(
+        request_id=payload.request_id,
+        request=payload.request,
+        data=data,
+    )
+
+
 __all__ = [
     "NEMOTRON_ASR_SAMPLE_RATE",
     "Nemotron3_5ASRRequest",
+    "build_nemotron3_5_asr_result",
     "make_nemotron3_5_asr_request_builder",
     "normalize_nemotron_language",
     "validate_nemotron_greedy_params",

@@ -89,9 +89,14 @@ def test_run_batch_pads_once_generates_once_and_preserves_order() -> None:
     assert model.calls[0]["return_dict_in_generate"] is True
     assert [result.request_id for result in results] == ["request-a", "request-b"]
     assert [result.data["text"] for result in results] == [
+        "first",
+        "second",
+    ]
+    assert [result.data["raw_text"] for result in results] == [
         "first <en-US>",
         "second <zh-CN>",
     ]
+    assert [result.data["language"] for result in results] == ["en-US", "zh-CN"]
     assert all(result.data["batch_size"] == 2 for result in results)
 
 

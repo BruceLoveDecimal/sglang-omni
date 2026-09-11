@@ -80,3 +80,31 @@ def test_builder_rejects_unsupported_generation_modes(
 
     with pytest.raises(ValueError, match=message):
         builder(_payload(**params))
+
+
+def test_result_builder_unifies_offline_and_streaming_payload_fields() -> None:
+    payload = _payload(language="auto")
+
+    result = request_builders.build_nemotron3_5_asr_result(
+        payload,
+        raw_text="  hello <en-US>  ",
+        requested_language="auto",
+        duration_s=0.5,
+        asr_latency_s=0.3,
+        model_latency_s=0.2,
+        extra_data={"batch_size": 2},
+    )
+
+    assert result.request_id == payload.request_id
+    assert result.request is payload.request
+    assert result.data == {
+        "text": "hello",
+        "raw_text": "hello <en-US>",
+        "language": "en-US",
+        "duration_s": 0.5,
+        "asr_latency_s": 0.3,
+        "model_latency_s": 0.2,
+        "usage": {"engine_time_s": 0.2},
+        "modality": "text",
+        "batch_size": 2,
+    }

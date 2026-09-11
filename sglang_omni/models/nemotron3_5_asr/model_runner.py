@@ -32,7 +32,11 @@ from .hf_compat import (
     NemotronAsrStreamingEncoderModelOutput,
 )
 
-from .request_builders import NEMOTRON_ASR_SAMPLE_RATE, Nemotron3_5ASRRequest
+from .request_builders import (
+    NEMOTRON_ASR_SAMPLE_RATE,
+    Nemotron3_5ASRRequest,
+    build_nemotron3_5_asr_result,
+)
 from .text import clean_nemotron_text, resolve_nemotron_locale
 
 
@@ -479,25 +483,21 @@ class Nemotron3_5ASRModelRunner:
 
         results: list[StagePayload] = []
         for request, raw_text in zip(requests, raw_texts):
-            payload = request.stage_payload
             stage_latency_s = (
                 time.perf_counter() - request.started_at_s
                 if request.started_at_s
                 else elapsed_s
             )
             results.append(
-                StagePayload(
-                    request_id=payload.request_id,
-                    request=payload.request,
-                    data={
-                        "text": str(raw_text).strip(),
-                        "language": request.language,
-                        "duration_s": request.duration_s,
-                        "asr_latency_s": stage_latency_s,
-                        "model_latency_s": elapsed_s,
+                build_nemotron3_5_asr_result(
+                    request.stage_payload,
+                    raw_text=raw_text,
+                    requested_language=request.language,
+                    duration_s=request.duration_s,
+                    asr_latency_s=stage_latency_s,
+                    model_latency_s=elapsed_s,
+                    extra_data={
                         "batch_size": len(requests),
-                        "usage": {"engine_time_s": stage_latency_s},
-                        "modality": "text",
                     },
                 )
             )

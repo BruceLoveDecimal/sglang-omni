@@ -23,6 +23,7 @@ from .model_runner import (
     Nemotron3_5ASRStreamingBatchResult,
 )
 from .request_builders import (
+    build_nemotron3_5_asr_result,
     normalize_nemotron_language,
     validate_nemotron_greedy_params,
 )
@@ -490,29 +491,27 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
         state.metrics.finalized_s = time.perf_counter()
         self._aggregate["completed_streams"] += 1
         metrics = self._metrics_snapshot(state, now=state.metrics.finalized_s)
-        payload = state.payload
+        final_payload = build_nemotron3_5_asr_result(
+            state.payload,
+            raw_text=state.raw_text,
+            requested_language=state.language,
+            duration_s=state.total_samples / state.spec.sample_rate,
+            asr_latency_s=metrics["elapsed_s"],
+            model_latency_s=state.metrics.model_compute_s,
+            extra_data={
+                "token_ids": list(state.decode.tokens),
+                "durations": list(state.decode.durations),
+                "encoder_frames": state.decode.encoder_frames,
+                "decoder_steps": state.decode.decoder_steps,
+                "streaming_latency_ms": state.spec.streaming_latency_ms,
+                "metrics": metrics,
+            },
+        )
         messages.append(
             OutgoingMessage(
                 request_id=request_id,
                 type="result",
-                data=StagePayload(
-                    request_id=payload.request_id,
-                    request=payload.request,
-                    data={
-                        "text": state.clean_text,
-                        "raw_text": state.raw_text,
-                        "language": state.detected_language,
-                        "duration_s": state.total_samples / state.spec.sample_rate,
-                        "token_ids": list(state.decode.tokens),
-                        "durations": list(state.decode.durations),
-                        "encoder_frames": state.decode.encoder_frames,
-                        "decoder_steps": state.decode.decoder_steps,
-                        "streaming_latency_ms": state.spec.streaming_latency_ms,
-                        "metrics": metrics,
-                        "usage": {"engine_time_s": state.metrics.model_compute_s},
-                        "modality": "text",
-                    },
-                ),
+                data=final_payload,
             )
         )
         return messages
