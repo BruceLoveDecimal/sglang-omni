@@ -59,7 +59,6 @@ logger = logging.getLogger(__name__)
 
 _SCHEDULER_THREAD_JOIN_TIMEOUT_S = 5.0
 _OUTBOX_DRAIN_BATCH_SIZE = 64
-_EXTERNAL_INPUT_ENQUEUE_TIMEOUT_S = 1.0
 _EXTERNAL_INPUT_ENQUEUE_RETRY_S = 0.005
 
 GetNextFn = Callable[[str, Any], str | list[str] | None]
@@ -106,6 +105,7 @@ class Stage:
         project_payload: dict[str, Callable[[Any], Any]] | None = None,
         stream_targets: list[str] | None = None,
         get_stream_done_targets: GetStreamDoneTargetsFn | None = None,
+        external_input_enqueue_timeout_s: float = 1.0,
         gpu_stage_names: set[str] | None = None,
         stage_gpu_ids: dict[str, tuple[int, ...]] | None = None,
         remote_stage_names: set[str] | None = None,
@@ -128,6 +128,7 @@ class Stage:
         self._project_payload = project_payload or {}
         self._stream_targets = stream_targets or []
         self.get_stream_done_targets = get_stream_done_targets
+        self._external_input_enqueue_timeout_s = external_input_enqueue_timeout_s
         self._same_process_targets = same_process_targets or set()
         self._local_dispatcher = local_dispatcher
         self._can_accept_stream_before_payload = can_accept_stream_before_payload
@@ -886,7 +887,7 @@ class Stage:
     ) -> bool:
         """Wait asynchronously for bounded scheduler capacity without blocking IO."""
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + _EXTERNAL_INPUT_ENQUEUE_TIMEOUT_S
+        deadline = loop.time() + self._external_input_enqueue_timeout_s
         while self._is_current_external_input_stream(request_id):
             try:
                 self.scheduler.inbox.put_nowait(message)
