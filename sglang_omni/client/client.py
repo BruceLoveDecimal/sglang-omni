@@ -34,8 +34,8 @@ from sglang_omni.pipeline.coordinator import Coordinator
 from sglang_omni.proto import OmniRequest, RequestState, StreamMessage
 
 
-class ExternalInputStream:
-    """One persistent request with incrementally supplied entry-stage input."""
+class _ExternalInputStream:
+    """Internal handle for incrementally supplied entry-stage input."""
 
     def __init__(
         self,
@@ -49,7 +49,7 @@ class ExternalInputStream:
         self._input_done = False
         self._closed = False
 
-    def __aiter__(self) -> ExternalInputStream:
+    def __aiter__(self) -> _ExternalInputStream:
         return self
 
     async def __anext__(self) -> GenerateChunk:
@@ -69,7 +69,7 @@ class ExternalInputStream:
             raise RuntimeError(f"Input stream {self.request_id!r} is already done")
         if self._closed:
             raise RuntimeError(f"Input stream {self.request_id!r} is closed")
-        return await self._client.send_input_chunk(
+        return await self._client._send_input_chunk(
             self.request_id, data, metadata=metadata
         )
 
@@ -78,17 +78,17 @@ class ExternalInputStream:
             raise RuntimeError(f"Input stream {self.request_id!r} is already done")
         if self._closed:
             raise RuntimeError(f"Input stream {self.request_id!r} is closed")
-        await self._client.finish_input_stream(self.request_id)
+        await self._client._finish_input_stream(self.request_id)
         self._input_done = True
 
     async def abort(self) -> AbortResult:
-        result = await self._client.close_input_stream(self.request_id)
+        result = await self._client._close_input_stream(self.request_id)
         await self._close_events()
         return result
 
     async def aclose(self) -> None:
         if not self._closed:
-            await self._client.close_input_stream(self.request_id)
+            await self._client._close_input_stream(self.request_id)
         await self._close_events()
 
     async def _close_events(self) -> None:
@@ -97,7 +97,7 @@ class ExternalInputStream:
         if close is not None:
             await close()
 
-    async def __aenter__(self) -> ExternalInputStream:
+    async def __aenter__(self) -> _ExternalInputStream:
         return self
 
     async def __aexit__(self, *exc_info: Any) -> None:
@@ -142,20 +142,20 @@ class Client:
         result = await self._coordinator.submit(req_id, omni_request)
         yield self._result_builder(req_id, result)
 
-    async def start_input_stream(
+    async def _start_input_stream(
         self,
         request: GenerateRequest,
         *,
         request_id: str | None = None,
-    ) -> ExternalInputStream:
-        """Open a persistent request that accepts bounded CPU tensor chunks."""
+    ) -> _ExternalInputStream:
+        """Open an internal request that accepts bounded CPU tensor chunks."""
         req_id = request_id or str(uuid.uuid4())
         events = await self._coordinator.start_input_stream(
             req_id, self._build_omni_request(request)
         )
-        return ExternalInputStream(self, req_id, events)
+        return _ExternalInputStream(self, req_id, events)
 
-    async def send_input_chunk(
+    async def _send_input_chunk(
         self,
         request_id: str,
         data: Any,
@@ -166,10 +166,10 @@ class Client:
             request_id, data, metadata=metadata
         )
 
-    async def finish_input_stream(self, request_id: str) -> None:
+    async def _finish_input_stream(self, request_id: str) -> None:
         await self._coordinator.finish_input_stream(request_id)
 
-    async def close_input_stream(
+    async def _close_input_stream(
         self,
         request_id: str,
         *,

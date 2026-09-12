@@ -6,7 +6,8 @@ import asyncio
 import pytest
 import torch
 
-from sglang_omni.client import Client, ExternalInputStream
+import sglang_omni.client as client_package
+from sglang_omni.client import Client
 from sglang_omni.client.types import GenerateRequest
 from sglang_omni.proto import CompleteMessage, StreamMessage
 
@@ -49,14 +50,19 @@ class _FakeCoordinator:
         return True
 
 
+def test_external_input_stream_is_internal() -> None:
+    assert "ExternalInputStream" not in client_package.__all__
+    assert not hasattr(client_package, "ExternalInputStream")
+    assert not hasattr(Client, "start_input_stream")
+
+
 def test_client_external_input_stream_handle_lifecycle() -> None:
     async def run() -> None:
         coordinator = _FakeCoordinator()
         client = Client(coordinator)
-        stream = await client.start_input_stream(
+        stream = await client._start_input_stream(
             GenerateRequest(prompt="", stream=True), request_id="req"
         )
-        assert isinstance(stream, ExternalInputStream)
         assert (
             await stream.send(
                 torch.tensor([1, 2], dtype=torch.int16),
@@ -81,7 +87,7 @@ def test_client_external_input_stream_handle_lifecycle() -> None:
 def test_client_iterator_aclose_aborts_unfinished_request_once() -> None:
     async def run() -> None:
         coordinator = _FakeCoordinator()
-        stream = await Client(coordinator).start_input_stream(
+        stream = await Client(coordinator)._start_input_stream(
             GenerateRequest(prompt="", stream=True), request_id="req"
         )
         await stream.aclose()
@@ -96,7 +102,7 @@ def test_client_iterator_aclose_aborts_unfinished_request_once() -> None:
 def test_client_context_manager_aborts_on_exception() -> None:
     async def run() -> None:
         coordinator = _FakeCoordinator()
-        stream = await Client(coordinator).start_input_stream(
+        stream = await Client(coordinator)._start_input_stream(
             GenerateRequest(prompt="", stream=True), request_id="req"
         )
         with pytest.raises(RuntimeError, match="boom"):
