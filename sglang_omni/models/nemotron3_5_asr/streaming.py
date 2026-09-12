@@ -241,6 +241,12 @@ class Nemotron3_5ASRStreamState:
 class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
     """Offline batch scheduler plus request-owned native RNNT streaming state."""
 
+    # TODO: Before adding another cache-aware streaming ASR scheduler, extract
+    # the request-state lifecycle shared with StreamingVocoderBase—state
+    # registration, abort/stop teardown, stream-done sequencing, and delta
+    # emission—into a modality-neutral base. StreamingVocoderBase is currently
+    # audio-output-specific, so Nemotron cannot inherit from it directly.
+
     supports_external_input_stream = True
     _can_batch_stream_chunks = True
     _stream_chunk_batch_distinct_requests = True
