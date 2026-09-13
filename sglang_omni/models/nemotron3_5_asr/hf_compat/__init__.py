@@ -12,11 +12,11 @@ from .feature_extraction_nemotron_asr_streaming import (
     NemotronAsrStreamingFeatureExtractor,
 )
 from .generation_nemotron3_5_asr import Nemotron3_5AsrRNNTDecoderCache
+from .modeling_nemotron3_5_asr import Nemotron3_5AsrForRNNT
 from .modeling_nemotron_asr_streaming import (
     NemotronAsrStreamingEncoderCausalConvPaddingCache,
     NemotronAsrStreamingEncoderModelOutput,
 )
-from .modeling_nemotron3_5_asr import Nemotron3_5AsrForRNNT
 from .processing_nemotron3_5_asr import Nemotron3_5AsrProcessor
 
 __all__ = [
