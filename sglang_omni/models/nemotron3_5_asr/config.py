@@ -3,13 +3,11 @@
 
 from __future__ import annotations
 
-from typing import ClassVar, Literal
+from typing import ClassVar
 
 from pydantic import Field
 
 from sglang_omni.config import FactoryArgs, PipelineConfig, StageConfig
-
-_PKG = "sglang_omni.models.nemotron3_5_asr"
 
 
 class Nemotron3_5ASRFactoryArgs(FactoryArgs):
@@ -26,7 +24,7 @@ class Nemotron3_5ASRStageConfig(StageConfig):
 
 
 class Nemotron3_5ASRPipelineConfig(PipelineConfig):
-    """Single-stage, batched offline transcription pipeline."""
+    """Single-stage offline and streaming transcription pipeline."""
 
     architecture: ClassVar[str] = "Nemotron3_5AsrForRNNT"
     stage_config_types: ClassVar[dict[str, type[StageConfig]]] = {
@@ -39,7 +37,7 @@ class Nemotron3_5ASRPipelineConfig(PipelineConfig):
         Nemotron3_5ASRStageConfig(
             name="asr",
             process="asr",
-            factory_path=f"{_PKG}.stages.create_nemotron3_5_asr_executor",
+            factory_path="sglang_omni.models.nemotron3_5_asr.stages.create_nemotron3_5_asr_executor",
             gpu=0,
             terminal=True,
         )

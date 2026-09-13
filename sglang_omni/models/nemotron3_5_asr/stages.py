@@ -45,13 +45,13 @@ def create_nemotron3_5_asr_executor(
         prompt_dictionary=runner.prompt_dictionary
     )
 
-    def run_one(payload: StagePayload) -> StagePayload:
+    def _run_one(payload: StagePayload) -> StagePayload:
         return runner.run_one(build_request(payload))
 
-    def run_batch(
+    def _run_batch(
         payloads: Sequence[StagePayload],
     ) -> list[StagePayload | BaseException]:
-        results: list[StagePayload | BaseException | None] = [None] * len(payloads)
+        results: dict[int, StagePayload | BaseException] = {}
         valid: list[tuple[int, Nemotron3_5ASRRequest]] = []
         for index, payload in enumerate(payloads):
             try:
@@ -61,32 +61,17 @@ def create_nemotron3_5_asr_executor(
 
         if valid:
             try:
-                batch_results: list[StagePayload | BaseException] = list(
-                    runner.run_batch([request for _, request in valid])
-                )
+                batch_results = runner.run_batch([request for _, request in valid])
             except Exception as exc:
                 batch_results = [exc] * len(valid)
-            if len(batch_results) != len(valid):
-                batch_results = [
-                    RuntimeError(
-                        "Nemotron runner returned "
-                        f"{len(batch_results)} results for {len(valid)} requests"
-                    )
-                ] * len(valid)
-            for (index, _), result in zip(valid, batch_results):
+            for (index, _), result in zip(valid, batch_results, strict=True):
                 results[index] = result
-
-        completed: list[StagePayload | BaseException] = []
-        for result in results:
-            if result is None:
-                raise RuntimeError("Nemotron batch result isolation was incomplete")
-            completed.append(result)
-        return completed
+        return [results[index] for index in range(len(payloads))]
 
     return Nemotron3_5ASRStreamingScheduler(
         runner,
-        run_one,
-        batch_compute_fn=run_batch,
+        _run_one,
+        batch_compute_fn=_run_batch,
         prompt_dictionary=runner.prompt_dictionary,
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,

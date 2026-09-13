@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import queue
+from dataclasses import asdict
 from types import SimpleNamespace
 
 import numpy as np
@@ -14,7 +14,6 @@ from sglang_omni.models.nemotron3_5_asr.model_runner import (
     Nemotron3_5ASRStreamingBatchResult,
 )
 from sglang_omni.models.nemotron3_5_asr.streaming import (
-    Nemotron3_5ASRAudioWindow,
     Nemotron3_5ASRStreamingChunkSpec,
     Nemotron3_5ASRStreamingScheduler,
     Nemotron3_5ASRStreamState,
@@ -55,16 +54,7 @@ def _item(request_id: str, samples: np.ndarray) -> tuple[str, StreamItem]:
 
 class _FakeRunner:
     prompt_dictionary = {"auto": 101, "en-US": 0, "zh-CN": 4}
-    streaming_chunk_spec = {
-        "sample_rate": LOOKAHEAD_3.sample_rate,
-        "first_samples": LOOKAHEAD_3.first_samples,
-        "subsequent_samples": LOOKAHEAD_3.subsequent_samples,
-        "first_frames": LOOKAHEAD_3.first_frames,
-        "subsequent_frames": LOOKAHEAD_3.subsequent_frames,
-        "hop_length": LOOKAHEAD_3.hop_length,
-        "n_fft": LOOKAHEAD_3.n_fft,
-        "streaming_latency_ms": LOOKAHEAD_3.streaming_latency_ms,
-    }
+    streaming_chunk_spec = asdict(LOOKAHEAD_3)
 
     def __init__(self) -> None:
         self.batches: list[list[Nemotron3_5ASRDecodeState]] = []
@@ -101,8 +91,6 @@ class _FakeRunner:
             raw_texts=raw_texts,
             clean_texts=clean_texts,
             languages=["en-US"] * len(states),
-            emitted_token_counts=[1] * len(states),
-            encoder_frame_counts=[2] * len(states),
         )
 
     def close(self) -> None:
@@ -139,17 +127,13 @@ def test_pcm16_fragmentation_and_final_padding_geometry() -> None:
         )
 
     first = state.pop_ready_window()
-    assert isinstance(first, Nemotron3_5ASRAudioWindow)
-    assert first.raw_start_sample == 0
-    assert first.real_samples == 4040
-    assert first.right_padding_samples == 0
-    assert np.array_equal((first.waveform[:5] * 32768).astype(np.int16), waveform[:5])
+    np.testing.assert_array_equal(first.waveform, waveform[:4040] / 32768.0)
 
     state.mark_done()
     final = state.pop_ready_window(finalizing=True)
-    assert final.raw_start_sample == 3744
-    assert final.real_samples == 1256
-    assert final.right_padding_samples == 4264
+    np.testing.assert_array_equal(
+        final.waveform, np.pad(waveform[3744:] / 32768.0, (0, 4264))
+    )
     assert state.total_samples / LOOKAHEAD_3.sample_rate == pytest.approx(0.3125)
 
 
@@ -175,9 +159,9 @@ def test_lookahead_zero_preserves_negative_stft_start() -> None:
     state.pop_ready_window()
     state.mark_done()
     final = state.pop_ready_window(finalizing=True)
-    assert final.raw_start_sample == -96
-    assert final.left_padding_samples == 96
-    assert final.real_samples == 300
+    np.testing.assert_array_equal(
+        final.waveform, np.pad(np.arange(300) / 32768.0, (96, 1284))
+    )
 
 
 def test_scheduler_batches_one_window_per_request_and_cleans_state() -> None:
@@ -198,12 +182,8 @@ def test_scheduler_batches_one_window_per_request_and_cleans_state() -> None:
         [_item("a", continuation), _item("b", continuation)]
     )
     assert [len(batch) for batch in runner.batches] == [2, 2]
-    messages = []
-    while True:
-        try:
-            messages.append(scheduler.outbox.get_nowait())
-        except queue.Empty:
-            break
+    messages = [scheduler.outbox.get_nowait() for _ in range(4)]
+    assert scheduler.outbox.empty()
     assert [message.request_id for message in messages] == ["a", "b", "a", "b"]
 
     scheduler._on_done("a")
@@ -219,7 +199,7 @@ def test_scheduler_batches_one_window_per_request_and_cleans_state() -> None:
     assert all(payload.data["language"] == "en-US" for payload in final_payloads)
     assert all("asr_latency_s" in payload.data for payload in final_payloads)
     assert all(
-        payload.data["model_latency_s"] == pytest.approx(0.002)
+        payload.data["model_latency_s"] == pytest.approx(0.001)
         for payload in final_payloads
     )
     assert scheduler.stats()["active_streams"] == 0
@@ -250,18 +230,25 @@ def test_stream_done_rejects_incomplete_pcm16_sample() -> None:
         state.mark_done()
 
 
-def test_scheduler_rejects_non_pcm16_or_wrong_rate() -> None:
+@pytest.mark.parametrize(
+    "dtype,sample_rate,error",
+    [
+        (torch.float32, 16000, "PCM16"),
+        (torch.int16, 16000.5, "sample_rate"),
+    ],
+)
+def test_scheduler_rejects_non_pcm16_or_wrong_rate(dtype, sample_rate, error) -> None:
     runner = _FakeRunner()
     scheduler = _scheduler(runner)
     scheduler._on_streaming_new_request("r", _payload("r"))
     bad = StreamItem(
         chunk_id=0,
-        data=torch.zeros(2, dtype=torch.float32),
+        data=torch.zeros(2, dtype=dtype),
         from_stage="test",
-        metadata={"sample_rate": 8000},
+        metadata={"sample_rate": sample_rate},
     )
     scheduler.on_stream_chunk_batch([("r", bad)])
     message = scheduler.outbox.get_nowait()
     assert message.type == "error"
-    assert "PCM16" in str(message.data)
+    assert error in str(message.data)
     assert scheduler.stats()["active_streams"] == 0

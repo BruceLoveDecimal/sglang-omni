@@ -6,7 +6,6 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
 
 import numpy as np
 
@@ -29,7 +28,7 @@ class Nemotron3_5ASRRequest:
 
 
 def normalize_nemotron_language(
-    value: Any,
+    value: object,
     prompt_dictionary: Mapping[str, int],
 ) -> str:
     if value is None:
@@ -39,9 +38,6 @@ def normalize_nemotron_language(
     else:
         language = value.strip() or "auto"
 
-    # The checkpoint owns the language vocabulary. A case-insensitive lookup
-    # accepts normal HTTP spellings such as en-us without maintaining a second
-    # locale table in SGLang-Omni.
     canonical = {key.casefold(): key for key in prompt_dictionary}
     resolved = canonical.get(language.casefold())
     if resolved is None:
@@ -52,7 +48,7 @@ def normalize_nemotron_language(
     return resolved
 
 
-def validate_nemotron_greedy_params(params: Mapping[str, Any]) -> int | None:
+def validate_nemotron_greedy_params(params: Mapping[str, object]) -> int | None:
     try:
         temperature = float(params.get("temperature") or 0.0)
     except (TypeError, ValueError) as exc:
@@ -92,7 +88,7 @@ def make_nemotron3_5_asr_request_builder(
     if not prompt_dictionary:
         raise ValueError("Nemotron processor prompt_dictionary must not be empty")
 
-    def request_builder(payload: StagePayload) -> Nemotron3_5ASRRequest:
+    def _request_builder(payload: StagePayload) -> Nemotron3_5ASRRequest:
         started_at_s = time.perf_counter()
         params = payload.request.params or {}
         max_new_tokens = validate_nemotron_greedy_params(params)
@@ -113,7 +109,7 @@ def make_nemotron3_5_asr_request_builder(
             stage_payload=payload,
         )
 
-    return request_builder
+    return _request_builder
 
 
 def build_nemotron3_5_asr_result(
@@ -124,12 +120,12 @@ def build_nemotron3_5_asr_result(
     duration_s: float,
     asr_latency_s: float,
     model_latency_s: float,
-    extra_data: Mapping[str, Any] | None = None,
+    extra_data: Mapping[str, object] | None = None,
 ) -> StagePayload:
     """Build the common final payload for offline and streaming ASR."""
 
-    raw_text = str(raw_text).strip()
-    data: dict[str, Any] = {
+    raw_text = raw_text.strip()
+    data: dict[str, object] = {
         "text": clean_nemotron_text(raw_text),
         "raw_text": raw_text,
         "language": resolve_nemotron_locale(raw_text, requested_language),

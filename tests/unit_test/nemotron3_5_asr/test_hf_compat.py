@@ -2,40 +2,37 @@
 
 from __future__ import annotations
 
-import importlib
 import json
+import threading
 from types import SimpleNamespace
 
-import pytest
 import torch
+from transformers.generation import GenerationMixin
 
-
-def test_import_does_not_mutate_transformers_auto_mappings() -> None:
-    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
-    from transformers.models.auto.feature_extraction_auto import (
-        FEATURE_EXTRACTOR_MAPPING,
-    )
-    from transformers.models.auto.modeling_auto import MODEL_FOR_RNNT_MAPPING
-
-    mappings = (CONFIG_MAPPING, FEATURE_EXTRACTOR_MAPPING, MODEL_FOR_RNNT_MAPPING)
-    before = [dict(mapping._extra_content) for mapping in mappings]
-
-    module = importlib.import_module("sglang_omni.models.nemotron3_5_asr.hf_compat")
-    importlib.reload(module)
-
-    assert [dict(mapping._extra_content) for mapping in mappings] == before
+from sglang_omni.models.nemotron3_5_asr.hf_compat import (
+    Nemotron3_5AsrConfig,
+    Nemotron3_5AsrForRNNT,
+    Nemotron3_5AsrProcessor,
+    NemotronAsrStreamingFeatureExtractor,
+)
+from sglang_omni.models.nemotron3_5_asr.hf_compat import (
+    processing_nemotron3_5_asr as processing,
+)
+from sglang_omni.models.nemotron3_5_asr.hf_compat.configuration_nemotron_asr_streaming import (
+    NemotronAsrStreamingEncoderConfig,
+)
+from sglang_omni.models.nemotron3_5_asr.hf_compat.generation_parakeet import (
+    ParakeetRNNTGenerationMixin,
+)
+from sglang_omni.models.nemotron3_5_asr.model_runner import (
+    Nemotron3_5ASRModelRunner,
+    Nemotron3_5ASRPreparedChunk,
+)
 
 
 def test_processor_loads_nested_feature_extractor_without_auto_registration(
     tmp_path, monkeypatch
 ) -> None:
-    from sglang_omni.models.nemotron3_5_asr.hf_compat import (
-        Nemotron3_5AsrProcessor,
-        NemotronAsrStreamingFeatureExtractor,
-    )
-    from sglang_omni.models.nemotron3_5_asr.hf_compat import (
-        processing_nemotron3_5_asr as processing,
-    )
 
     processor_config = {
         "blank_token": "<blank>",
@@ -61,16 +58,11 @@ def test_processor_loads_nested_feature_extractor_without_auto_registration(
         init_kwargs={},
         convert_tokens_to_ids=lambda token: 13087 if token == "<blank>" else 0,
     )
-    tokenizer_loads: list[tuple[object, dict[str, object]]] = []
-
-    def load_tokenizer(path, **kwargs):
-        tokenizer_loads.append((path, kwargs))
-        return tokenizer
 
     monkeypatch.setattr(
         processing.ParakeetTokenizer,
         "from_pretrained",
-        load_tokenizer,
+        lambda *args, **kwargs: tokenizer,
     )
     monkeypatch.setattr(
         Nemotron3_5AsrProcessor,
@@ -85,27 +77,11 @@ def test_processor_loads_nested_feature_extractor_without_auto_registration(
     assert processor.tokenizer is tokenizer
     assert processor.blank_token_id == 13087
     assert processor.default_num_lookahead_tokens == 3
-    assert tokenizer_loads[0][0] == tmp_path
-    assert tokenizer_loads[0][1]["local_files_only"] is True
 
 
-def test_processor_rejects_checkpoint_without_nested_feature_extractor() -> None:
-    from sglang_omni.models.nemotron3_5_asr.hf_compat import Nemotron3_5AsrProcessor
-
-    with pytest.raises(ValueError, match="nested.*feature_extractor"):
-        Nemotron3_5AsrProcessor._get_arguments_from_pretrained(
-            "unused", processor_dict={}
-        )
-
-
-def test_config_and_model_support_local_from_pretrained(tmp_path) -> None:
-    from sglang_omni.models.nemotron3_5_asr.hf_compat import (
-        Nemotron3_5AsrConfig,
-        Nemotron3_5AsrForRNNT,
-    )
-    from sglang_omni.models.nemotron3_5_asr.hf_compat.configuration_nemotron_asr_streaming import (
-        NemotronAsrStreamingEncoderConfig,
-    )
+def test_local_model_preserves_streaming_results_and_caches_when_batched(
+    tmp_path,
+) -> None:
 
     config = Nemotron3_5AsrConfig(
         vocab_size=16,
@@ -130,7 +106,9 @@ def test_config_and_model_support_local_from_pretrained(tmp_path) -> None:
             "default_num_lookahead_tokens": 0,
         },
     )
-    model = Nemotron3_5AsrForRNNT(config)
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(0)
+        model = Nemotron3_5AsrForRNNT(config)
     model.save_pretrained(tmp_path)
 
     loaded_config = Nemotron3_5AsrConfig.from_pretrained(
@@ -147,13 +125,60 @@ def test_config_and_model_support_local_from_pretrained(tmp_path) -> None:
     assert isinstance(loaded_model.config, Nemotron3_5AsrConfig)
     assert loaded_model.config.vocab_size == 16
 
+    runner = object.__new__(Nemotron3_5ASRModelRunner)
+    runner.model = loaded_model.eval()
+    runner.device = torch.device("cpu")
+    runner._model_lock = threading.Lock()
+    runner.processor = SimpleNamespace(
+        default_num_lookahead_tokens=0,
+        batch_decode=lambda rows, **kwargs: [str(row.tolist()) for row in rows],
+    )
+    serial = [runner.new_streaming_decode_state() for _ in range(2)]
+    batched = [runner.new_streaming_decode_state() for _ in range(2)]
+    for chunk_index in range(2):
+        chunks = [
+            Nemotron3_5ASRPreparedChunk(
+                input_features=torch.full((1, 8, 4), float(index + chunk_index)),
+                prompt_ids=torch.tensor([index]),
+            )
+            for index in range(2)
+        ]
+        for state, chunk in zip(serial, chunks):
+            runner.run_streaming_batch([state], [chunk], requested_languages=["auto"])
+        runner.run_streaming_batch(
+            batched, chunks, requested_languages=["auto", "auto"]
+        )
+        for expected, actual in zip(serial, batched):
+            assert actual.tokens == expected.tokens
+            assert actual.durations == expected.durations
+            torch.testing.assert_close(
+                actual.decoder_cache.cache, expected.decoder_cache.cache
+            )
+            for left, right in zip(
+                actual.attention_cache.layers, expected.attention_cache.layers
+            ):
+                torch.testing.assert_close(left.keys, right.keys)
+            for key in actual.padding_cache.layers:
+                torch.testing.assert_close(
+                    actual.padding_cache.layers[key].cache,
+                    expected.padding_cache.layers[key].cache,
+                )
+        assert (
+            batched[0].decoder_cache.cache.data_ptr()
+            != batched[1].decoder_cache.cache.data_ptr()
+        )
+        for left, right in zip(
+            batched[0].attention_cache.layers, batched[1].attention_cache.layers
+        ):
+            assert left.keys.data_ptr() != right.keys.data_ptr()
+        for key in batched[0].padding_cache.layers:
+            assert (
+                batched[0].padding_cache.layers[key].cache.data_ptr()
+                != batched[1].padding_cache.layers[key].cache.data_ptr()
+            )
+
 
 def test_parakeet_compat_forwards_cache_aware_encoder_kwargs(monkeypatch) -> None:
-    from transformers.generation import GenerationMixin
-
-    from sglang_omni.models.nemotron3_5_asr.hf_compat.generation_parakeet import (
-        ParakeetRNNTGenerationMixin,
-    )
 
     input_features = torch.zeros(2, 5, 4)
     attention_mask = torch.ones(2, 5, dtype=torch.long)

@@ -662,7 +662,13 @@ class Coordinator:
                 ),
             )
         except BaseException:
-            self._rollback_request_start(request_id)
+            self._requests.pop(request_id, None)
+            self._partial_results.pop(request_id, None)
+            self._stream_queues.pop(request_id, None)
+            self._external_input_streams.pop(request_id, None)
+            pending = self._completion_futures.pop(request_id, None)
+            if pending is not None and not pending.done():
+                pending.cancel()
             raise
 
         # Update state
@@ -677,16 +683,6 @@ class Coordinator:
             entry_info.control_endpoint,
             replica_bindings,
         )
-
-    def _rollback_request_start(self, request_id: str) -> None:
-        """Release every owner installed before the entry-stage submit."""
-        self._requests.pop(request_id, None)
-        self._partial_results.pop(request_id, None)
-        self._stream_queues.pop(request_id, None)
-        self._external_input_streams.pop(request_id, None)
-        pending = self._completion_futures.pop(request_id, None)
-        if pending is not None and not pending.done():
-            pending.cancel()
 
     def _request_id_is_reserved(self, request_id: str) -> bool:
         """Return whether any coordinator owner still holds this request ID."""

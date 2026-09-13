@@ -498,16 +498,10 @@ class Stage:
                 f"Stage {self.name} external input streams currently require "
                 f"tp_size=1; got tp_size={self._comm.tp_size}"
             )
-        if not getattr(self.scheduler, "supports_external_input_stream", False):
+        if not self.scheduler.supports_external_input_stream:
             return f"Stage {self.name} does not support external input streams"
-        scheduler_inbox = getattr(self.scheduler, "inbox", None)
-        if getattr(scheduler_inbox, "maxsize", 0) <= 0:
+        if self.scheduler.inbox.maxsize <= 0:
             return f"Stage {self.name} external input stream inbox must be bounded"
-        if not callable(getattr(scheduler_inbox, "put_nowait", None)):
-            return (
-                f"Stage {self.name} external input stream inbox must support "
-                "non-blocking enqueue"
-            )
         return None
 
     async def _on_data_ready(

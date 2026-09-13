@@ -69,7 +69,7 @@ class _ExternalInputStream:
             raise RuntimeError(f"Input stream {self.request_id!r} is already done")
         if self._closed:
             raise RuntimeError(f"Input stream {self.request_id!r} is closed")
-        return await self._client._send_input_chunk(
+        return await self._client._coordinator.send_input_chunk(
             self.request_id, data, metadata=metadata
         )
 
@@ -78,17 +78,17 @@ class _ExternalInputStream:
             raise RuntimeError(f"Input stream {self.request_id!r} is already done")
         if self._closed:
             raise RuntimeError(f"Input stream {self.request_id!r} is closed")
-        await self._client._finish_input_stream(self.request_id)
+        await self._client._coordinator.finish_input_stream(self.request_id)
         self._input_done = True
 
     async def abort(self) -> AbortResult:
-        result = await self._client._close_input_stream(self.request_id)
+        success = await self._client._coordinator.close_input_stream(self.request_id)
         await self._close_events()
-        return result
+        return AbortResult(success=success, level_applied=AbortLevel.SOFT)
 
     async def aclose(self) -> None:
         if not self._closed:
-            await self._client._close_input_stream(self.request_id)
+            await self._client._coordinator.close_input_stream(self.request_id)
         await self._close_events()
 
     async def _close_events(self) -> None:
@@ -154,29 +154,6 @@ class Client:
             req_id, self._build_omni_request(request)
         )
         return _ExternalInputStream(self, req_id, events)
-
-    async def _send_input_chunk(
-        self,
-        request_id: str,
-        data: Any,
-        *,
-        metadata: dict[str, Any] | None = None,
-    ) -> int:
-        return await self._coordinator.send_input_chunk(
-            request_id, data, metadata=metadata
-        )
-
-    async def _finish_input_stream(self, request_id: str) -> None:
-        await self._coordinator.finish_input_stream(request_id)
-
-    async def _close_input_stream(
-        self,
-        request_id: str,
-        *,
-        level: AbortLevel = AbortLevel.SOFT,
-    ) -> AbortResult:
-        success = await self._coordinator.close_input_stream(request_id)
-        return AbortResult(success=success, level_applied=level)
 
     # ------------------------------------------------------------------
     # High-level: non-streaming completion

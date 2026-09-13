@@ -65,7 +65,11 @@ class _StageControlPlane:
 
 
 def _stage_with_control_plane(
-    scheduler, *, role: str = "single", tp_size: int = 1
+    scheduler,
+    *,
+    role: str = "single",
+    tp_size: int = 1,
+    external_input_enqueue_timeout_s: float = 1.0,
 ) -> tuple[Stage, _StageControlPlane]:
     control_plane = _StageControlPlane()
     stage_obj = Stage(
@@ -79,6 +83,7 @@ def _stage_with_control_plane(
         scheduler=scheduler,
         tp_size=tp_size,
         is_terminal=True,
+        external_input_enqueue_timeout_s=external_input_enqueue_timeout_s,
     )
     return stage_obj, control_plane
 
@@ -496,6 +501,7 @@ def test_stage_rejects_unsupported_or_unbounded_scheduler() -> None:
             inbox=queue.Queue(maxsize=4),
             outbox=queue.Queue(),
             abort=lambda request_id: None,
+            supports_external_input_stream=False,
         )
         stage_obj, control_plane = _stage_with_control_plane(unsupported)
         await stage_obj._on_submit(
@@ -595,12 +601,12 @@ def test_stage_waits_for_chunk_and_done_queue_capacity() -> None:
     asyncio.run(run())
 
 
-def test_stage_queue_timeout_fails_and_cleans_stream(monkeypatch) -> None:
-    monkeypatch.setattr(stage_runtime, "_EXTERNAL_INPUT_ENQUEUE_TIMEOUT_S", 0.02)
-
+def test_stage_queue_timeout_fails_and_cleans_stream() -> None:
     async def run() -> None:
         scheduler = _external_scheduler(maxsize=1)
-        stage_obj, control_plane = _stage_with_control_plane(scheduler)
+        stage_obj, control_plane = _stage_with_control_plane(
+            scheduler, external_input_enqueue_timeout_s=0.02
+        )
         await stage_obj._on_submit(
             SubmitMessage("req", _payload(), external_input_stream=True)
         )

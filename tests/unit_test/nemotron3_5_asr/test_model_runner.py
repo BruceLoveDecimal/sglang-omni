@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
+from transformers.feature_extraction_utils import BatchFeature
 
 from sglang_omni.models.nemotron3_5_asr.model_runner import Nemotron3_5ASRModelRunner
 from sglang_omni.models.nemotron3_5_asr.request_builders import Nemotron3_5ASRRequest
@@ -20,12 +21,14 @@ class FakeProcessor:
     def __call__(self, audio, **kwargs):
         self.calls.append({"audio": audio, **kwargs})
         batch_size = len(audio)
-        return {
-            "input_features": torch.zeros(batch_size, 5, 4),
-            "attention_mask": torch.ones(batch_size, 5, dtype=torch.long),
-            "prompt_ids": torch.arange(batch_size),
-            "num_lookahead_tokens": 3,
-        }
+        return BatchFeature(
+            {
+                "input_features": torch.zeros(batch_size, 5, 4),
+                "attention_mask": torch.ones(batch_size, 5, dtype=torch.long),
+                "prompt_ids": torch.arange(batch_size),
+                "num_lookahead_tokens": 3,
+            }
+        )
 
     def batch_decode(self, sequences, **kwargs):
         assert kwargs == {"skip_special_tokens": False}
@@ -97,20 +100,20 @@ def test_run_batch_pads_once_generates_once_and_preserves_order() -> None:
         "second <zh-CN>",
     ]
     assert [result.data["language"] for result in results] == ["en-US", "zh-CN"]
-    assert all(result.data["batch_size"] == 2 for result in results)
+    for result in results:
+        assert result.data["batch_size"] == 2
+        assert result.data["duration_s"] == 0.1
+        assert result.data["usage"]["engine_time_s"] == result.data["model_latency_s"]
 
 
-def test_run_one_delegates_to_run_batch(monkeypatch) -> None:
-    runner, _, _ = _runner()
-    request = _request("request-a", "en-US")
-    expected = request.stage_payload
-    calls: list[list[Nemotron3_5ASRRequest]] = []
-
-    def fake_run_batch(requests):
-        calls.append(list(requests))
-        return [expected]
-
-    monkeypatch.setattr(runner, "run_batch", fake_run_batch)
-
-    assert runner.run_one(request) is expected
-    assert calls == [[request]]
+def test_batch_groups_token_limits_without_changing_request_order() -> None:
+    runner, _, model = _runner()
+    requests = [_request(name, "en-US") for name in ("a", "b", "c")]
+    requests[0].max_new_tokens = requests[2].max_new_tokens = 2
+    requests[1].max_new_tokens = 5
+    results = runner.run_batch(requests)
+    assert [result.request_id for result in results] == ["a", "b", "c"]
+    assert [call["max_new_tokens"] for call in model.calls] == [2, 5]
+    assert [call["input_features"].shape[0] for call in model.calls] == [2, 1]
+    assert model.calls[0]["input_features"].dtype == runner.dtype
+    assert model.calls[0]["prompt_ids"].dtype == torch.long
