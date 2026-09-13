@@ -288,7 +288,7 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
         )
 
     def is_streaming_payload(self, payload: StagePayload) -> bool:
-        return bool(getattr(payload, "external_input_stream", False))
+        return payload.external_input_stream
 
     def on_streaming_new_request(self, request_id: str, payload: StagePayload) -> None:
         if request_id in self._stream_states:
