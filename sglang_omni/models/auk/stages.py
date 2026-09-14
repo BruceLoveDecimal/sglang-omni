@@ -279,6 +279,7 @@ def create_auk_engine_executor(
     weight_dtype: str = "float32",
     enable_dit_torch_compile: bool = False,
     enable_dit_cuda_graph: bool = False,
+    enable_packed_dit: bool = False,
 ) -> SimpleScheduler:
     """Build the DiT sampling stage.
 
@@ -293,6 +294,10 @@ def create_auk_engine_executor(
     compute_dtype = _resolve_dtype(field="dtype", name=dtype)
     backbone_dtype = _resolve_dtype(field="weight_dtype", name=weight_dtype)
     device = resolve_concrete_device(device, gpu_id)
+    if enable_packed_dit and (
+        device.type != "cuda" or backbone_dtype != torch.bfloat16
+    ):
+        raise ValueError("Packed AuK DiT requires CUDA and weight_dtype=bfloat16")
     checkpoint = resolve_checkpoint(model_path)
     config = make_runtime_config(checkpoint)
     # A non-fp32 backbone runs natively, and _autocast reads fp32 as "off":
@@ -316,6 +321,8 @@ def create_auk_engine_executor(
         step_graph = build_step_graph_runner(device)
         if step_graph is not None:
             sampling["step_graph"] = step_graph
+    if enable_packed_dit:
+        sampling["enable_packed_dit"] = True
     return _scheduler(
         lambda payloads: _sample_batch(
             payloads,

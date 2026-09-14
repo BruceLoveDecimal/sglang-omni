@@ -57,6 +57,7 @@ class AuKPipelineConfig(PipelineConfig):
                 weight_dtype="bfloat16",
                 enable_dit_torch_compile=True,
                 enable_dit_cuda_graph=True,
+                enable_packed_dit=False,
             ),
             gpu=0,
             next=DECODE_STAGE,

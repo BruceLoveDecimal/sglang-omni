@@ -113,6 +113,7 @@ class AuKFlowMatching(nn.Module):
         sway_sampling_coef: float | None = None,
         t_grid: Sequence[float] | None = None,
         step_graph: AuKStepCudaGraphRunner | None = None,
+        enable_packed_dit: bool = False,
     ) -> list[torch.Tensor]:
         """Integrate the velocity field for a batch of requests.
 
@@ -210,6 +211,21 @@ class AuKFlowMatching(nn.Module):
                 dim=1,
             )
 
+        packed_layout = None
+        if enable_packed_dit and len(items) > 1:
+            from sglang_omni.models.auk.packed import PackedLayout
+
+            if not self.transformer.attn_mask_enabled:
+                raise ValueError("Packed AuK DiT requires attn_mask_enabled")
+            audio_mask = torch.cat((ref_mask, mask), dim=1)
+            packed_text_mask = text_mask
+            if cfg_strength >= 1e-5:
+                audio_mask = audio_mask.repeat(2, 1)
+                packed_text_mask = text_mask.repeat(2, 1)
+            packed_layout = PackedLayout.build(
+                audio_mask, packed_text_mask, ref.shape[1], y0.shape[1]
+            )
+
         inputs = dict(
             text=text,
             mask=mask,
@@ -223,8 +239,29 @@ class AuKFlowMatching(nn.Module):
             joint_positions=joint_positions,
         )
 
+        # Flatten layout fields so graph keys include every packed shape and
+        # replays refresh index/cu_seqlens buffers for a new request layout.
+        if packed_layout is not None:
+            from dataclasses import fields
+
+            inputs.update(
+                {
+                    "packed_" + f.name: getattr(packed_layout, f.name)
+                    for f in fields(packed_layout)
+                }
+            )
+
         def step(inputs, t, x):
-            kwargs = dict(inputs, x=x.to(weight_dtype), time=t)
+            kwargs = {k: v for k, v in inputs.items() if not k.startswith("packed_")}
+            if packed_layout is not None:
+                kwargs["packed_layout"] = PackedLayout(
+                    **{
+                        k.removeprefix("packed_"): v
+                        for k, v in inputs.items()
+                        if k.startswith("packed_")
+                    }
+                )
+            kwargs.update(x=x.to(weight_dtype), time=t)
             if cfg_strength < 1e-5:
                 return self.transformer(
                     **kwargs, drop_audio_cond=False, drop_text=False
