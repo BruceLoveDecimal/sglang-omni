@@ -221,8 +221,8 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
     """Offline batch scheduler plus request-owned native RNNT streaming state."""
 
     supports_external_input_stream = True
-    _can_batch_stream_chunks = True
-    _stream_chunk_batch_distinct_requests = True
+    can_batch_stream_chunks = True
+    stream_chunk_batch_distinct_requests = True
 
     def __init__(
         self,
@@ -255,7 +255,7 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
             "completed_streams": 0,
             "aborted_streams": 0,
         }
-        self._stream_chunk_batch_max = max_batch_size
+        self.stream_chunk_batch_max = max_batch_size
         super().__init__(
             compute_fn,
             batch_compute_fn=batch_compute_fn,
@@ -293,10 +293,10 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
 
     def on_stream_chunk_batch(self, items: list[tuple[str, StreamItem]]) -> None:
         failed: list[str] = []
-        with self._state_lock:
+        with self.state_lock:
             touched: set[str] = set()
             for request_id, item in items:
-                if self._is_aborted(request_id):
+                if self.is_aborted(request_id):
                     continue
                 try:
                     state = self._stream_states[request_id]
@@ -320,21 +320,21 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
                     )
                     touched.add(request_id)
                 except Exception as exc:
-                    self._emit_error(request_id, exc)
-                    self._abort_state(request_id)
+                    self.emit_error(request_id, exc)
+                    self.abort_state(request_id)
                     self._aggregate["aborted_streams"] += 1
                     failed.append(request_id)
             ready = [
                 (request_id, state, state.pop_ready_window())
                 for request_id, state in self._stream_states.items()
                 if request_id in touched
-                and not self._is_aborted(request_id)
+                and not self.is_aborted(request_id)
                 and not state.decode_limit_reached
                 and state.has_ready_window()
             ]
             failed.extend(self._run_ready_windows(ready))
         for request_id in dict.fromkeys(failed):
-            self._cleanup_aborted_request(request_id)
+            self.cleanup_aborted_request(request_id)
 
     def _run_ready_windows(
         self,
@@ -351,8 +351,8 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
 
         failed: list[str] = []
         for group in groups.values():
-            for offset in range(0, len(group), self._max_batch_size):
-                batch = group[offset : offset + self._max_batch_size]
+            for offset in range(0, len(group), self.max_batch_size):
+                batch = group[offset : offset + self.max_batch_size]
                 try:
                     prepared = [
                         self.runner.prepare_streaming_chunk(
@@ -371,12 +371,12 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
                     self._record_batch(batch, result)
                     for index, (request_id, state, _) in enumerate(batch):
                         message = self._partial_message(state, result, index)
-                        if message is not None and not self._is_aborted(request_id):
+                        if message is not None and not self.is_aborted(request_id):
                             self.outbox.put(message)
                 except Exception as exc:
                     for request_id, _, _ in batch:
-                        self._emit_error(request_id, exc)
-                        self._abort_state(request_id)
+                        self.emit_error(request_id, exc)
+                        self.abort_state(request_id)
                         self._aggregate["aborted_streams"] += 1
                         failed.append(request_id)
         return failed
@@ -539,7 +539,7 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
         self._stream_states.pop(request_id, None)
 
     def stats(self) -> dict[str, int | float]:
-        with self._state_lock:
+        with self.state_lock:
             return {
                 **self._aggregate,
                 "active_streams": len(self._stream_states),
@@ -550,15 +550,15 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
         try:
             super().start()
         finally:
-            with self._state_lock:
+            with self.state_lock:
                 self._stream_states.clear()
             self._close_runner()
 
     def stop(self) -> None:
-        was_running = self._running
+        was_running = self.running
         super().stop()
         if not was_running:
-            with self._state_lock:
+            with self.state_lock:
                 self._stream_states.clear()
             self._close_runner()
 

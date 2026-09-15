@@ -167,8 +167,8 @@ def test_lookahead_zero_preserves_negative_stft_start() -> None:
 def test_scheduler_batches_one_window_per_request_and_cleans_state() -> None:
     runner = _FakeRunner()
     scheduler = _scheduler(runner)
-    scheduler._on_streaming_new_request("a", _payload("a"))
-    scheduler._on_streaming_new_request("b", _payload("b"))
+    scheduler.handle_streaming_new_request("a", _payload("a"))
+    scheduler.handle_streaming_new_request("b", _payload("b"))
 
     first = np.arange(4040, dtype=np.int16)
     scheduler.on_stream_chunk_batch([_item("a", first), _item("b", first)])
@@ -186,8 +186,8 @@ def test_scheduler_batches_one_window_per_request_and_cleans_state() -> None:
     assert scheduler.outbox.empty()
     assert [message.request_id for message in messages] == ["a", "b", "a", "b"]
 
-    scheduler._on_done("a")
-    scheduler._on_done("b")
+    scheduler.handle_stream_done("a")
+    scheduler.handle_stream_done("b")
     results = [scheduler.outbox.get_nowait(), scheduler.outbox.get_nowait()]
     assert all(message.type == "result" for message in results)
     final_payloads = [message.data for message in results]
@@ -208,7 +208,7 @@ def test_scheduler_batches_one_window_per_request_and_cleans_state() -> None:
 def test_scheduler_processes_at_most_one_window_per_request_per_input_batch() -> None:
     runner = _FakeRunner()
     scheduler = _scheduler(runner)
-    scheduler._on_streaming_new_request("r", _payload("r"))
+    scheduler.handle_streaming_new_request("r", _payload("r"))
 
     scheduler.on_stream_chunk_batch([_item("r", np.arange(20000, dtype=np.int16))])
 
@@ -240,7 +240,7 @@ def test_stream_done_rejects_incomplete_pcm16_sample() -> None:
 def test_scheduler_rejects_non_pcm16_or_wrong_rate(dtype, sample_rate, error) -> None:
     runner = _FakeRunner()
     scheduler = _scheduler(runner)
-    scheduler._on_streaming_new_request("r", _payload("r"))
+    scheduler.handle_streaming_new_request("r", _payload("r"))
     bad = StreamItem(
         chunk_id=0,
         data=torch.zeros(2, dtype=dtype),
