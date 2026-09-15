@@ -45,10 +45,10 @@ def create_nemotron3_5_asr_executor(
         prompt_dictionary=runner.prompt_dictionary
     )
 
-    def run_one(payload: StagePayload) -> StagePayload:
+    def _run_one(payload: StagePayload) -> StagePayload:
         return runner.run_batch([build_request(payload)])[0]
 
-    def run_batch(
+    def _run_batch(
         payloads: Sequence[StagePayload],
     ) -> list[StagePayload | BaseException]:
         results: dict[int, StagePayload | BaseException] = {}
@@ -70,8 +70,8 @@ def create_nemotron3_5_asr_executor(
 
     return Nemotron3_5ASRStreamingScheduler(
         runner,
-        run_one,
-        batch_compute_fn=run_batch,
+        _run_one,
+        batch_compute_fn=_run_batch,
         prompt_dictionary=runner.prompt_dictionary,
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,

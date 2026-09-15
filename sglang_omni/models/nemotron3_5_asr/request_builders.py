@@ -88,7 +88,7 @@ def make_nemotron3_5_asr_request_builder(
     if not prompt_dictionary:
         raise ValueError("Nemotron processor prompt_dictionary must not be empty")
 
-    def request_builder(payload: StagePayload) -> Nemotron3_5ASRRequest:
+    def _request_builder(payload: StagePayload) -> Nemotron3_5ASRRequest:
         started_at_s = time.perf_counter()
         params = payload.request.params or {}
         max_new_tokens = validate_nemotron_greedy_params(params)
@@ -109,7 +109,7 @@ def make_nemotron3_5_asr_request_builder(
             stage_payload=payload,
         )
 
-    return request_builder
+    return _request_builder
 
 
 def build_nemotron3_5_asr_result(

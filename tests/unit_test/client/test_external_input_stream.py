@@ -26,7 +26,7 @@ class FakeCoordinator:
     ) -> AsyncGenerator[CompleteMessage | StreamMessage, None]:
         self.started.append((request_id, request))
 
-        async def events() -> AsyncGenerator[CompleteMessage | StreamMessage, None]:
+        async def _events() -> AsyncGenerator[CompleteMessage | StreamMessage, None]:
             try:
                 yield StreamMessage(
                     request_id=request_id,
@@ -43,7 +43,7 @@ class FakeCoordinator:
             finally:
                 self.finalized_events.append(request_id)
 
-        return events()
+        return _events()
 
     async def send_input_chunk(
         self,
@@ -64,7 +64,7 @@ class FakeCoordinator:
 
 
 def test_client_external_input_stream_handle_lifecycle() -> None:
-    async def run() -> None:
+    async def _run() -> None:
         coordinator = FakeCoordinator()
         client = Client(coordinator)
         stream = await client.start_input_stream(
@@ -89,14 +89,14 @@ def test_client_external_input_stream_handle_lifecycle() -> None:
         assert coordinator.finished == ["req"]
         assert coordinator.closed == []
 
-    asyncio.run(run())
+    asyncio.run(_run())
 
 
 @pytest.mark.parametrize("close_method", ["aclose", "abort"])
 def test_client_closing_stream_releases_request_and_events_once(
     close_method: Literal["aclose", "abort"],
 ) -> None:
-    async def run() -> None:
+    async def _run() -> None:
         coordinator = FakeCoordinator()
         stream = await Client(coordinator).start_input_stream(
             GenerateRequest(prompt="", stream=True), request_id="req"
@@ -112,11 +112,11 @@ def test_client_closing_stream_releases_request_and_events_once(
         with pytest.raises(RuntimeError, match="closed"):
             await stream.send(torch.tensor([1], dtype=torch.int16))
 
-    asyncio.run(run())
+    asyncio.run(_run())
 
 
 def test_client_context_manager_aborts_on_exception() -> None:
-    async def run() -> None:
+    async def _run() -> None:
         coordinator = FakeCoordinator()
         stream = await Client(coordinator).start_input_stream(
             GenerateRequest(prompt="", stream=True), request_id="req"
@@ -126,4 +126,4 @@ def test_client_context_manager_aborts_on_exception() -> None:
                 raise RuntimeError("boom")
         assert coordinator.closed == ["req"]
 
-    asyncio.run(run())
+    asyncio.run(_run())
