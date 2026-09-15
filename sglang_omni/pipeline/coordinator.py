@@ -7,7 +7,7 @@ import uuid
 from collections.abc import Callable, Sequence
 from contextlib import aclosing
 from dataclasses import dataclass, field, replace
-from typing import Any, AsyncIterator
+from typing import Any, AsyncGenerator, AsyncIterator
 
 import torch
 
@@ -414,7 +414,7 @@ class Coordinator:
         self,
         request_id: str,
         request: OmniRequest | Any,
-    ) -> AsyncIterator[CompleteMessage | StreamMessage]:
+    ) -> AsyncGenerator[CompleteMessage | StreamMessage, None]:
         """Submit a request and return its output-event iterator."""
         stream_queue: asyncio.Queue[CompleteMessage | StreamMessage] = asyncio.Queue()
         await self._submit_request(
@@ -542,7 +542,7 @@ class Coordinator:
         request_id: str,
         queue: asyncio.Queue[CompleteMessage | StreamMessage],
         expected_terminal_stages: set[str],
-    ) -> AsyncIterator[CompleteMessage | StreamMessage]:
+    ) -> AsyncGenerator[CompleteMessage | StreamMessage, None]:
         completed_stages: set[str] = set()
         try:
             while True:

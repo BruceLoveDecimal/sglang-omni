@@ -7,7 +7,8 @@ import asyncio
 import uuid
 from contextlib import aclosing
 from dataclasses import replace
-from typing import Any, AsyncIterator, Callable
+from types import TracebackType
+from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, Callable
 
 import numpy as np
 
@@ -31,7 +32,10 @@ from sglang_omni.client.types import (
     UsageInfo,
 )
 from sglang_omni.pipeline.coordinator import Coordinator
-from sglang_omni.proto import OmniRequest, RequestState, StreamMessage
+from sglang_omni.proto import CompleteMessage, OmniRequest, RequestState, StreamMessage
+
+if TYPE_CHECKING:
+    import torch
 
 
 class _ExternalInputStream:
@@ -41,67 +45,71 @@ class _ExternalInputStream:
         self,
         client: Client,
         request_id: str,
-        events: AsyncIterator[Any],
+        events: AsyncGenerator[CompleteMessage | StreamMessage, None],
     ) -> None:
-        self._client = client
+        self.client = client
         self.request_id = request_id
-        self._events = events
-        self._input_done = False
-        self._closed = False
+        self.events = events
+        self.is_input_done = False
+        self.is_closed = False
 
     def __aiter__(self) -> _ExternalInputStream:
         return self
 
     async def __anext__(self) -> GenerateChunk:
-        if self._closed:
+        if self.is_closed:
             raise StopAsyncIteration
         try:
-            msg = await anext(self._events)
+            msg = await anext(self.events)
         except StopAsyncIteration:
-            self._closed = True
+            self.is_closed = True
             raise
         if isinstance(msg, StreamMessage):
-            return self._client._stream_builder(self.request_id, msg)
-        return self._client._result_builder(self.request_id, msg.result)
+            return self.client._stream_builder(self.request_id, msg)
+        return self.client._result_builder(self.request_id, msg.result)
 
-    async def send(self, data: Any, *, metadata: dict[str, Any] | None = None) -> int:
-        if self._input_done:
+    async def send(
+        self, data: torch.Tensor, *, metadata: dict[str, object] | None = None
+    ) -> int:
+        if self.is_input_done:
             raise RuntimeError(f"Input stream {self.request_id!r} is already done")
-        if self._closed:
+        if self.is_closed:
             raise RuntimeError(f"Input stream {self.request_id!r} is closed")
-        return await self._client._coordinator.send_input_chunk(
+        return await self.client._coordinator.send_input_chunk(
             self.request_id, data, metadata=metadata
         )
 
     async def finish(self) -> None:
-        if self._input_done:
+        if self.is_input_done:
             raise RuntimeError(f"Input stream {self.request_id!r} is already done")
-        if self._closed:
+        if self.is_closed:
             raise RuntimeError(f"Input stream {self.request_id!r} is closed")
-        await self._client._coordinator.finish_input_stream(self.request_id)
-        self._input_done = True
+        await self.client._coordinator.finish_input_stream(self.request_id)
+        self.is_input_done = True
 
     async def abort(self) -> AbortResult:
-        success = await self._client._coordinator.close_input_stream(self.request_id)
-        await self._close_events()
+        success = await self.client._coordinator.close_input_stream(self.request_id)
+        await self.close_events()
         return AbortResult(success=success, level_applied=AbortLevel.SOFT)
 
     async def aclose(self) -> None:
-        if not self._closed:
-            await self._client._coordinator.close_input_stream(self.request_id)
-        await self._close_events()
+        if not self.is_closed:
+            await self.client._coordinator.close_input_stream(self.request_id)
+        await self.close_events()
 
-    async def _close_events(self) -> None:
-        self._closed = True
-        close = getattr(self._events, "aclose", None)
-        if close is not None:
-            await close()
+    async def close_events(self) -> None:
+        self.is_closed = True
+        await self.events.aclose()
 
     async def __aenter__(self) -> _ExternalInputStream:
         return self
 
-    async def __aexit__(self, *exc_info: Any) -> None:
-        del exc_info
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         await self.aclose()
 
 

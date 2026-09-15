@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import AsyncGenerator, Literal
 
 import pytest
 import torch
@@ -9,43 +10,55 @@ import torch
 import sglang_omni.client as client_package
 from sglang_omni.client import Client
 from sglang_omni.client.types import GenerateRequest
-from sglang_omni.proto import CompleteMessage, StreamMessage
+from sglang_omni.proto import CompleteMessage, OmniRequest, StreamMessage
 
 
-class _FakeCoordinator:
+class FakeCoordinator:
     def __init__(self) -> None:
-        self.started = []
-        self.chunks = []
-        self.finished = []
-        self.closed = []
+        self.started: list[tuple[str, OmniRequest]] = []
+        self.chunks: list[tuple[str, torch.Tensor, dict[str, object] | None]] = []
+        self.finished: list[str] = []
+        self.closed: list[str] = []
+        self.finalized_events: list[str] = []
 
-    async def start_input_stream(self, request_id, request):
+    async def start_input_stream(
+        self, request_id: str, request: OmniRequest
+    ) -> AsyncGenerator[CompleteMessage | StreamMessage, None]:
         self.started.append((request_id, request))
 
-        async def events():
-            yield StreamMessage(
-                request_id=request_id,
-                from_stage="asr",
-                chunk={"text": "hel", "modality": "text"},
-                modality="text",
-            )
-            yield CompleteMessage(
-                request_id=request_id,
-                from_stage="asr",
-                success=True,
-                result={"text": "hello", "finish_reason": "stop"},
-            )
+        async def _events() -> AsyncGenerator[CompleteMessage | StreamMessage, None]:
+            try:
+                yield StreamMessage(
+                    request_id=request_id,
+                    from_stage="asr",
+                    chunk={"text": "hel", "modality": "text"},
+                    modality="text",
+                )
+                yield CompleteMessage(
+                    request_id=request_id,
+                    from_stage="asr",
+                    success=True,
+                    result={"text": "hello", "finish_reason": "stop"},
+                )
+            finally:
+                self.finalized_events.append(request_id)
 
-        return events()
+        return _events()
 
-    async def send_input_chunk(self, request_id, data, *, metadata=None):
+    async def send_input_chunk(
+        self,
+        request_id: str,
+        data: torch.Tensor,
+        *,
+        metadata: dict[str, object] | None = None,
+    ) -> int:
         self.chunks.append((request_id, data, metadata))
         return len(self.chunks) - 1
 
-    async def finish_input_stream(self, request_id):
+    async def finish_input_stream(self, request_id: str) -> None:
         self.finished.append(request_id)
 
-    async def close_input_stream(self, request_id):
+    async def close_input_stream(self, request_id: str) -> bool:
         self.closed.append(request_id)
         return True
 
@@ -57,8 +70,8 @@ def test_external_input_stream_is_internal() -> None:
 
 
 def test_client_external_input_stream_handle_lifecycle() -> None:
-    async def run() -> None:
-        coordinator = _FakeCoordinator()
+    async def _run() -> None:
+        coordinator = FakeCoordinator()
         client = Client(coordinator)
         stream = await client._start_input_stream(
             GenerateRequest(prompt="", stream=True), request_id="req"
@@ -81,27 +94,35 @@ def test_client_external_input_stream_handle_lifecycle() -> None:
         assert coordinator.finished == ["req"]
         assert coordinator.closed == []
 
-    asyncio.run(run())
+    asyncio.run(_run())
 
 
-def test_client_iterator_aclose_aborts_unfinished_request_once() -> None:
-    async def run() -> None:
-        coordinator = _FakeCoordinator()
+@pytest.mark.parametrize("close_method", ["aclose", "abort"])
+def test_client_closing_stream_releases_request_and_events_once(
+    close_method: Literal["aclose", "abort"],
+) -> None:
+    async def _run() -> None:
+        coordinator = FakeCoordinator()
         stream = await Client(coordinator)._start_input_stream(
             GenerateRequest(prompt="", stream=True), request_id="req"
         )
-        await stream.aclose()
+        await anext(stream)
+        if close_method == "abort":
+            await stream.abort()
+        else:
+            await stream.aclose()
         await stream.aclose()
         assert coordinator.closed == ["req"]
+        assert coordinator.finalized_events == ["req"]
         with pytest.raises(RuntimeError, match="closed"):
             await stream.send(torch.tensor([1], dtype=torch.int16))
 
-    asyncio.run(run())
+    asyncio.run(_run())
 
 
 def test_client_context_manager_aborts_on_exception() -> None:
-    async def run() -> None:
-        coordinator = _FakeCoordinator()
+    async def _run() -> None:
+        coordinator = FakeCoordinator()
         stream = await Client(coordinator)._start_input_stream(
             GenerateRequest(prompt="", stream=True), request_id="req"
         )
@@ -110,4 +131,4 @@ def test_client_context_manager_aborts_on_exception() -> None:
                 raise RuntimeError("boom")
         assert coordinator.closed == ["req"]
 
-    asyncio.run(run())
+    asyncio.run(_run())
