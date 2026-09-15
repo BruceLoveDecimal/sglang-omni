@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import asdict
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -11,6 +11,8 @@ import torch
 
 from sglang_omni.models.nemotron3_5_asr.model_runner import (
     Nemotron3_5ASRDecodeState,
+    Nemotron3_5ASRModelRunner,
+    Nemotron3_5ASRPreparedChunk,
     Nemotron3_5ASRStreamingBatchResult,
 )
 from sglang_omni.models.nemotron3_5_asr.streaming import (
@@ -19,7 +21,7 @@ from sglang_omni.models.nemotron3_5_asr.streaming import (
     Nemotron3_5ASRStreamState,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
-from sglang_omni.proto import OmniRequest, StagePayload
+from sglang_omni.proto.request import OmniRequest, StagePayload
 
 LOOKAHEAD_3 = Nemotron3_5ASRStreamingChunkSpec(
     sample_rate=16000,
@@ -33,7 +35,7 @@ LOOKAHEAD_3 = Nemotron3_5ASRStreamingChunkSpec(
 )
 
 
-def _payload(request_id: str, *, language: str = "en-US") -> StagePayload:
+def make_payload(request_id: str, *, language: str = "en-US") -> StagePayload:
     payload = StagePayload(
         request_id=request_id,
         request=OmniRequest(inputs=None, params={"language": language}),
@@ -43,7 +45,7 @@ def _payload(request_id: str, *, language: str = "en-US") -> StagePayload:
     return payload
 
 
-def _item(request_id: str, samples: np.ndarray) -> tuple[str, StreamItem]:
+def make_pcm_item(request_id: str, samples: np.ndarray) -> tuple[str, StreamItem]:
     return request_id, StreamItem(
         chunk_id=0,
         data=torch.from_numpy(samples.astype(np.int16, copy=False)),
@@ -52,29 +54,38 @@ def _item(request_id: str, samples: np.ndarray) -> tuple[str, StreamItem]:
     )
 
 
-class _FakeRunner:
-    prompt_dictionary = {"auto": 101, "en-US": 0, "zh-CN": 4}
-    streaming_chunk_spec = asdict(LOOKAHEAD_3)
-
+class FakeRunner(Nemotron3_5ASRModelRunner):
     def __init__(self) -> None:
         self.batches: list[list[Nemotron3_5ASRDecodeState]] = []
-        self.closed = False
+        self.is_closed = False
+
+    @property
+    def prompt_dictionary(self) -> dict[str, int]:
+        return {"auto": 101, "en-US": 0, "zh-CN": 4}
+
+    @property
+    def streaming_chunk_spec(self) -> dict[str, int]:
+        return asdict(LOOKAHEAD_3)
 
     def new_streaming_decode_state(self) -> Nemotron3_5ASRDecodeState:
         return Nemotron3_5ASRDecodeState(tokens=[99], durations=[0])
 
-    def prepare_streaming_chunk(self, waveform, *, language, is_first):
-        return SimpleNamespace(waveform=waveform, language=language, is_first=is_first)
+    def prepare_streaming_chunk(
+        self, waveform: np.ndarray, *, language: str, is_first: bool
+    ) -> Nemotron3_5ASRPreparedChunk:
+        return Nemotron3_5ASRPreparedChunk(
+            input_features=torch.from_numpy(waveform),
+            prompt_ids=torch.tensor([self.prompt_dictionary[language]]),
+        )
 
     def run_streaming_batch(
         self,
-        states,
-        chunks,
+        states: Sequence[Nemotron3_5ASRDecodeState],
+        chunks: Sequence[Nemotron3_5ASRPreparedChunk],
         *,
-        requested_languages,
-        max_new_tokens=None,
+        requested_languages: Sequence[str],
+        max_new_tokens: Sequence[int | None] | None = None,
     ) -> Nemotron3_5ASRStreamingBatchResult:
-        del chunks, requested_languages
         self.batches.append(list(states))
         raw_texts = []
         clean_texts = []
@@ -94,14 +105,14 @@ class _FakeRunner:
         )
 
     def close(self) -> None:
-        self.closed = True
+        self.is_closed = True
 
 
-def _scheduler(runner: _FakeRunner) -> Nemotron3_5ASRStreamingScheduler:
+def make_scheduler(runner: FakeRunner) -> Nemotron3_5ASRStreamingScheduler:
     return Nemotron3_5ASRStreamingScheduler(
         runner,
         lambda payload: payload,
-        batch_compute_fn=lambda payloads: payloads,
+        batch_compute_fn=lambda payloads: list(payloads),
         prompt_dictionary=runner.prompt_dictionary,
         max_batch_size=4,
         max_batch_wait_ms=0,
@@ -112,7 +123,7 @@ def _scheduler(runner: _FakeRunner) -> Nemotron3_5ASRStreamingScheduler:
 def test_pcm16_fragmentation_and_final_padding_geometry() -> None:
     state = Nemotron3_5ASRStreamState(
         request_id="r",
-        payload=_payload("r"),
+        payload=make_payload("r"),
         language="en-US",
         spec=LOOKAHEAD_3,
         decode=Nemotron3_5ASRDecodeState(tokens=[99], durations=[0]),
@@ -150,7 +161,7 @@ def test_lookahead_zero_preserves_negative_stft_start() -> None:
     )
     state = Nemotron3_5ASRStreamState(
         request_id="r",
-        payload=_payload("r"),
+        payload=make_payload("r"),
         language="en-US",
         spec=spec,
         decode=Nemotron3_5ASRDecodeState(tokens=[99], durations=[0]),
@@ -165,21 +176,21 @@ def test_lookahead_zero_preserves_negative_stft_start() -> None:
 
 
 def test_scheduler_batches_one_window_per_request_and_cleans_state() -> None:
-    runner = _FakeRunner()
-    scheduler = _scheduler(runner)
-    scheduler.handle_streaming_new_request("a", _payload("a"))
-    scheduler.handle_streaming_new_request("b", _payload("b"))
+    runner = FakeRunner()
+    scheduler = make_scheduler(runner)
+    scheduler.handle_streaming_new_request("a", make_payload("a"))
+    scheduler.handle_streaming_new_request("b", make_payload("b"))
 
     first = np.arange(4040, dtype=np.int16)
-    scheduler.on_stream_chunk_batch([_item("a", first), _item("b", first)])
-    assert [len(batch) for batch in runner.batches] == [2]
-    assert (
-        scheduler._stream_states["a"].decode is not scheduler._stream_states["b"].decode
+    scheduler.on_stream_chunk_batch(
+        [make_pcm_item("a", first), make_pcm_item("b", first)]
     )
+    assert [len(batch) for batch in runner.batches] == [2]
+    assert runner.batches[0][0] is not runner.batches[0][1]
 
     continuation = np.arange(5224, dtype=np.int16)
     scheduler.on_stream_chunk_batch(
-        [_item("a", continuation), _item("b", continuation)]
+        [make_pcm_item("a", continuation), make_pcm_item("b", continuation)]
     )
     assert [len(batch) for batch in runner.batches] == [2, 2]
     messages = [scheduler.outbox.get_nowait() for _ in range(4)]
@@ -206,20 +217,23 @@ def test_scheduler_batches_one_window_per_request_and_cleans_state() -> None:
 
 
 def test_scheduler_processes_at_most_one_window_per_request_per_input_batch() -> None:
-    runner = _FakeRunner()
-    scheduler = _scheduler(runner)
-    scheduler.handle_streaming_new_request("r", _payload("r"))
+    runner = FakeRunner()
+    scheduler = make_scheduler(runner)
+    scheduler.handle_streaming_new_request("r", make_payload("r"))
 
-    scheduler.on_stream_chunk_batch([_item("r", np.arange(20000, dtype=np.int16))])
+    scheduler.on_stream_chunk_batch(
+        [make_pcm_item("r", np.arange(20000, dtype=np.int16))]
+    )
 
     assert [len(batch) for batch in runner.batches] == [1]
-    assert scheduler._stream_states["r"].has_ready_window()
+    scheduler.handle_stream_done("r")
+    assert [len(batch) for batch in runner.batches] == [1, 1, 1, 1, 1]
 
 
 def test_stream_done_rejects_incomplete_pcm16_sample() -> None:
     state = Nemotron3_5ASRStreamState(
         request_id="r",
-        payload=_payload("r"),
+        payload=make_payload("r"),
         language="en-US",
         spec=LOOKAHEAD_3,
         decode=Nemotron3_5ASRDecodeState(tokens=[99], durations=[0]),
@@ -237,10 +251,12 @@ def test_stream_done_rejects_incomplete_pcm16_sample() -> None:
         (torch.int16, 16000.5, "sample_rate"),
     ],
 )
-def test_scheduler_rejects_non_pcm16_or_wrong_rate(dtype, sample_rate, error) -> None:
-    runner = _FakeRunner()
-    scheduler = _scheduler(runner)
-    scheduler.handle_streaming_new_request("r", _payload("r"))
+def test_scheduler_rejects_non_pcm16_or_wrong_rate(
+    dtype: torch.dtype, sample_rate: int | float, error: str
+) -> None:
+    runner = FakeRunner()
+    scheduler = make_scheduler(runner)
+    scheduler.handle_streaming_new_request("r", make_payload("r"))
     bad = StreamItem(
         chunk_id=0,
         data=torch.zeros(2, dtype=dtype),

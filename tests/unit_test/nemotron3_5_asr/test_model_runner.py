@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import threading
-from types import SimpleNamespace
 
 import numpy as np
 import torch
 from transformers.feature_extraction_utils import BatchFeature
+from transformers.generation.utils import GenerateDecoderOnlyOutput
 
 from sglang_omni.models.nemotron3_5_asr.model_runner import Nemotron3_5ASRModelRunner
 from sglang_omni.models.nemotron3_5_asr.request_builders import Nemotron3_5ASRRequest
@@ -18,7 +18,7 @@ class FakeProcessor:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
 
-    def __call__(self, audio, **kwargs):
+    def __call__(self, audio: list[np.ndarray], **kwargs: object) -> BatchFeature:
         self.calls.append({"audio": audio, **kwargs})
         batch_size = len(audio)
         return BatchFeature(
@@ -30,8 +30,10 @@ class FakeProcessor:
             }
         )
 
-    def batch_decode(self, sequences, **kwargs):
-        assert kwargs == {"skip_special_tokens": False}
+    def batch_decode(
+        self, sequences: torch.Tensor, *, skip_special_tokens: bool
+    ) -> list[str]:
+        assert not skip_special_tokens
         assert sequences.device.type == "cpu"
         return ["first <en-US>", "second <zh-CN>"][: sequences.shape[0]]
 
@@ -40,15 +42,17 @@ class FakeModel:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
 
-    def generate(self, **kwargs):
-        self.calls.append(kwargs)
-        batch_size = kwargs["input_features"].shape[0]
-        return SimpleNamespace(
+    def generate(
+        self, *, input_features: torch.Tensor, **kwargs: object
+    ) -> GenerateDecoderOnlyOutput:
+        self.calls.append({"input_features": input_features, **kwargs})
+        batch_size = input_features.shape[0]
+        return GenerateDecoderOnlyOutput(
             sequences=torch.arange(batch_size * 3).reshape(batch_size, 3)
         )
 
 
-def _request(request_id: str, language: str) -> Nemotron3_5ASRRequest:
+def make_request(request_id: str, language: str) -> Nemotron3_5ASRRequest:
     payload = StagePayload(
         request_id=request_id,
         request=OmniRequest(inputs=b"audio"),
@@ -62,7 +66,7 @@ def _request(request_id: str, language: str) -> Nemotron3_5ASRRequest:
     )
 
 
-def _runner() -> tuple[Nemotron3_5ASRModelRunner, FakeProcessor, FakeModel]:
+def make_runner() -> tuple[Nemotron3_5ASRModelRunner, FakeProcessor, FakeModel]:
     runner = object.__new__(Nemotron3_5ASRModelRunner)
     processor = FakeProcessor()
     model = FakeModel()
@@ -70,15 +74,15 @@ def _runner() -> tuple[Nemotron3_5ASRModelRunner, FakeProcessor, FakeModel]:
     runner.dtype = torch.float32
     runner.processor = processor
     runner.model = model
-    runner._model_lock = threading.Lock()
+    runner.model_lock = threading.Lock()
     return runner, processor, model
 
 
 def test_run_batch_pads_once_generates_once_and_preserves_order() -> None:
-    runner, processor, model = _runner()
+    runner, processor, model = make_runner()
 
     results = runner.run_batch(
-        [_request("request-a", "en-US"), _request("request-b", "zh-CN")]
+        [make_request("request-a", "en-US"), make_request("request-b", "zh-CN")]
     )
 
     assert len(processor.calls) == 1
@@ -107,8 +111,8 @@ def test_run_batch_pads_once_generates_once_and_preserves_order() -> None:
 
 
 def test_batch_groups_token_limits_without_changing_request_order() -> None:
-    runner, _, model = _runner()
-    requests = [_request(name, "en-US") for name in ("a", "b", "c")]
+    runner, _, model = make_runner()
+    requests = [make_request(name, "en-US") for name in ("a", "b", "c")]
     requests[0].max_new_tokens = requests[2].max_new_tokens = 2
     requests[1].max_new_tokens = 5
     results = runner.run_batch(requests)

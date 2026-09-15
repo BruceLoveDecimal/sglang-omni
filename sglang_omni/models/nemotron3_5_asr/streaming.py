@@ -27,6 +27,9 @@ from .request_builders import (
     validate_nemotron_greedy_params,
 )
 
+PCM16_BYTES_PER_SAMPLE = 2
+PCM16_AMPLITUDE_SCALE = 32768.0
+
 
 @dataclass(frozen=True, slots=True)
 class Nemotron3_5ASRStreamingChunkSpec:
@@ -77,7 +80,7 @@ class Nemotron3_5ASRStreamState:
     covered_audio_end: int = 0
     model_chunk_index: int = 0
     next_mel_frame: int = 0
-    input_done: bool = False
+    is_input_done: bool = False
     ready_since_s: float | None = None
     raw_text: str = ""
     clean_text: str = ""
@@ -112,43 +115,43 @@ class Nemotron3_5ASRStreamState:
             raise ValueError(
                 f"Nemotron streaming chunk modality must be audio or pcm16, got {modality!r}"
             )
-        if self.input_done:
+        if self.is_input_done:
             raise RuntimeError(f"Nemotron stream {self.request_id!r} is already done")
 
-        flat = tensor.detach().contiguous().reshape(-1)
-        if flat.numel() == 0:
+        pcm_samples = tensor.detach().contiguous().reshape(-1)
+        if pcm_samples.numel() == 0:
             raise ValueError("Nemotron streaming PCM16 chunks must not be empty")
-        if flat.dtype == torch.int16:
-            packet = flat.numpy().astype("<i2", copy=False).tobytes()
+        if pcm_samples.dtype == torch.int16:
+            packet_bytes = pcm_samples.numpy().astype("<i2", copy=False).tobytes()
         else:
-            packet = flat.numpy().tobytes()
-        self.pcm_bytes.extend(packet)
-        self.total_samples = len(self.pcm_bytes) // 2
+            packet_bytes = pcm_samples.numpy().tobytes()
+        self.pcm_bytes.extend(packet_bytes)
+        self.total_samples = len(self.pcm_bytes) // PCM16_BYTES_PER_SAMPLE
         now = time.perf_counter()
         self.metrics.packet_count += 1
-        self._mark_ready(now)
+        self.mark_ready(now)
 
     @property
-    def decode_limit_reached(self) -> bool:
+    def has_reached_decode_limit(self) -> bool:
         return (
             self.max_new_tokens is not None
             and self.decode.decoder_steps >= self.max_new_tokens
         )
 
     def mark_done(self) -> None:
-        if self.input_done:
+        if self.is_input_done:
             raise RuntimeError(f"Nemotron stream {self.request_id!r} is already done")
         if self.total_samples == 0:
             raise ValueError("Nemotron streaming input contains no PCM16 samples")
-        if len(self.pcm_bytes) % 2:
+        if len(self.pcm_bytes) % PCM16_BYTES_PER_SAMPLE:
             raise ValueError(
                 "Nemotron streaming input ends with an incomplete PCM16 sample"
             )
-        self.input_done = True
+        self.is_input_done = True
         self.metrics.input_done_s = time.perf_counter()
-        self._mark_ready(self.metrics.input_done_s)
+        self.mark_ready(self.metrics.input_done_s)
 
-    def _next_bounds(self) -> tuple[int, int]:
+    def next_window_bounds(self) -> tuple[int, int]:
         if self.model_chunk_index == 0:
             return 0, self.spec.first_samples
         start = self.next_mel_frame * self.spec.hop_length - self.spec.n_fft // 2
@@ -159,36 +162,38 @@ class Nemotron3_5ASRStreamState:
             return self.total_samples >= self.spec.first_samples or (
                 finalizing and self.total_samples > 0
             )
-        _, end = self._next_bounds()
+        _, end = self.next_window_bounds()
         if self.total_samples >= end:
             return True
         return finalizing and self.total_samples > self.covered_audio_end
 
-    def _mark_ready(self, now: float) -> None:
-        if self.ready_since_s is None and self.has_ready_window(
-            finalizing=self.input_done
+    def mark_ready(self, now: float) -> None:
+        if self.ready_since_s is not None or not self.has_ready_window(
+            finalizing=self.is_input_done
         ):
-            self.ready_since_s = now
+            return
+        self.ready_since_s = now
 
     def pop_ready_window(
         self, *, finalizing: bool = False
     ) -> Nemotron3_5ASRAudioWindow:
-        if not self.has_ready_window(finalizing=finalizing):
-            raise RuntimeError(
-                f"Nemotron stream {self.request_id!r} has no ready window"
-            )
+        assert self.has_ready_window(
+            finalizing=finalizing
+        ), f"Nemotron stream {self.request_id!r} has no ready window"
         now = time.perf_counter()
-        start, end = self._next_bounds()
-        size = end - start
+        start, end = self.next_window_bounds()
+        window_samples = end - start
         source_start = max(start, 0)
         source_end = min(end, self.total_samples)
-        complete_bytes = memoryview(self.pcm_bytes)[: self.total_samples * 2]
-        raw = np.frombuffer(complete_bytes, dtype="<i2")
-        real = raw[source_start : max(source_start, source_end)]
+        complete_bytes = memoryview(self.pcm_bytes)[
+            : self.total_samples * PCM16_BYTES_PER_SAMPLE
+        ]
+        pcm_samples = np.frombuffer(complete_bytes, dtype="<i2")
+        window_pcm = pcm_samples[source_start : max(source_start, source_end)]
         left_padding = max(-start, 0)
-        right_padding = size - left_padding - int(real.shape[0])
+        right_padding = window_samples - left_padding - int(window_pcm.shape[0])
         waveform = np.pad(
-            real.astype(np.float32) / 32768.0,
+            window_pcm.astype(np.float32) / PCM16_AMPLITUDE_SCALE,
             (left_padding, right_padding),
         ).astype(np.float32, copy=False)
         is_first = self.model_chunk_index == 0
@@ -213,12 +218,12 @@ class Nemotron3_5ASRStreamState:
         else:
             self.next_mel_frame += self.spec.subsequent_frames
         self.ready_since_s = None
-        self._mark_ready(now)
+        self.mark_ready(now)
         return window
 
 
 class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
-    """Offline batch scheduler plus request-owned native RNNT streaming state."""
+    """Serialize request-owned RNNT state with abort cleanup through state_lock."""
 
     supports_external_input_stream = True
     can_batch_stream_chunks = True
@@ -242,9 +247,9 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
             **runner.streaming_chunk_spec
         )
         self.prompt_dictionary = dict(prompt_dictionary)
-        self._stream_states: dict[str, Nemotron3_5ASRStreamState] = {}
-        self._closed = False
-        self._aggregate = {
+        self.stream_states: dict[str, Nemotron3_5ASRStreamState] = {}
+        self.is_closed = False
+        self.aggregate_metrics: dict[str, int | float] = {
             "input_packets": 0,
             "model_chunks": 0,
             "model_batches": 0,
@@ -268,14 +273,14 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
         return payload.external_input_stream
 
     def on_streaming_new_request(self, request_id: str, payload: StagePayload) -> None:
-        if request_id in self._stream_states:
+        if request_id in self.stream_states:
             raise ValueError(f"Nemotron stream {request_id!r} already exists")
         params = payload.request.params or {}
         max_new_tokens = validate_nemotron_greedy_params(params)
         language = normalize_nemotron_language(
             params.get("language"), self.prompt_dictionary
         )
-        self._stream_states[request_id] = Nemotron3_5ASRStreamState(
+        self.stream_states[request_id] = Nemotron3_5ASRStreamState(
             request_id=request_id,
             payload=payload,
             language=language,
@@ -299,7 +304,7 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
                 if self.is_aborted(request_id):
                     continue
                 try:
-                    state = self._stream_states[request_id]
+                    state = self.stream_states[request_id]
                     metadata = item.metadata or {}
                     if not isinstance(metadata, dict):
                         raise TypeError(
@@ -311,32 +316,33 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
                         )
                     samples_before = state.total_samples
                     state.append_pcm16(item.data, metadata)
-                    state.metrics.max_queue_depth = max(
-                        state.metrics.max_queue_depth, self.inbox.qsize()
-                    )
-                    self._aggregate["input_packets"] += 1
-                    self._aggregate["audio_samples"] += (
-                        state.total_samples - samples_before
-                    )
-                    touched.add(request_id)
                 except Exception as exc:
                     self.emit_error(request_id, exc)
                     self.abort_state(request_id)
-                    self._aggregate["aborted_streams"] += 1
+                    self.aggregate_metrics["aborted_streams"] += 1
                     failed.append(request_id)
+                    continue
+                state.metrics.max_queue_depth = max(
+                    state.metrics.max_queue_depth, self.inbox.qsize()
+                )
+                self.aggregate_metrics["input_packets"] += 1
+                self.aggregate_metrics["audio_samples"] += (
+                    state.total_samples - samples_before
+                )
+                touched.add(request_id)
             ready = [
                 (request_id, state, state.pop_ready_window())
-                for request_id, state in self._stream_states.items()
+                for request_id, state in self.stream_states.items()
                 if request_id in touched
                 and not self.is_aborted(request_id)
-                and not state.decode_limit_reached
+                and not state.has_reached_decode_limit
                 and state.has_ready_window()
             ]
-            failed.extend(self._run_ready_windows(ready))
+            failed.extend(self.run_ready_windows(ready))
         for request_id in dict.fromkeys(failed):
             self.cleanup_aborted_request(request_id)
 
-    def _run_ready_windows(
+    def run_ready_windows(
         self,
         ready: Sequence[
             tuple[str, Nemotron3_5ASRStreamState, Nemotron3_5ASRAudioWindow]
@@ -354,7 +360,7 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
             for offset in range(0, len(group), self.max_batch_size):
                 batch = group[offset : offset + self.max_batch_size]
                 try:
-                    prepared = [
+                    prepared_chunks = [
                         self.runner.prepare_streaming_chunk(
                             window.waveform,
                             language=state.language,
@@ -362,118 +368,124 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
                         )
                         for _, state, window in batch
                     ]
-                    result = self.runner.run_streaming_batch(
+                    batch_result = self.runner.run_streaming_batch(
                         [state.decode for _, state, _ in batch],
-                        prepared,
+                        prepared_chunks,
                         requested_languages=[state.language for _, state, _ in batch],
                         max_new_tokens=[state.max_new_tokens for _, state, _ in batch],
                     )
-                    self._record_batch(batch, result)
+                    self.record_batch(batch, batch_result)
                     for index, (request_id, state, _) in enumerate(batch):
-                        message = self._partial_message(state, result, index)
-                        if message is not None and not self.is_aborted(request_id):
-                            self.outbox.put(message)
+                        message = self.partial_message(state, batch_result, index)
+                        if message is None or self.is_aborted(request_id):
+                            continue
+                        self.outbox.put(message)
                 except Exception as exc:
                     for request_id, _, _ in batch:
                         self.emit_error(request_id, exc)
                         self.abort_state(request_id)
-                        self._aggregate["aborted_streams"] += 1
+                        self.aggregate_metrics["aborted_streams"] += 1
                         failed.append(request_id)
         return failed
 
-    def _record_batch(
+    def record_batch(
         self,
         batch: Sequence[
             tuple[str, Nemotron3_5ASRStreamState, Nemotron3_5ASRAudioWindow]
         ],
-        result: Nemotron3_5ASRStreamingBatchResult,
+        batch_result: Nemotron3_5ASRStreamingBatchResult,
     ) -> None:
         batch_size = len(batch)
-        self._aggregate["model_batches"] += 1
-        self._aggregate["model_chunks"] += batch_size
-        self._aggregate["model_compute_s"] += result.elapsed_s
-        self._aggregate["max_batch_size"] = max(
-            self._aggregate["max_batch_size"], batch_size
+        self.aggregate_metrics["model_batches"] += 1
+        self.aggregate_metrics["model_chunks"] += batch_size
+        self.aggregate_metrics["model_compute_s"] += batch_result.elapsed_s
+        self.aggregate_metrics["max_batch_size"] = max(
+            self.aggregate_metrics["max_batch_size"], batch_size
         )
-        per_request_compute_s = result.elapsed_s / batch_size
+        per_request_compute_s = batch_result.elapsed_s / batch_size
         for _, state, window in batch:
             state.metrics.model_compute_s += per_request_compute_s
             state.metrics.model_chunk_count += 1
             state.metrics.batch_sizes.append(batch_size)
-            state.metrics.chunk_latency_ms.append(result.elapsed_s * 1000.0)
+            state.metrics.chunk_latency_ms.append(batch_result.elapsed_s * 1000.0)
             state.metrics.chunk_ready_wait_ms.append(window.ready_wait_s * 1000.0)
-            if window.model_chunk_index > 0:
-                state.metrics.cache_reuse_count += 1
-                self._aggregate["cache_reuses"] += 1
+            if window.model_chunk_index == 0:
+                continue
+            state.metrics.cache_reuse_count += 1
+            self.aggregate_metrics["cache_reuses"] += 1
 
-    def _partial_message(
+    def partial_message(
         self,
         state: Nemotron3_5ASRStreamState,
-        result: Nemotron3_5ASRStreamingBatchResult,
+        batch_result: Nemotron3_5ASRStreamingBatchResult,
         index: int,
     ) -> OutgoingMessage | None:
-        previous = state.clean_text
-        state.raw_text = result.raw_texts[index]
-        state.clean_text = result.clean_texts[index]
-        state.detected_language = result.languages[index]
-        if not state.clean_text or state.clean_text == previous:
+        previous_text = state.clean_text
+        state.raw_text = batch_result.raw_texts[index]
+        state.clean_text = batch_result.clean_texts[index]
+        state.detected_language = batch_result.languages[index]
+        if not state.clean_text or state.clean_text == previous_text:
             return None
-        if previous and not state.clean_text.startswith(previous):
+        if previous_text and not state.clean_text.startswith(previous_text):
             raise RuntimeError(
                 "Nemotron streaming transcript changed a previously emitted prefix"
             )
-        delta = state.clean_text[len(previous) :]
+        text_delta = state.clean_text[len(previous_text) :]
         now = time.perf_counter()
-        if state.metrics.first_text_s is None:
-            state.metrics.first_text_s = now
+        state.metrics.first_text_s = (
+            now if state.metrics.first_text_s is None else state.metrics.first_text_s
+        )
         return OutgoingMessage(
             request_id=state.request_id,
             type="stream",
             data={
-                "text": delta,
+                "text": text_delta,
                 "full_text": state.clean_text,
                 "raw_text": state.raw_text,
                 "language": state.detected_language,
                 "token_ids": list(state.decode.tokens),
                 "modality": "text",
-                "metrics": self._metrics_snapshot(state, now=now),
+                "metrics": self.metrics_snapshot(state, now=now),
             },
             metadata={"modality": "text"},
         )
 
     def on_stream_done(self, request_id: str) -> list[OutgoingMessage]:
-        state = self._stream_states[request_id]
+        state = self.stream_states[request_id]
         state.mark_done()
         messages: list[OutgoingMessage] = []
-        while not state.decode_limit_reached and state.has_ready_window(
+        while not state.has_reached_decode_limit and state.has_ready_window(
             finalizing=True
         ):
             window = state.pop_ready_window(finalizing=True)
-            prepared = self.runner.prepare_streaming_chunk(
+            prepared_chunk = self.runner.prepare_streaming_chunk(
                 window.waveform,
                 language=state.language,
                 is_first=window.is_first,
             )
-            result = self.runner.run_streaming_batch(
+            batch_result = self.runner.run_streaming_batch(
                 [state.decode],
-                [prepared],
+                [prepared_chunk],
                 requested_languages=[state.language],
                 max_new_tokens=[state.max_new_tokens],
             )
-            self._record_batch([(request_id, state, window)], result)
-            partial = self._partial_message(state, result, 0)
-            if partial is not None:
-                messages.append(partial)
+            self.record_batch([(request_id, state, window)], batch_result)
+            partial = self.partial_message(state, batch_result, 0)
+            if partial is None:
+                continue
+            messages.append(partial)
 
         state.metrics.finalized_s = time.perf_counter()
-        self._aggregate["completed_streams"] += 1
-        metrics = self._metrics_snapshot(state, now=state.metrics.finalized_s)
+        self.aggregate_metrics["completed_streams"] += 1
+        metrics = self.metrics_snapshot(state, now=state.metrics.finalized_s)
         final_payload = build_nemotron3_5_asr_result(
             state.payload,
             raw_text=state.raw_text,
             requested_language=state.language,
             duration_s=state.total_samples / state.spec.sample_rate,
-            asr_latency_s=metrics["elapsed_s"],
+            asr_latency_s=max(
+                state.metrics.finalized_s - state.metrics.request_started_s, 0.0
+            ),
             model_latency_s=state.metrics.model_compute_s,
             extra_data={
                 "token_ids": list(state.decode.tokens),
@@ -493,7 +505,7 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
         )
         return messages
 
-    def _metrics_snapshot(
+    def metrics_snapshot(
         self, state: Nemotron3_5ASRStreamState, *, now: float
     ) -> dict[str, float | int | list[float] | list[int] | None]:
         audio_s = state.total_samples / state.spec.sample_rate
@@ -504,18 +516,22 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
             if state.metrics.first_text_s is not None
             else None
         )
-        speech_end_to_final_s = (
-            state.metrics.finalized_s - state.metrics.input_done_s
-            if state.metrics.finalized_s is not None
+        if (
+            state.metrics.finalized_s is not None
             and state.metrics.input_done_s is not None
-            else None
-        )
+        ):
+            speech_end_to_final_s = (
+                state.metrics.finalized_s - state.metrics.input_done_s
+            )
+        else:
+            speech_end_to_final_s = None
         latencies = state.metrics.chunk_latency_ms
-        p50, p99 = (
-            np.percentile(latencies, [50, 99], method="inverted_cdf").tolist()
-            if latencies
-            else (None, None)
-        )
+        if latencies:
+            p50, p99 = np.percentile(
+                latencies, [50, 99], method="inverted_cdf"
+            ).tolist()
+        else:
+            p50, p99 = None, None
         return {
             "ttft_s": ttft_s,
             "speech_end_to_final_s": speech_end_to_final_s,
@@ -536,13 +552,13 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
         }
 
     def clear_stream_state(self, request_id: str) -> None:
-        self._stream_states.pop(request_id, None)
+        self.stream_states.pop(request_id, None)
 
     def stats(self) -> dict[str, int | float]:
         with self.state_lock:
             return {
-                **self._aggregate,
-                "active_streams": len(self._stream_states),
+                **self.aggregate_metrics,
+                "active_streams": len(self.stream_states),
                 "inbox_depth": self.inbox.qsize(),
             }
 
@@ -551,21 +567,22 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
             super().start()
         finally:
             with self.state_lock:
-                self._stream_states.clear()
-            self._close_runner()
+                self.stream_states.clear()
+            self.close_runner()
 
     def stop(self) -> None:
         was_running = self.running
         super().stop()
-        if not was_running:
-            with self.state_lock:
-                self._stream_states.clear()
-            self._close_runner()
-
-    def _close_runner(self) -> None:
-        if self._closed:
+        if was_running:
             return
-        self._closed = True
+        with self.state_lock:
+            self.stream_states.clear()
+        self.close_runner()
+
+    def close_runner(self) -> None:
+        if self.is_closed:
+            return
+        self.is_closed = True
         self.runner.close()
 
 

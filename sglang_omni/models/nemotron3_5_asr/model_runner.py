@@ -62,7 +62,7 @@ class Nemotron3_5ASRStreamingBatchResult:
 
 
 class Nemotron3_5ASRModelRunner:
-    """Own one processor/model pair and serialize its mutable generate path."""
+    """Serialize model inference across threads; callers own request state."""
 
     def __init__(
         self,
@@ -96,7 +96,7 @@ class Nemotron3_5ASRModelRunner:
         ).to(self.device)
         self.model.eval()
         # Note (Li Gang): generate mutates model-owned decoder progress.
-        self._model_lock = threading.Lock()
+        self.model_lock = threading.Lock()
 
     @property
     def prompt_dictionary(self) -> dict[str, int]:
@@ -141,19 +141,11 @@ class Nemotron3_5ASRModelRunner:
             if is_first
             else self.processor.num_mel_frames_per_audio_chunk
         )
-        if input_features.shape[1] < required_frames:
-            raise ValueError(
-                f"Nemotron processor returned {input_features.shape[1]} frames; "
-                f"the {'first' if is_first else 'subsequent'} streaming chunk "
-                f"requires {required_frames}"
-            )
         if is_first:
+            assert input_features.shape[1] >= required_frames
             input_features = input_features[:, :required_frames, :]
-        elif input_features.shape[1] != required_frames:
-            raise ValueError(
-                f"Nemotron processor returned {input_features.shape[1]} frames; "
-                f"the subsequent streaming chunk requires exactly {required_frames}"
-            )
+        else:
+            assert input_features.shape[1] == required_frames
         return Nemotron3_5ASRPreparedChunk(
             input_features=input_features.to(device=self.device, dtype=self.dtype),
             prompt_ids=processor_inputs.prompt_ids.to(device=self.device),
@@ -165,44 +157,37 @@ class Nemotron3_5ASRModelRunner:
     ) -> DynamicCache | None:
         if all(cache is None for cache in caches):
             return None
-        if any(cache is None for cache in caches):
-            raise RuntimeError(
-                "Cannot batch initialized and uninitialized attention caches"
-            )
+        assert all(cache is not None for cache in caches)
         layer_count = len(caches[0].layers)
-        if any(len(cache.layers) != layer_count for cache in caches):
-            raise RuntimeError("Nemotron attention cache layer counts do not match")
-        data = []
+        assert all(len(cache.layers) == layer_count for cache in caches)
+        key_value_pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
         for layer_index in range(layer_count):
             layers = [cache.layers[layer_index] for cache in caches]
             sequence_lengths = {layer.get_seq_length() for layer in layers}
-            if len(sequence_lengths) != 1:
-                raise RuntimeError(
-                    "Nemotron attention caches can only batch at the same chunk index"
-                )
-            data.append(
+            assert len(sequence_lengths) == 1
+            key_value_pairs.append(
                 (
                     torch.cat([layer.keys for layer in layers], dim=0),
                     torch.cat([layer.values for layer in layers], dim=0),
                 )
             )
-        return DynamicCache(ddp_cache_data=data)
+        return DynamicCache(ddp_cache_data=key_value_pairs)
 
     @staticmethod
     def split_attention_cache(
         cache: DynamicCache, batch_size: int
     ) -> list[DynamicCache]:
-        split: list[DynamicCache] = []
+        request_caches: list[DynamicCache] = []
         for batch_index in range(batch_size):
-            data = [
+            key_value_pairs = [
                 (
                     layer.keys[batch_index : batch_index + 1].clone(),
                     layer.values[batch_index : batch_index + 1].clone(),
                 )
                 for layer in cache.layers
             ]
-            split.append(DynamicCache(ddp_cache_data=data))
-        return split
+            request_caches.append(DynamicCache(ddp_cache_data=key_value_pairs))
+        return request_caches
 
     @staticmethod
     def merge_padding_caches(
@@ -210,11 +195,9 @@ class Nemotron3_5ASRModelRunner:
     ) -> NemotronAsrStreamingEncoderCausalConvPaddingCache | None:
         if all(cache is None for cache in caches):
             return None
-        if any(cache is None for cache in caches):
-            raise RuntimeError("Cannot batch initialized and uninitialized conv caches")
+        assert all(cache is not None for cache in caches)
         keys = list(caches[0].layers)
-        if any(list(cache.layers) != keys for cache in caches):
-            raise RuntimeError("Nemotron conv cache layouts do not match")
+        assert all(list(cache.layers) == keys for cache in caches)
         merged = NemotronAsrStreamingEncoderCausalConvPaddingCache()
         for key in keys:
             source_layers = [cache.layers[key] for cache in caches]
@@ -227,26 +210,27 @@ class Nemotron3_5ASRModelRunner:
     def split_padding_cache(
         cache: NemotronAsrStreamingEncoderCausalConvPaddingCache, batch_size: int
     ) -> list[NemotronAsrStreamingEncoderCausalConvPaddingCache]:
-        split = [
+        request_caches = [
             NemotronAsrStreamingEncoderCausalConvPaddingCache()
             for _ in range(batch_size)
         ]
         for key, source in cache.layers.items():
-            for batch_index, target in enumerate(split):
+            for batch_index, target in enumerate(request_caches):
                 layer = copy(source)
                 layer.cache = source.cache[batch_index : batch_index + 1].clone()
                 target.layers[key] = layer
-        return split
+        return request_caches
 
     def merge_decoder_caches(
         self, caches: Sequence[Nemotron3_5AsrRNNTDecoderCache | None]
     ) -> Nemotron3_5AsrRNNTDecoderCache:
-        initialized = [cache is not None and cache.is_initialized for cache in caches]
+        is_initialized = [
+            cache is not None and cache.is_initialized for cache in caches
+        ]
         merged = Nemotron3_5AsrRNNTDecoderCache(self.model.config)
-        if not any(initialized):
+        if not any(is_initialized):
             return merged
-        if not all(initialized):
-            raise RuntimeError("Cannot batch initialized and uninitialized RNNT caches")
+        assert all(is_initialized)
         merged.cache = torch.cat([cache.cache for cache in caches], dim=0)
         merged.hidden_state = torch.cat([cache.hidden_state for cache in caches], dim=1)
         merged.cell_state = torch.cat([cache.cell_state for cache in caches], dim=1)
@@ -256,24 +240,21 @@ class Nemotron3_5ASRModelRunner:
     def split_decoder_cache(
         self, cache: Nemotron3_5AsrRNNTDecoderCache, batch_size: int
     ) -> list[Nemotron3_5AsrRNNTDecoderCache]:
-        split = []
-        for batch_index in range(batch_size):
-            item = Nemotron3_5AsrRNNTDecoderCache(self.model.config)
-            if cache.is_initialized:
-                item.cache = cache.cache[batch_index : batch_index + 1].clone()
-                item.hidden_state = cache.hidden_state[
-                    :, batch_index : batch_index + 1
-                ].clone()
-                item.cell_state = cache.cell_state[
-                    :, batch_index : batch_index + 1
-                ].clone()
-                item.is_initialized = True
-            split.append(item)
-        return split
-
-    def synchronize(self) -> None:
-        if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
+        request_caches = [
+            Nemotron3_5AsrRNNTDecoderCache(self.model.config) for _ in range(batch_size)
+        ]
+        if not cache.is_initialized:
+            return request_caches
+        for batch_index, request_cache in enumerate(request_caches):
+            request_cache.cache = cache.cache[batch_index : batch_index + 1].clone()
+            request_cache.hidden_state = cache.hidden_state[
+                :, batch_index : batch_index + 1
+            ].clone()
+            request_cache.cell_state = cache.cell_state[
+                :, batch_index : batch_index + 1
+            ].clone()
+            request_cache.is_initialized = True
+        return request_caches
 
     def run_streaming_batch(
         self,
@@ -284,15 +265,16 @@ class Nemotron3_5ASRModelRunner:
         max_new_tokens: Sequence[int | None] | None = None,
     ) -> Nemotron3_5ASRStreamingBatchResult:
         assert states and len(states) == len(chunks) == len(requested_languages)
-        if max_new_tokens is None:
-            max_new_tokens = [None] * len(states)
-        assert len(max_new_tokens) == len(states)
+        token_limits = (
+            [None] * len(states) if max_new_tokens is None else max_new_tokens
+        )
+        assert len(token_limits) == len(states)
         assert all(
             limit is None or state.decoder_steps < limit
-            for state, limit in zip(states, max_new_tokens)
+            for state, limit in zip(states, token_limits)
         )
 
-        features = torch.cat([chunk.input_features for chunk in chunks], dim=0)
+        input_features = torch.cat([chunk.input_features for chunk in chunks], dim=0)
         prompt_ids = torch.cat([chunk.prompt_ids.reshape(-1) for chunk in chunks])
         attention_cache = self.merge_attention_caches(
             [state.attention_cache for state in states]
@@ -300,11 +282,12 @@ class Nemotron3_5ASRModelRunner:
         padding_cache = self.merge_padding_caches(
             [state.padding_cache for state in states]
         )
-        self.synchronize()
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
         started_at_s = time.perf_counter()
-        with self._model_lock, torch.inference_mode():
-            encoded = self.model.get_audio_features(
-                input_features=features,
+        with self.model_lock, torch.inference_mode():
+            encoder_outputs = self.model.get_audio_features(
+                input_features=input_features,
                 prompt_ids=prompt_ids,
                 past_key_values=attention_cache,
                 padding_cache=padding_cache,
@@ -313,42 +296,45 @@ class Nemotron3_5ASRModelRunner:
                 output_attention_mask=False,
             )
             split_attention = self.split_attention_cache(
-                encoded.past_key_values, len(states)
+                encoder_outputs.past_key_values, len(states)
             )
-            split_padding = self.split_padding_cache(encoded.padding_cache, len(states))
+            split_padding = self.split_padding_cache(
+                encoder_outputs.padding_cache, len(states)
+            )
             for state, cache in zip(states, split_attention):
                 state.attention_cache = cache
             for state, cache in zip(states, split_padding):
                 state.padding_cache = cache
 
-            pooler_chunks = [
-                encoded.pooler_output[index : index + 1] for index in range(len(states))
+            encoded_frame_chunks = [
+                encoder_outputs.pooler_output[index : index + 1]
+                for index in range(len(states))
             ]
             local_frame_indices = [0] * len(states)
-            for state, pooler in zip(states, pooler_chunks):
-                state.encoder_frames += int(pooler.shape[1])
+            for state, encoded_frames in zip(states, encoded_frame_chunks):
+                state.encoder_frames += int(encoded_frames.shape[1])
 
-            active = list(range(len(states)))
-            while active:
+            active_indices = list(range(len(states)))
+            while active_indices:
                 current_frames = torch.cat(
                     [
-                        pooler_chunks[index][
+                        encoded_frame_chunks[index][
                             :,
                             local_frame_indices[index] : local_frame_indices[index] + 1,
                         ]
-                        for index in active
+                        for index in active_indices
                     ],
                     dim=0,
                 )
                 decoder_input_ids = torch.tensor(
-                    [[states[index].tokens[-1]] for index in active],
+                    [[states[index].tokens[-1]] for index in active_indices],
                     dtype=torch.long,
                     device=self.device,
                 )
                 decoder_cache = self.merge_decoder_caches(
-                    [states[index].decoder_cache for index in active]
+                    [states[index].decoder_cache for index in active_indices]
                 )
-                outputs = self.model(
+                decoder_outputs = self.model(
                     encoder_outputs=NemotronAsrStreamingEncoderModelOutput(
                         pooler_output=current_frames
                     ),
@@ -356,33 +342,43 @@ class Nemotron3_5ASRModelRunner:
                     decoder_cache=decoder_cache,
                     use_decoder_cache=True,
                 )
-                predicted = outputs.logits[:, -1, :].argmax(dim=-1).tolist()
-                split_decoder = self.split_decoder_cache(
-                    outputs.decoder_cache, len(active)
+                # Note (Li Gang): blank decisions advance each request's frame independently.
+                predicted_token_ids = (
+                    decoder_outputs.logits[:, -1, :].argmax(dim=-1).tolist()
                 )
-                next_active: list[int] = []
-                for row, state_index in enumerate(active):
+                split_decoder = self.split_decoder_cache(
+                    decoder_outputs.decoder_cache, len(active_indices)
+                )
+                next_active_indices: list[int] = []
+                for row, state_index in enumerate(active_indices):
                     state = states[state_index]
                     state.decoder_cache = split_decoder[row]
-                    token = int(predicted[row])
-                    state.tokens.append(token)
-                    is_blank = token == int(self.model.config.blank_token_id)
-                    symbols = 0 if is_blank else state.symbols_at_frame + 1
-                    force_advance = symbols >= int(self.model.max_symbols_per_step)
-                    state.symbols_at_frame = 0 if is_blank or force_advance else symbols
-                    advance = int(is_blank or force_advance)
-                    state.durations.append(advance)
+                    token_id = int(predicted_token_ids[row])
+                    state.tokens.append(token_id)
+                    is_blank = token_id == int(self.model.config.blank_token_id)
+                    symbols_at_frame = 0 if is_blank else state.symbols_at_frame + 1
+                    should_advance_frame = is_blank or symbols_at_frame >= int(
+                        self.model.max_symbols_per_step
+                    )
+                    state.symbols_at_frame = (
+                        0 if should_advance_frame else symbols_at_frame
+                    )
+                    frame_advance = int(should_advance_frame)
+                    state.durations.append(frame_advance)
                     state.decoder_steps += 1
-                    local_frame_indices[state_index] += advance
-                    token_limit = max_new_tokens[state_index]
-                    if local_frame_indices[state_index] < pooler_chunks[
-                        state_index
-                    ].shape[1] and (
-                        token_limit is None or state.decoder_steps < token_limit
+                    local_frame_indices[state_index] += frame_advance
+                    token_limit = token_limits[state_index]
+                    if (
+                        local_frame_indices[state_index]
+                        >= encoded_frame_chunks[state_index].shape[1]
                     ):
-                        next_active.append(state_index)
-                active = next_active
-        self.synchronize()
+                        continue
+                    if token_limit is not None and state.decoder_steps >= token_limit:
+                        continue
+                    next_active_indices.append(state_index)
+                active_indices = next_active_indices
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
         elapsed_s = time.perf_counter() - started_at_s
 
         token_tensors = [
@@ -418,12 +414,16 @@ class Nemotron3_5ASRModelRunner:
             return_tensors="pt",
         )
         model_inputs = processor_inputs.to(device=self.device, dtype=self.dtype)
-        generate_kwargs: dict[str, bool | int] = {"return_dict_in_generate": True}
         if max_new_tokens is not None:
-            generate_kwargs["max_new_tokens"] = max_new_tokens
+            generate_kwargs = {
+                "return_dict_in_generate": True,
+                "max_new_tokens": max_new_tokens,
+            }
+        else:
+            generate_kwargs = {"return_dict_in_generate": True}
 
         started_at_s = time.perf_counter()
-        with self._model_lock, torch.inference_mode():
+        with self.model_lock, torch.inference_mode():
             generated = self.model.generate(**model_inputs, **generate_kwargs)
         elapsed_s = time.perf_counter() - started_at_s
         sequences = generated.sequences.detach().to("cpu")
@@ -477,12 +477,8 @@ class Nemotron3_5ASRModelRunner:
                 ordered_results[index] = result
         return [ordered_results[index] for index in range(len(requests))]
 
-    def run_one(self, request: Nemotron3_5ASRRequest) -> StagePayload:
-        return self.run_batch([request])[0]
-
     def close(self) -> None:
-        self.model = None  # type: ignore[assignment]
-        self.processor = None  # type: ignore[assignment]
+        del self.model, self.processor
 
 
 __all__ = [
