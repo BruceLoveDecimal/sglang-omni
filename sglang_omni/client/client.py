@@ -38,8 +38,8 @@ if TYPE_CHECKING:
     import torch
 
 
-class _ExternalInputStream:
-    """Internal handle for incrementally supplied entry-stage input."""
+class ExternalInputStream:
+    """Handle for incrementally supplied entry-stage input."""
 
     def __init__(
         self,
@@ -53,7 +53,7 @@ class _ExternalInputStream:
         self.is_input_done = False
         self.is_closed = False
 
-    def __aiter__(self) -> _ExternalInputStream:
+    def __aiter__(self) -> ExternalInputStream:
         return self
 
     async def __anext__(self) -> GenerateChunk:
@@ -101,7 +101,7 @@ class _ExternalInputStream:
         self.is_closed = True
         await self.events.aclose()
 
-    async def __aenter__(self) -> _ExternalInputStream:
+    async def __aenter__(self) -> ExternalInputStream:
         return self
 
     async def __aexit__(
@@ -150,18 +150,18 @@ class Client:
         result = await self._coordinator.submit(req_id, omni_request)
         yield self._result_builder(req_id, result)
 
-    async def _start_input_stream(
+    async def start_input_stream(
         self,
         request: GenerateRequest,
         *,
         request_id: str | None = None,
-    ) -> _ExternalInputStream:
-        """Open an internal request that accepts bounded CPU tensor chunks."""
+    ) -> ExternalInputStream:
+        """Open a request that accepts bounded CPU tensor chunks."""
         req_id = request_id or str(uuid.uuid4())
         events = await self._coordinator.start_input_stream(
             req_id, self._build_omni_request(request)
         )
-        return _ExternalInputStream(self, req_id, events)
+        return ExternalInputStream(self, req_id, events)
 
     # ------------------------------------------------------------------
     # High-level: non-streaming completion

@@ -55,7 +55,7 @@ class _AdminPendingOperation:
 
 
 @dataclass
-class _ExternalInputStream:
+class ExternalInputStream:
     entry_stage: str
     entry_endpoint: str
     replica_bindings: dict[str, int] | None
@@ -150,14 +150,14 @@ class Coordinator:
         # Abort messages carry only the request ID. A strongly held task keeps
         # local admission closed and lets the broadcast survive caller cancellation.
         self._abort_tasks: dict[str, asyncio.Task[bool]] = {}
-        self._external_input_streams: dict[str, _ExternalInputStream] = {}
+        self.external_input_streams: dict[str, ExternalInputStream] = {}
         self._admin_ops: dict[str, _AdminPendingOperation] = {}
         self._admin_lock = asyncio.Lock()
 
         # State
         self._running = False
         self._fatal_error: str | None = None
-        self._external_input_writes_open = True
+        self.external_input_writes_open = True
 
     def register_stage(self, name: str, endpoint: str) -> None:
         """Register a stage.
@@ -173,17 +173,17 @@ class Coordinator:
         """Start the coordinator."""
         await self.control_plane.start()
         self._running = True
-        self._external_input_writes_open = True
+        self.external_input_writes_open = True
         logger.info("Coordinator started")
 
     async def stop(self) -> None:
         """Stop the coordinator."""
         self._running = False
-        self._external_input_writes_open = False
-        for request_id, stream in list(self._external_input_streams.items()):
+        self.external_input_writes_open = False
+        for request_id, stream in list(self.external_input_streams.items()):
             async with stream.write_lock:
-                if self._external_input_streams.get(request_id) is stream:
-                    self._external_input_streams.pop(request_id, None)
+                if self.external_input_streams.get(request_id) is stream:
+                    self.external_input_streams.pop(request_id, None)
         self.control_plane.close()
         logger.info("Coordinator stopped")
 
@@ -192,17 +192,17 @@ class Coordinator:
         self._running = False
         message = str(error)
         self._fatal_error = message
-        self._external_input_writes_open = False
+        self.external_input_writes_open = False
         for request_id in list(self._requests):
-            stream = self._external_input_streams.get(request_id)
+            stream = self.external_input_streams.get(request_id)
             if stream is None:
-                await self._fail_pending_request(request_id, message)
+                await self.fail_pending_request(request_id, message)
                 continue
             async with stream.write_lock:
-                await self._fail_pending_request(request_id, message)
+                await self.fail_pending_request(request_id, message)
         self._partial_results.clear()
 
-    async def _fail_pending_request(self, request_id: str, message: str) -> None:
+    async def fail_pending_request(self, request_id: str, message: str) -> None:
         """Fail one request while its external-input write lock is held, if any."""
         info = self._requests.get(request_id)
         if info is None:
@@ -222,7 +222,7 @@ class Coordinator:
             )
         self._requests.pop(request_id, None)
         self._partial_results.pop(request_id, None)
-        self._external_input_streams.pop(request_id, None)
+        self.external_input_streams.pop(request_id, None)
 
     async def shutdown_stages(self, stage_names: Sequence[str] | None = None) -> None:
         """Send shutdown to registered stages, or only to *stage_names*."""
@@ -424,7 +424,7 @@ class Coordinator:
             external_input_stream=True,
         )
         expected = self._expected_terminal_stages(request_id)
-        return self._stream_events(request_id, stream_queue, expected)
+        return self.stream_events(request_id, stream_queue, expected)
 
     async def send_input_chunk(
         self,
@@ -445,9 +445,9 @@ class Coordinator:
                 f"payload is at most {stage_io.INLINE_STREAM_CHUNK_BYTES_LIMIT} bytes"
             )
 
-        stream = self._active_input_stream(request_id)
+        stream = self.active_input_stream(request_id)
         async with stream.write_lock:
-            self._ensure_current_input_stream(request_id, stream)
+            self.ensure_current_input_stream(request_id, stream)
             if stream.done:
                 raise RuntimeError(f"Input stream {request_id!r} is already done")
             if stream.next_chunk_id >= self.max_external_input_chunks:
@@ -474,16 +474,16 @@ class Coordinator:
                     replica_bindings=stream.replica_bindings,
                 ),
             )
-            self._ensure_current_input_stream(request_id, stream)
+            self.ensure_current_input_stream(request_id, stream)
             stream.next_chunk_id += 1
             stream.bytes_sent += chunk_bytes
             return chunk_id
 
     async def finish_input_stream(self, request_id: str) -> None:
         """Mark an active entry-stage input stream complete."""
-        stream = self._active_input_stream(request_id)
+        stream = self.active_input_stream(request_id)
         async with stream.write_lock:
-            self._ensure_current_input_stream(request_id, stream)
+            self.ensure_current_input_stream(request_id, stream)
             if stream.done:
                 raise RuntimeError(f"Input stream {request_id!r} is already done")
             await self.control_plane.send_input_stream_event(
@@ -498,30 +498,30 @@ class Coordinator:
                     replica_bindings=stream.replica_bindings,
                 ),
             )
-            self._ensure_current_input_stream(request_id, stream)
+            self.ensure_current_input_stream(request_id, stream)
             stream.done = True
 
-    def _active_input_stream(self, request_id: str) -> _ExternalInputStream:
-        self._ensure_external_input_writes_open()
-        stream = self._external_input_streams.get(request_id)
+    def active_input_stream(self, request_id: str) -> ExternalInputStream:
+        self.ensure_external_input_writes_open()
+        stream = self.external_input_streams.get(request_id)
         if stream is None or request_id not in self._requests:
             raise ValueError(f"No active input stream for request {request_id!r}")
         return stream
 
-    def _ensure_current_input_stream(
-        self, request_id: str, stream: _ExternalInputStream
+    def ensure_current_input_stream(
+        self, request_id: str, stream: ExternalInputStream
     ) -> None:
-        self._ensure_external_input_writes_open()
+        self.ensure_external_input_writes_open()
         if (
-            self._external_input_streams.get(request_id) is not stream
+            self.external_input_streams.get(request_id) is not stream
             or request_id not in self._requests
         ):
             raise ValueError(f"No active input stream for request {request_id!r}")
 
-    def _ensure_external_input_writes_open(self) -> None:
+    def ensure_external_input_writes_open(self) -> None:
         if self._fatal_error is not None:
             raise RuntimeError(self._fatal_error)
-        if not self._external_input_writes_open:
+        if not self.external_input_writes_open:
             raise RuntimeError("Coordinator is not accepting external input writes")
 
     async def stream(
@@ -532,12 +532,12 @@ class Coordinator:
 
         await self._submit_request(request_id, request, stream_queue=queue)
         expected = self._expected_terminal_stages(request_id)
-        events = self._stream_events(request_id, queue, expected)
+        events = self.stream_events(request_id, queue, expected)
         async with aclosing(events):
             async for msg in events:
                 yield msg
 
-    async def _stream_events(
+    async def stream_events(
         self,
         request_id: str,
         queue: asyncio.Queue[CompleteMessage | StreamMessage],
@@ -573,7 +573,7 @@ class Coordinator:
                     if self._stream_queues.get(request_id) is queue:
                         self._stream_queues.pop(request_id, None)
                         self._completion_futures.pop(request_id, None)
-                        self._external_input_streams.pop(request_id, None)
+                        self.external_input_streams.pop(request_id, None)
 
     async def _submit_request(
         self,
@@ -587,7 +587,7 @@ class Coordinator:
         if self._fatal_error is not None:
             raise RuntimeError(self._fatal_error)
         if external_input_stream:
-            self._ensure_external_input_writes_open()
+            self.ensure_external_input_writes_open()
         if self._request_id_is_reserved(request_id):
             raise ValueError(f"Request {request_id} already exists")
 
@@ -631,7 +631,7 @@ class Coordinator:
         if stream_queue is not None:
             self._stream_queues[request_id] = stream_queue
         if external_input_stream:
-            self._external_input_streams[request_id] = _ExternalInputStream(
+            self.external_input_streams[request_id] = ExternalInputStream(
                 entry_stage=entry_instance,
                 entry_endpoint=entry_info.control_endpoint,
                 replica_bindings=replica_bindings,
@@ -665,7 +665,7 @@ class Coordinator:
             self._requests.pop(request_id, None)
             self._partial_results.pop(request_id, None)
             self._stream_queues.pop(request_id, None)
-            self._external_input_streams.pop(request_id, None)
+            self.external_input_streams.pop(request_id, None)
             pending = self._completion_futures.pop(request_id, None)
             if pending is not None and not pending.done():
                 pending.cancel()
@@ -691,7 +691,7 @@ class Coordinator:
             or request_id in self._completion_futures
             or request_id in self._stream_queues
             or request_id in self._abort_tasks
-            or request_id in self._external_input_streams
+            or request_id in self.external_input_streams
         )
 
     def _reject_completion_future(
@@ -749,13 +749,13 @@ class Coordinator:
         self,
         request_id: str,
     ) -> bool:
-        stream = self._external_input_streams.get(request_id)
+        stream = self.external_input_streams.get(request_id)
         if stream is not None:
             async with stream.write_lock:
-                return await self._run_abort_locked(request_id)
-        return await self._run_abort_locked(request_id)
+                return await self.run_abort_locked(request_id)
+        return await self.run_abort_locked(request_id)
 
-    async def _run_abort_locked(self, request_id: str) -> bool:
+    async def run_abort_locked(self, request_id: str) -> bool:
         await self.control_plane.broadcast_abort(AbortMessage(request_id=request_id))
 
         info = self._requests.get(request_id)
@@ -779,7 +779,7 @@ class Coordinator:
 
         self._requests.pop(request_id, None)
         self._partial_results.pop(request_id, None)
-        self._external_input_streams.pop(request_id, None)
+        self.external_input_streams.pop(request_id, None)
 
         logger.info("Coordinator aborted req=%s", request_id)
         return True
@@ -789,7 +789,7 @@ class Coordinator:
         aborted = await self.abort(request_id)
         self._stream_queues.pop(request_id, None)
         self._completion_futures.pop(request_id, None)
-        self._external_input_streams.pop(request_id, None)
+        self.external_input_streams.pop(request_id, None)
         return aborted
 
     def _on_abort_task_done(
@@ -832,14 +832,14 @@ class Coordinator:
 
     async def _handle_completion(self, msg: CompleteMessage) -> None:
         """Serialize terminal state with external input writes for this request."""
-        stream = self._external_input_streams.get(msg.request_id)
+        stream = self.external_input_streams.get(msg.request_id)
         if stream is None:
-            await self._handle_completion_locked(msg)
+            await self.handle_completion_locked(msg)
             return
         async with stream.write_lock:
-            await self._handle_completion_locked(msg)
+            await self.handle_completion_locked(msg)
 
-    async def _handle_completion_locked(self, msg: CompleteMessage) -> None:
+    async def handle_completion_locked(self, msg: CompleteMessage) -> None:
         """Handle a completion message from a stage."""
         request_id = msg.request_id
         logger.debug(
@@ -889,7 +889,7 @@ class Coordinator:
             if stream_queue is not None:
                 await stream_queue.put(msg)
             self._requests.pop(request_id, None)
-            self._external_input_streams.pop(request_id, None)
+            self.external_input_streams.pop(request_id, None)
             return
 
         expected_terminal_stages = self._expected_terminal_stages(request_id)
@@ -914,7 +914,7 @@ class Coordinator:
             if request_id in self._stream_queues:
                 await self._stream_queues[request_id].put(msg)
             self._requests.pop(request_id, None)
-            self._external_input_streams.pop(request_id, None)
+            self.external_input_streams.pop(request_id, None)
             return
 
         # Multi-terminal: collect partial results
@@ -939,7 +939,7 @@ class Coordinator:
             if not future.done():
                 future.set_result(merged)
         self._requests.pop(request_id, None)
-        self._external_input_streams.pop(request_id, None)
+        self.external_input_streams.pop(request_id, None)
 
     async def _handle_stream(self, msg: StreamMessage) -> None:
         """Handle a stream chunk from a stage."""

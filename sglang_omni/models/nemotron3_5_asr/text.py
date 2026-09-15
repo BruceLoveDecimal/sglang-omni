@@ -5,11 +5,11 @@ from __future__ import annotations
 
 import re
 
-_LOCALE_TAG_RE = re.compile(r"<(?P<locale>[A-Za-z]{2,3}-[A-Za-z]{2,3})>")
+LOCALE_TAG_RE = re.compile(r"<(?P<locale>[A-Za-z]{2,3}-[A-Za-z]{2,3})>")
 
 
 def clean_nemotron_text(raw_text: str) -> str:
-    cleaned = _LOCALE_TAG_RE.sub("", raw_text)
+    cleaned = LOCALE_TAG_RE.sub("", raw_text)
     return re.sub(r"[ \t]{2,}", " ", cleaned).strip()
 
 
@@ -17,7 +17,7 @@ def resolve_nemotron_locale(
     raw_text: str, requested_language: str | None
 ) -> str | None:
     detected: dict[str, str] = {}
-    for match in _LOCALE_TAG_RE.finditer(raw_text):
+    for match in LOCALE_TAG_RE.finditer(raw_text):
         locale = match.group("locale")
         detected.setdefault(locale.casefold(), locale)
     if len(detected) == 1:

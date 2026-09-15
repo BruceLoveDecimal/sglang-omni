@@ -9,7 +9,7 @@ import pytest
 from sglang_omni.serve import speech_to_text
 from sglang_omni.serve.transcription_adapters import resolve_adapter
 
-_ARCHITECTURES = ["Nemotron3_5AsrForRNNT"]
+ARCHITECTURES = ["Nemotron3_5AsrForRNNT"]
 
 
 @pytest.mark.parametrize("response_format", ["text", "json", "verbose_json"])
@@ -21,7 +21,7 @@ def test_response_assembler_cleans_text_and_populates_language(response_format) 
         task="transcribe",
         language="auto",
         audio_bytes=b"invalid",
-        architectures=_ARCHITECTURES,
+        architectures=ARCHITECTURES,
         duration_s=1.0,
     )
     if response_format == "text":
@@ -35,7 +35,7 @@ def test_response_assembler_cleans_text_and_populates_language(response_format) 
 
 def test_plain_text_hook_does_not_change_existing_adapter_output() -> None:
     assert (
-        resolve_adapter(_ARCHITECTURES).resolve_language(
+        resolve_adapter(ARCHITECTURES).resolve_language(
             "hello <en-US> ni hao <zh-CN>", "auto"
         )
         is None
