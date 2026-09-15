@@ -128,7 +128,7 @@ def test_local_model_preserves_streaming_results_and_caches_when_batched(
     runner = object.__new__(Nemotron3_5ASRModelRunner)
     runner.model = loaded_model.eval()
     runner.device = torch.device("cpu")
-    runner._model_lock = threading.Lock()
+    runner.model_lock = threading.Lock()
     runner.processor = SimpleNamespace(
         default_num_lookahead_tokens=0,
         batch_decode=lambda rows, **kwargs: [str(row.tolist()) for row in rows],

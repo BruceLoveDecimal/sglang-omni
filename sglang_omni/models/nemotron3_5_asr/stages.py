@@ -46,7 +46,7 @@ def create_nemotron3_5_asr_executor(
     )
 
     def _run_one(payload: StagePayload) -> StagePayload:
-        return runner.run_one(build_request(payload))
+        return runner.run_batch([build_request(payload)])[0]
 
     def _run_batch(
         payloads: Sequence[StagePayload],

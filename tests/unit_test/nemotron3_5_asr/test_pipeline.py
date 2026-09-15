@@ -28,8 +28,18 @@ def test_config_leaves_defaults_to_factory() -> None:
 
 
 @pytest.mark.parametrize("model_error", [False, True])
-def test_factory_batches_valid_requests_and_isolates_errors(
-    monkeypatch, model_error
+@pytest.mark.parametrize(
+    "request_languages",
+    [
+        [("a", "auto")],
+        [("a", "auto"), ("bad", "unknown"), ("b", "auto")],
+    ],
+    ids=["single", "mixed_batch"],
+)
+def test_factory_transcribes_single_and_batched_requests(
+    monkeypatch: pytest.MonkeyPatch,
+    model_error: bool,
+    request_languages: list[tuple[str, str]],
 ) -> None:
     runner = Mock(spec=stages.Nemotron3_5ASRModelRunner)
     runner.prompt_dictionary = {"auto": 101}
@@ -67,11 +77,11 @@ def test_factory_batches_valid_requests_and_isolates_errors(
             request=OmniRequest(inputs=b"audio", params={"language": language}),
             data=None,
         )
-        for name, language in [("a", "auto"), ("bad", "unknown"), ("b", "auto")]
+        for name, language in request_languages
     ]
     loop = asyncio.new_event_loop()
     try:
-        scheduler._run_non_streaming_batch(
+        scheduler.run_non_streaming_batch(
             [
                 IncomingMessage(payload.request_id, "new_request", payload)
                 for payload in payloads
@@ -80,21 +90,23 @@ def test_factory_batches_valid_requests_and_isolates_errors(
         )
     finally:
         loop.close()
+        scheduler.stop()
     outputs = {
         message.request_id: message
         for message in [scheduler.outbox.get_nowait() for _ in payloads]
     }
-    assert isinstance(outputs["bad"].data, ValueError)
-    assert outputs["bad"].type == "error"
-    assert [
-        request.stage_payload.request_id
-        for request in runner.run_batch.call_args.args[0]
-    ] == ["a", "b"]
-    for name in ("a", "b"):
+    for name, language in request_languages:
+        if language != "auto":
+            assert isinstance(outputs[name].data, ValueError)
+            assert outputs[name].type == "error"
+            continue
         assert outputs[name].type == ("error" if model_error else "result")
         if model_error:
             assert str(outputs[name].data) == "model failed"
         else:
             assert outputs[name].data.request_id == name
-    scheduler.stop()
+    assert [
+        request.stage_payload.request_id
+        for request in runner.run_batch.call_args.args[0]
+    ] == [name for name, language in request_languages if language == "auto"]
     runner.close.assert_called_once()
