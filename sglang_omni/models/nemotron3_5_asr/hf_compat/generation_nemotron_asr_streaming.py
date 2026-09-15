@@ -228,10 +228,9 @@ class NemotronAsrStreamingGenerationMixin(ParakeetRNNTGenerationMixin):
             NemotronAsrStreamingEncoderModelOutput,
         )
 
-        # Bypass ParakeetRNNTGenerationMixin's `prepare_inputs_for_generation` (it would build a
-        # `ParakeetEncoderModelOutput`, which `NemotronAsrStreamingForRNNT.forward` does not recognize via isinstance
-        # and would mangle into `pooler_output=None`). Go straight to the base GenerationMixin and select the
-        # current encoder frame into a `NemotronAsrStreamingEncoderModelOutput`.
+        # Select the current encoder frame into the streaming output type used by
+        # Nemotron 3.5, bypassing ParakeetRNNTGenerationMixin's
+        # `prepare_inputs_for_generation`, which builds a `ParakeetEncoderModelOutput`.
         model_inputs = GenerationMixin.prepare_inputs_for_generation(
             self, input_ids, *args, **kwargs
         )

@@ -19,6 +19,12 @@ load the checkpoint's nested feature extractor without mutating global Auto
 mappings, and reuse Transformers 5.12.1's Parakeet generation implementation
 with only the 5.13 cache-aware encoder-kwargs delta.
 
+The backport omits the older `NemotronAsrStreaming` RNN-T model, decoder,
+joint network, output type, and top-level config. Nemotron 3.5 defines its
+own RNN-T head and config; the shared encoder, encoder config, generation
+mixin, and decoder cache remain. The encoder base config annotation is
+narrowed to `NemotronAsrStreamingEncoderConfig`.
+
 Regenerate this directory from the pinned upstream commit and reapply those
-small compatibility changes when updating it. Remove the backport once the
-repository dependency moves to Transformers 5.13 or newer.
+compatibility changes and scope reductions when updating it. Remove the
+backport once the repository dependency moves to Transformers 5.13 or newer.

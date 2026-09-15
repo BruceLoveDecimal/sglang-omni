@@ -29,7 +29,6 @@ from torch import nn
 from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
-from transformers.generation import GenerationMode
 from transformers.integrations import use_kernel_func_from_hub, use_kernelized_func
 from transformers.masking_utils import create_bidirectional_mask
 from transformers.modeling_layers import GradientCheckpointingLayer
@@ -46,14 +45,7 @@ from transformers.utils import (
 from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
 
-from .configuration_nemotron_asr_streaming import (
-    NemotronAsrStreamingConfig,
-    NemotronAsrStreamingEncoderConfig,
-)
-from .generation_nemotron_asr_streaming import (
-    NemotronAsrStreamingGenerationMixin,
-    NemotronAsrStreamingRNNTDecoderCache,
-)
+from .configuration_nemotron_asr_streaming import NemotronAsrStreamingEncoderConfig
 
 logger = logging.get_logger(__name__)
 
@@ -942,7 +934,7 @@ class NemotronAsrStreamingEncoderBlock(GradientCheckpointingLayer):
 
 @auto_docstring
 class NemotronAsrStreamingPreTrainedModel(PreTrainedModel):
-    config: NemotronAsrStreamingConfig
+    config: NemotronAsrStreamingEncoderConfig
     base_model_prefix = "model"
     main_input_name = "input_features"
     input_modalities = "audio"
@@ -1221,220 +1213,8 @@ class NemotronAsrStreamingEncoder(NemotronAsrStreamingPreTrainedModel):
         return left_context, num_lookahead_tokens
 
 
-@dataclass
-class NemotronAsrStreamingRNNTOutput(BaseModelOutputWithPooling):
-    r"""
-    encoder_past_key_values (`Cache`, *optional*):
-        Updated encoder attention K/V sliding-window cache, returned when encoding audio with `use_cache=True`
-        (cache-aware streaming). Pass it to the next chunk's forward.
-    padding_cache (`NemotronAsrStreamingEncoderCausalConvPaddingCache`, *optional*):
-        Updated unified streaming conv cache (subsampling Conv2d + conformer depthwise Conv1d), returned when
-        encoding audio with `use_cache=True`. Pass it to the next chunk's forward.
-    """
-
-    loss: torch.FloatTensor | None = None
-    logits: torch.FloatTensor | None = None
-    decoder_cache: NemotronAsrStreamingRNNTDecoderCache | None = None
-
-    encoder_past_key_values: Cache | None = None
-    padding_cache: NemotronAsrStreamingEncoderCausalConvPaddingCache | None = None
-
-
-class NemotronAsrStreamingRNNTDecoder(nn.Module):
-    """LSTM-based prediction network For RNN-T"""
-
-    def __init__(self, config: NemotronAsrStreamingConfig):
-        super().__init__()
-        self.blank_token_id = config.blank_token_id
-        self.embedding = nn.Embedding(config.vocab_size, config.decoder_hidden_size)
-        self.lstm = nn.LSTM(
-            input_size=config.decoder_hidden_size,
-            hidden_size=config.decoder_hidden_size,
-            num_layers=config.num_decoder_layers,
-            batch_first=True,
-        )
-        self.decoder_projector = nn.Linear(
-            config.decoder_hidden_size, config.decoder_hidden_size
-        )
-
-    def forward(
-        self,
-        input_ids: torch.LongTensor,
-        cache: NemotronAsrStreamingRNNTDecoderCache | None = None,
-    ) -> torch.Tensor:
-        if cache is not None:
-            blank_mask = input_ids[:, -1] == self.blank_token_id
-            # All-blank fast path: skip decoder when all batch elements predict blank
-            if cache.is_initialized and blank_mask.all():
-                return cache.cache
-
-        embeddings = self.embedding(input_ids)
-
-        # Get cached hidden/cell states if available, otherwise initialize with NemotronAsrStreamingRNNTDecoderCache
-        if cache is not None:
-            was_initialized = cache.is_initialized
-            if not was_initialized:
-                cache.lazy_initialization(embeddings)
-            hidden_cell_states = (cache.hidden_state, cache.cell_state)
-        else:
-            hidden_cell_states = None
-
-        lstm_output, (hidden_state, cell_state) = self.lstm(
-            embeddings, hidden_cell_states
-        )
-        decoder_output = self.decoder_projector(lstm_output)
-
-        if cache is not None:
-            mask = ~blank_mask if was_initialized else None
-            cache.update(decoder_output, hidden_state, cell_state, mask=mask)
-            return cache.cache
-
-        return decoder_output
-
-
-class NemotronAsrStreamingRNNTJointNetwork(nn.Module):
-    """Joint network that combines encoder and decoder outputs to predict token logits."""
-
-    def __init__(self, config: NemotronAsrStreamingConfig):
-        super().__init__()
-        self.activation = ACT2FN[config.hidden_act]
-        self.head = nn.Linear(config.decoder_hidden_size, config.vocab_size)
-        self.vocab_size = config.vocab_size
-
-    def forward(
-        self,
-        decoder_hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        joint_output = self.activation(encoder_hidden_states + decoder_hidden_states)
-        return self.head(joint_output)
-
-
-@auto_docstring(
-    custom_intro="""
-    NemotronAsrStreaming Encoder with an RNN-T (Recurrent Neural Network Transducer) head.
-    """
-)
-class NemotronAsrStreamingForRNNT(
-    NemotronAsrStreamingPreTrainedModel, NemotronAsrStreamingGenerationMixin
-):
-    config: NemotronAsrStreamingConfig
-    _no_split_modules = ["NemotronAsrStreamingRNNTDecoder"]
-    _supported_generation_modes = [GenerationMode.GREEDY_SEARCH]
-
-    def __init__(self, config: NemotronAsrStreamingConfig):
-        super().__init__(config)
-        self.encoder = NemotronAsrStreamingEncoder(config.encoder_config)
-        self.encoder_projector = nn.Linear(
-            config.encoder_config.hidden_size, config.decoder_hidden_size
-        )
-        self.decoder = NemotronAsrStreamingRNNTDecoder(config)
-        self.joint = NemotronAsrStreamingRNNTJointNetwork(config)
-        self.max_symbols_per_step = config.max_symbols_per_step  # used in generation
-
-        self.post_init()
-
-    @can_return_tuple
-    def get_audio_features(
-        self,
-        input_features: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> NemotronAsrStreamingEncoderModelOutput:
-        encoder_outputs = self.encoder(
-            input_features=input_features,
-            attention_mask=attention_mask,
-            **kwargs,
-        )
-        encoder_outputs.pooler_output = self.encoder_projector(
-            encoder_outputs.last_hidden_state
-        )
-        return encoder_outputs
-
-    @auto_docstring
-    @can_return_tuple
-    def forward(
-        self,
-        input_features: torch.Tensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        decoder_input_ids: torch.LongTensor | None = None,
-        decoder_cache: NemotronAsrStreamingRNNTDecoderCache | None = None,
-        use_decoder_cache: bool | None = None,
-        encoder_outputs: NemotronAsrStreamingEncoderModelOutput | None = None,
-        labels: torch.Tensor | None = None,
-        num_lookahead_tokens: int | None = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> NemotronAsrStreamingRNNTOutput:
-        r"""
-        decoder_input_ids (`torch.LongTensor` of shape `(batch_size, 1)`, *optional*):
-            Decoder input token ids for single-step inference.
-        decoder_cache (`NemotronAsrStreamingRNNTDecoderCache`, *optional*):
-            Decoder LSTM cache. Reused on blank predictions to skip the LSTM step.
-        use_decoder_cache (`bool`, *optional*):
-            Whether to allocate and use a decoder cache when none is provided.
-        encoder_outputs (`NemotronAsrStreamingEncoderModelOutput`, *optional*):
-            Pre-computed encoder outputs (last_hidden_state, pooler_output, ...).
-        num_lookahead_tokens (`int`, *optional*):
-            Right attention context (lookahead, in subsampled encoder frames) forwarded to the encoder.
-            Defaults to `config.encoder_config.default_num_lookahead_tokens`.
-
-        Example:
-
-        ```python
-        >>> from transformers import AutoProcessor, NemotronAsrStreamingForRNNT
-        >>> from datasets import load_dataset, Audio
-
-        >>> model_id = "nvidia/nemotron-speech-streaming-en-0.6b"
-        >>> processor = AutoProcessor.from_pretrained(model_id)
-        >>> model = NemotronAsrStreamingForRNNT.from_pretrained(model_id)
-
-        >>> ds = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
-        >>> ds = ds.cast_column("audio", Audio(sampling_rate=processor.feature_extractor.sampling_rate))
-
-        >>> inputs = processor(ds[0]["audio"]["array"])
-        >>> outputs = model(**inputs)
-        ```
-        """
-        if encoder_outputs is None:
-            encoder_outputs = self.get_audio_features(
-                input_features=input_features,
-                attention_mask=attention_mask,
-                num_lookahead_tokens=num_lookahead_tokens,
-                **kwargs,
-            )
-
-        if use_decoder_cache and decoder_cache is None:
-            decoder_cache = NemotronAsrStreamingRNNTDecoderCache()
-
-        decoder_hidden_states = self.decoder(decoder_input_ids, cache=decoder_cache)
-        logits = self.joint(
-            encoder_hidden_states=encoder_outputs.pooler_output[:, :, None, :],
-            decoder_hidden_states=decoder_hidden_states[:, None, :, :],
-        ).squeeze(2)
-
-        loss = None
-        if labels is not None:
-            loss = self.loss_function(
-                logits=logits, labels=labels, encoder_outputs=encoder_outputs
-            )
-
-        return NemotronAsrStreamingRNNTOutput(
-            loss=loss,
-            logits=logits,
-            last_hidden_state=encoder_outputs.last_hidden_state,
-            pooler_output=encoder_outputs.pooler_output,
-            hidden_states=encoder_outputs.hidden_states,
-            attentions=encoder_outputs.attentions,
-            decoder_cache=decoder_cache,
-            encoder_past_key_values=encoder_outputs.past_key_values,
-            padding_cache=encoder_outputs.padding_cache,
-        )
-
-
 __all__ = [
     "NemotronAsrStreamingEncoderModelOutput",
-    "NemotronAsrStreamingRNNTOutput",
-    "NemotronAsrStreamingForRNNT",
     "NemotronAsrStreamingEncoder",
     "NemotronAsrStreamingPreTrainedModel",
 ]
