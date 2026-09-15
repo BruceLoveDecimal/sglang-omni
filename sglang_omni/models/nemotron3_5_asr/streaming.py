@@ -48,23 +48,6 @@ class Nemotron3_5ASRAudioWindow:
     waveform: np.ndarray
     model_chunk_index: int
     is_first: bool
-    ready_wait_s: float
-
-
-@dataclass(slots=True)
-class Nemotron3_5ASRStreamMetrics:
-    request_started_s: float = field(default_factory=time.perf_counter)
-    input_done_s: float | None = None
-    first_text_s: float | None = None
-    finalized_s: float | None = None
-    model_compute_s: float = 0.0
-    packet_count: int = 0
-    model_chunk_count: int = 0
-    cache_reuse_count: int = 0
-    max_queue_depth: int = 0
-    batch_sizes: list[int] = field(default_factory=list)
-    chunk_latency_ms: list[float] = field(default_factory=list)
-    chunk_ready_wait_ms: list[float] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -81,13 +64,11 @@ class Nemotron3_5ASRStreamState:
     model_chunk_index: int = 0
     next_mel_frame: int = 0
     is_input_done: bool = False
-    ready_since_s: float | None = None
     raw_text: str = ""
     clean_text: str = ""
     detected_language: str | None = None
-    metrics: Nemotron3_5ASRStreamMetrics = field(
-        default_factory=Nemotron3_5ASRStreamMetrics
-    )
+    request_started_s: float = field(default_factory=time.perf_counter)
+    model_compute_s: float = 0.0
 
     def append_pcm16(
         self, tensor: torch.Tensor, metadata: Mapping[str, object]
@@ -127,9 +108,6 @@ class Nemotron3_5ASRStreamState:
             packet_bytes = pcm_samples.numpy().tobytes()
         self.pcm_bytes.extend(packet_bytes)
         self.total_samples = len(self.pcm_bytes) // PCM16_BYTES_PER_SAMPLE
-        now = time.perf_counter()
-        self.metrics.packet_count += 1
-        self.mark_ready(now)
 
     @property
     def has_reached_decode_limit(self) -> bool:
@@ -148,8 +126,6 @@ class Nemotron3_5ASRStreamState:
                 "Nemotron streaming input ends with an incomplete PCM16 sample"
             )
         self.is_input_done = True
-        self.metrics.input_done_s = time.perf_counter()
-        self.mark_ready(self.metrics.input_done_s)
 
     def next_window_bounds(self) -> tuple[int, int]:
         if self.model_chunk_index == 0:
@@ -167,20 +143,12 @@ class Nemotron3_5ASRStreamState:
             return True
         return finalizing and self.total_samples > self.covered_audio_end
 
-    def mark_ready(self, now: float) -> None:
-        if self.ready_since_s is not None or not self.has_ready_window(
-            finalizing=self.is_input_done
-        ):
-            return
-        self.ready_since_s = now
-
     def pop_ready_window(
         self, *, finalizing: bool = False
     ) -> Nemotron3_5ASRAudioWindow:
         assert self.has_ready_window(
             finalizing=finalizing
         ), f"Nemotron stream {self.request_id!r} has no ready window"
-        now = time.perf_counter()
         start, end = self.next_window_bounds()
         window_samples = end - start
         source_start = max(start, 0)
@@ -197,16 +165,10 @@ class Nemotron3_5ASRStreamState:
             (left_padding, right_padding),
         ).astype(np.float32, copy=False)
         is_first = self.model_chunk_index == 0
-        ready_wait_s = (
-            max(now - self.ready_since_s, 0.0)
-            if self.ready_since_s is not None
-            else 0.0
-        )
         window = Nemotron3_5ASRAudioWindow(
             waveform=waveform,
             model_chunk_index=self.model_chunk_index,
             is_first=is_first,
-            ready_wait_s=ready_wait_s,
         )
 
         self.covered_audio_end = max(
@@ -217,8 +179,6 @@ class Nemotron3_5ASRStreamState:
             self.next_mel_frame = self.spec.first_frames
         else:
             self.next_mel_frame += self.spec.subsequent_frames
-        self.ready_since_s = None
-        self.mark_ready(now)
         return window
 
 
@@ -249,17 +209,8 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
         self.prompt_dictionary = dict(prompt_dictionary)
         self.stream_states: dict[str, Nemotron3_5ASRStreamState] = {}
         self.is_closed = False
-        self.aggregate_metrics: dict[str, int | float] = {
-            "input_packets": 0,
-            "model_chunks": 0,
-            "model_batches": 0,
-            "cache_reuses": 0,
-            "audio_samples": 0,
-            "model_compute_s": 0.0,
-            "max_batch_size": 0,
-            "completed_streams": 0,
-            "aborted_streams": 0,
-        }
+        self.completed_streams = 0
+        self.aborted_streams = 0
         self.stream_chunk_batch_max = max_batch_size
         super().__init__(
             compute_fn,
@@ -314,21 +265,13 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
                         raise TypeError(
                             "Nemotron streaming chunks must carry torch.Tensor"
                         )
-                    samples_before = state.total_samples
                     state.append_pcm16(item.data, metadata)
                 except Exception as exc:
                     self.emit_error(request_id, exc)
                     self.abort_state(request_id)
-                    self.aggregate_metrics["aborted_streams"] += 1
+                    self.aborted_streams += 1
                     failed.append(request_id)
                     continue
-                state.metrics.max_queue_depth = max(
-                    state.metrics.max_queue_depth, self.inbox.qsize()
-                )
-                self.aggregate_metrics["input_packets"] += 1
-                self.aggregate_metrics["audio_samples"] += (
-                    state.total_samples - samples_before
-                )
                 touched.add(request_id)
             ready = [
                 (request_id, state, state.pop_ready_window())
@@ -374,8 +317,8 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
                         requested_languages=[state.language for _, state, _ in batch],
                         max_new_tokens=[state.max_new_tokens for _, state, _ in batch],
                     )
-                    self.record_batch(batch, batch_result)
                     for index, (request_id, state, _) in enumerate(batch):
+                        state.model_compute_s += batch_result.elapsed_s / len(batch)
                         message = self.partial_message(state, batch_result, index)
                         if message is None or self.is_aborted(request_id):
                             continue
@@ -384,35 +327,9 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
                     for request_id, _, _ in batch:
                         self.emit_error(request_id, exc)
                         self.abort_state(request_id)
-                        self.aggregate_metrics["aborted_streams"] += 1
+                        self.aborted_streams += 1
                         failed.append(request_id)
         return failed
-
-    def record_batch(
-        self,
-        batch: Sequence[
-            tuple[str, Nemotron3_5ASRStreamState, Nemotron3_5ASRAudioWindow]
-        ],
-        batch_result: Nemotron3_5ASRStreamingBatchResult,
-    ) -> None:
-        batch_size = len(batch)
-        self.aggregate_metrics["model_batches"] += 1
-        self.aggregate_metrics["model_chunks"] += batch_size
-        self.aggregate_metrics["model_compute_s"] += batch_result.elapsed_s
-        self.aggregate_metrics["max_batch_size"] = max(
-            self.aggregate_metrics["max_batch_size"], batch_size
-        )
-        per_request_compute_s = batch_result.elapsed_s / batch_size
-        for _, state, window in batch:
-            state.metrics.model_compute_s += per_request_compute_s
-            state.metrics.model_chunk_count += 1
-            state.metrics.batch_sizes.append(batch_size)
-            state.metrics.chunk_latency_ms.append(batch_result.elapsed_s * 1000.0)
-            state.metrics.chunk_ready_wait_ms.append(window.ready_wait_s * 1000.0)
-            if window.model_chunk_index == 0:
-                continue
-            state.metrics.cache_reuse_count += 1
-            self.aggregate_metrics["cache_reuses"] += 1
 
     def partial_message(
         self,
@@ -431,10 +348,6 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
                 "Nemotron streaming transcript changed a previously emitted prefix"
             )
         text_delta = state.clean_text[len(previous_text) :]
-        now = time.perf_counter()
-        state.metrics.first_text_s = (
-            now if state.metrics.first_text_s is None else state.metrics.first_text_s
-        )
         return OutgoingMessage(
             request_id=state.request_id,
             type="stream",
@@ -445,7 +358,6 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
                 "language": state.detected_language,
                 "token_ids": list(state.decode.tokens),
                 "modality": "text",
-                "metrics": self.metrics_snapshot(state, now=now),
             },
             metadata={"modality": "text"},
         )
@@ -469,31 +381,27 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
                 requested_languages=[state.language],
                 max_new_tokens=[state.max_new_tokens],
             )
-            self.record_batch([(request_id, state, window)], batch_result)
+            state.model_compute_s += batch_result.elapsed_s
             partial = self.partial_message(state, batch_result, 0)
             if partial is None:
                 continue
             messages.append(partial)
 
-        state.metrics.finalized_s = time.perf_counter()
-        self.aggregate_metrics["completed_streams"] += 1
-        metrics = self.metrics_snapshot(state, now=state.metrics.finalized_s)
+        finalized_s = time.perf_counter()
+        self.completed_streams += 1
         final_payload = build_nemotron3_5_asr_result(
             state.payload,
             raw_text=state.raw_text,
             requested_language=state.language,
             duration_s=state.total_samples / state.spec.sample_rate,
-            asr_latency_s=max(
-                state.metrics.finalized_s - state.metrics.request_started_s, 0.0
-            ),
-            model_latency_s=state.metrics.model_compute_s,
+            asr_latency_s=max(finalized_s - state.request_started_s, 0.0),
+            model_latency_s=state.model_compute_s,
             extra_data={
                 "token_ids": list(state.decode.tokens),
                 "durations": list(state.decode.durations),
                 "encoder_frames": state.decode.encoder_frames,
                 "decoder_steps": state.decode.decoder_steps,
                 "streaming_latency_ms": state.spec.streaming_latency_ms,
-                "metrics": metrics,
             },
         )
         messages.append(
@@ -505,59 +413,14 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
         )
         return messages
 
-    def metrics_snapshot(
-        self, state: Nemotron3_5ASRStreamState, *, now: float
-    ) -> dict[str, float | int | list[float] | list[int] | None]:
-        audio_s = state.total_samples / state.spec.sample_rate
-        compute_s = state.metrics.model_compute_s
-        elapsed_s = max(now - state.metrics.request_started_s, 0.0)
-        ttft_s = (
-            state.metrics.first_text_s - state.metrics.request_started_s
-            if state.metrics.first_text_s is not None
-            else None
-        )
-        if (
-            state.metrics.finalized_s is not None
-            and state.metrics.input_done_s is not None
-        ):
-            speech_end_to_final_s = (
-                state.metrics.finalized_s - state.metrics.input_done_s
-            )
-        else:
-            speech_end_to_final_s = None
-        latencies = state.metrics.chunk_latency_ms
-        if latencies:
-            p50, p99 = np.percentile(
-                latencies, [50, 99], method="inverted_cdf"
-            ).tolist()
-        else:
-            p50, p99 = None, None
-        return {
-            "ttft_s": ttft_s,
-            "speech_end_to_final_s": speech_end_to_final_s,
-            "elapsed_s": elapsed_s,
-            "model_compute_s": compute_s,
-            "rtf": compute_s / audio_s if audio_s > 0 else None,
-            "rtfx": audio_s / compute_s if compute_s > 0 else None,
-            "throughput_audio_s_per_s": audio_s / elapsed_s if elapsed_s > 0 else None,
-            "chunk_latency_ms": list(latencies),
-            "chunk_latency_p50_ms": p50,
-            "chunk_latency_p99_ms": p99,
-            "chunk_ready_wait_ms": list(state.metrics.chunk_ready_wait_ms),
-            "input_packets": state.metrics.packet_count,
-            "model_chunks": state.metrics.model_chunk_count,
-            "cache_reuses": state.metrics.cache_reuse_count,
-            "batch_sizes": list(state.metrics.batch_sizes),
-            "max_queue_depth": state.metrics.max_queue_depth,
-        }
-
     def clear_stream_state(self, request_id: str) -> None:
         self.stream_states.pop(request_id, None)
 
-    def stats(self) -> dict[str, int | float]:
+    def stats(self) -> dict[str, int]:
         with self.state_lock:
             return {
-                **self.aggregate_metrics,
+                "completed_streams": self.completed_streams,
+                "aborted_streams": self.aborted_streams,
                 "active_streams": len(self.stream_states),
                 "inbox_depth": self.inbox.qsize(),
             }
@@ -588,7 +451,6 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
 
 __all__ = [
     "Nemotron3_5ASRAudioWindow",
-    "Nemotron3_5ASRStreamMetrics",
     "Nemotron3_5ASRStreamState",
     "Nemotron3_5ASRStreamingChunkSpec",
     "Nemotron3_5ASRStreamingScheduler",

@@ -196,6 +196,7 @@ def test_scheduler_batches_one_window_per_request_and_cleans_state() -> None:
     messages = [scheduler.outbox.get_nowait() for _ in range(4)]
     assert scheduler.outbox.empty()
     assert [message.request_id for message in messages] == ["a", "b", "a", "b"]
+    assert all("metrics" not in message.data for message in messages)
 
     scheduler.handle_stream_done("a")
     scheduler.handle_stream_done("b")
@@ -213,6 +214,12 @@ def test_scheduler_batches_one_window_per_request_and_cleans_state() -> None:
         payload.data["model_latency_s"] == pytest.approx(0.001)
         for payload in final_payloads
     )
+    assert all(
+        payload.data["usage"]["engine_time_s"] == pytest.approx(0.001)
+        for payload in final_payloads
+    )
+    assert all("metrics" not in payload.data for payload in final_payloads)
+    assert scheduler.stats()["completed_streams"] == 2
     assert scheduler.stats()["active_streams"] == 0
 
 
@@ -228,6 +235,11 @@ def test_scheduler_processes_at_most_one_window_per_request_per_input_batch() ->
     assert [len(batch) for batch in runner.batches] == [1]
     scheduler.handle_stream_done("r")
     assert [len(batch) for batch in runner.batches] == [1, 1, 1, 1, 1]
+    messages = [scheduler.outbox.get_nowait() for _ in range(scheduler.outbox.qsize())]
+    assert messages[-1].type == "result"
+    result = messages[-1].data.data
+    assert result["model_latency_s"] == pytest.approx(0.005)
+    assert result["usage"]["engine_time_s"] == pytest.approx(0.005)
 
 
 def test_stream_done_rejects_incomplete_pcm16_sample() -> None:
