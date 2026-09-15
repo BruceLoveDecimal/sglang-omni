@@ -6,7 +6,10 @@ import json
 import threading
 from types import SimpleNamespace
 
+import pytest
 import torch
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
 from transformers.generation import GenerationMixin
 
 from sglang_omni.models.nemotron3_5_asr.hf_compat import (
@@ -77,6 +80,23 @@ def test_processor_loads_nested_feature_extractor_without_auto_registration(
     assert processor.tokenizer is tokenizer
     assert processor.blank_token_id == 13087
     assert processor.default_num_lookahead_tokens == 3
+
+
+def test_processor_text_decode_preserves_repeated_tokens() -> None:
+    tokenizer = processing.ParakeetTokenizer(
+        tokenizer_object=Tokenizer(WordLevel({"<blank>": 0, "hello": 1})),
+        pad_token="<blank>",
+    )
+    processor = Nemotron3_5AsrProcessor(
+        feature_extractor=NemotronAsrStreamingFeatureExtractor(), tokenizer=tokenizer
+    )
+    token_ids = [1, 1, 0, 1]
+    assert processor.decode(token_ids) == "hello hello hello"
+    assert processor.batch_decode([token_ids]) == ["hello hello hello"]
+    assert processor.decode(token_ids, group_tokens=True) == "hello hello"
+    assert processor.batch_decode([token_ids], group_tokens=True) == ["hello hello"]
+    with pytest.raises(ValueError, match="timestamps are not supported"):
+        processor.decode(token_ids, durations=torch.ones(len(token_ids)))
 
 
 def test_local_model_preserves_streaming_results_and_caches_when_batched(

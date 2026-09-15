@@ -25,6 +25,10 @@ own RNN-T head and config; the shared encoder, encoder config, generation
 mixin, and decoder cache remain. The encoder base config annotation is
 narrowed to `NemotronAsrStreamingEncoderConfig`.
 
+The processor retains plain-text `decode` and `batch_decode`, including
+RNN-T repeated-token handling, but omits token-level timestamp post-processing.
+Passing non-`None` `durations` to `decode` is unsupported and raises `ValueError`.
+
 Regenerate this directory from the pinned upstream commit and reapply those
 compatibility changes and scope reductions when updating it. Remove the
 backport once the repository dependency moves to Transformers 5.13 or newer.

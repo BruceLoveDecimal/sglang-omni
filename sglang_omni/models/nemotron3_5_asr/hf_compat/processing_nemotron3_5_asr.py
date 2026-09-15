@@ -20,7 +20,6 @@
 # limitations under the License.
 
 
-from tokenizers.decoders import DecodeStream
 from transformers import ParakeetTokenizer
 from transformers.audio_utils import AudioInput, make_list_of_audio
 from transformers.processing_utils import ProcessingKwargs, ProcessorMixin, Unpack
@@ -380,65 +379,12 @@ class Nemotron3_5AsrProcessor(ProcessorMixin):
         return self.tokenizer.batch_decode(*args, **kwargs)
 
     def decode(self, *args, durations=None, **kwargs):
-        """
-        Forward arguments to [`~PreTrainedTokenizer.decode`] and post-process the token-level timestamps (if
-        `durations` are provided) as in the NeMo library.
-        """
+        """Decode RNN-T text without token-level timestamp post-processing."""
+        if durations is not None:
+            raise ValueError("Token-level timestamps are not supported")
         # RNN-T keeps repeated tokens (each is a separate emission), so consecutive identical tokens are not merged.
         kwargs.setdefault("group_tokens", False)
-        decoded = self.tokenizer.decode(*args, **kwargs)
-
-        if durations is not None:
-            token_ids = args[0]
-            # Derive per-step frame indices from cumulative sum of durations.
-            timestamps = durations.cumsum(dim=-1) - durations
-
-            output_kwargs = self._merge_kwargs(
-                Nemotron3_5AsrProcessorKwargs,
-                tokenizer_init_kwargs=self.tokenizer.init_kwargs,
-            )
-            frame_rate = (
-                self.feature_extractor.hop_length
-                / self.feature_extractor.sampling_rate
-                * output_kwargs["audio_kwargs"]["subsampling_factor"]
-            )
-            # Filter padding/blank tokens and decode per sequence to keep track of token-level timestamps
-            # See `compute_rnnt_timestamps` in NeMo:
-            # https://github.com/NVIDIA-NeMo/NeMo/blob/1692a8fb97e1aadc883cfadd2a57c4e8a1b793aa/nemo/collections/asr/parts/submodules/rnnt_decoding.py#L993
-            skip_ids = {self.tokenizer.pad_token_id, self.blank_token_id}
-            proc_timestamps = []
-            for batch_ids, batch_timestamps in zip(token_ids, timestamps):
-                stream = DecodeStream(skip_special_tokens=True)
-                timestamp_dict = []
-                for i, token_id in enumerate(batch_ids):
-                    if int(token_id) in skip_ids:
-                        continue
-                    chunk = stream.step(self.tokenizer._tokenizer, int(token_id))
-                    if chunk is not None:
-                        # RNN-T tokens each span a single frame (their per-step value is a 0/1 encoder advance,
-                        # not a span).
-                        start = int(batch_timestamps[i])
-                        timestamp_dict.append(
-                            {
-                                "token": chunk,
-                                "start": start,
-                                "end": start + 1,
-                            }
-                        )
-                proc_timestamps.append(
-                    self._refine_timestamps(timestamp_dict, frame_rate)
-                )
-
-            return decoded, proc_timestamps
-        return decoded
-
-    def _refine_timestamps(self, char_offsets, frame_rate):
-        # RNN-T mirrors NeMo's raw char-level timestamps, which keep every token (punctuation included) at its
-        # own emitted frame. Only convert frame indices to seconds.
-        for offset in char_offsets:
-            offset["start"] = offset["start"] * frame_rate
-            offset["end"] = offset["end"] * frame_rate
-        return char_offsets
+        return self.tokenizer.decode(*args, **kwargs)
 
     def set_num_lookahead_tokens(self, num_lookahead_tokens: int):
         """
