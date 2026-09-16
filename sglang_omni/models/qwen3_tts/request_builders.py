@@ -846,7 +846,9 @@ class _Qwen3TTSRefCodeBatcher:
             batch.append(queued)
         return batch, shutdown
 
-    def _synchronize_outcomes(self) -> None:
+    def _synchronize_outcomes(
+        self, outcomes: dict[int, torch.Tensor | Exception]
+    ) -> None:
         # note (luojiaxuan): resolve futures only after the encode kernels
         # finish so consumer threads may use the codes on any stream. Waiting
         # on the dedicated stream's event leaves the default stream, where
@@ -855,6 +857,14 @@ class _Qwen3TTSRefCodeBatcher:
             handoff = torch.cuda.Event()
             handoff.record(self._encode_stream)
             handoff.synchronize()
+            return
+        accelerator_devices = {
+            outcome.device
+            for outcome in outcomes.values()
+            if not isinstance(outcome, Exception) and outcome.device.type != "cpu"
+        }
+        for device in accelerator_devices:
+            torch.get_device_module(device).current_stream(device).synchronize()
 
     def _encode_waveform(self, waveform: Any, sample_rate: int) -> torch.Tensor:
         """Codes (frames, quantizers) of one reference, frames = ceil(samples / hop)."""
@@ -900,7 +910,7 @@ class _Qwen3TTSRefCodeBatcher:
                         outcomes[index] = self._encode_waveform(waveform, sample_rate)
                     except Exception as exc:
                         outcomes[index] = exc
-            self._synchronize_outcomes()
+            self._synchronize_outcomes(outcomes)
             for index, (_, _, future) in enumerate(batch):
                 outcome = outcomes[index]
                 if isinstance(outcome, Exception):
