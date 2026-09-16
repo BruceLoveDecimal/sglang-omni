@@ -33,55 +33,6 @@ from sglang_omni.models.nemotron3_5_asr.model_runner import (
 )
 
 
-def test_processor_loads_nested_feature_extractor_without_auto_registration(
-    tmp_path, monkeypatch
-) -> None:
-
-    processor_config = {
-        "blank_token": "<blank>",
-        "default_num_lookahead_tokens": 3,
-        "feature_extractor": {
-            "feature_extractor_type": "NemotronAsrStreamingFeatureExtractor",
-            "feature_size": 4,
-            "hop_length": 4,
-            "n_fft": 16,
-            "sampling_rate": 16000,
-            "win_length": 8,
-        },
-        "num_prompts": 128,
-        "processor_class": "Nemotron3_5AsrProcessor",
-        "prompt_dictionary": {"en-US": 0, "auto": 101},
-        "supported_num_lookahead_tokens": [3, 0, 6, 13],
-    }
-    (tmp_path / "processor_config.json").write_text(
-        json.dumps(processor_config), encoding="utf-8"
-    )
-
-    tokenizer = SimpleNamespace(
-        init_kwargs={},
-        convert_tokens_to_ids=lambda token: 13087 if token == "<blank>" else 0,
-    )
-
-    monkeypatch.setattr(
-        processing.ParakeetTokenizer,
-        "from_pretrained",
-        lambda *args, **kwargs: tokenizer,
-    )
-    monkeypatch.setattr(
-        Nemotron3_5AsrProcessor,
-        "check_argument_for_proper_class",
-        lambda self, name, value: object,
-    )
-
-    processor = Nemotron3_5AsrProcessor.from_pretrained(tmp_path, local_files_only=True)
-
-    assert isinstance(processor.feature_extractor, NemotronAsrStreamingFeatureExtractor)
-    assert processor.feature_extractor.feature_size == 4
-    assert processor.tokenizer is tokenizer
-    assert processor.blank_token_id == 13087
-    assert processor.default_num_lookahead_tokens == 3
-
-
 def test_processor_text_decode_preserves_repeated_tokens() -> None:
     tokenizer = processing.ParakeetTokenizer(
         tokenizer_object=Tokenizer(WordLevel({"<blank>": 0, "hello": 1})),

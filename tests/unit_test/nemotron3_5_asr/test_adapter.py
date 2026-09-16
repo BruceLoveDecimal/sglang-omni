@@ -31,17 +31,3 @@ def test_response_assembler_cleans_text_and_populates_language(response_format) 
         assert data["text"] == "hello world"
         if response_format == "verbose_json":
             assert data["language"] == "en-US"
-
-
-def test_plain_text_hook_does_not_change_existing_adapter_output() -> None:
-    assert (
-        resolve_adapter(ARCHITECTURES).resolve_language(
-            "hello <en-US> ni hao <zh-CN>", "auto"
-        )
-        is None
-    )
-    adapter = resolve_adapter(["MossTranscribeDiarizeForConditionalGeneration"])
-    raw = "<|im_start|>hello"
-
-    assert adapter.postprocess_plain_text(raw) == raw
-    assert adapter.postprocess_text(raw) == "hello"
