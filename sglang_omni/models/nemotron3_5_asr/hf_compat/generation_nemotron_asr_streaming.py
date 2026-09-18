@@ -63,7 +63,7 @@ class NemotronAsrStreamingGenerationMixin(ParakeetRNNTGenerationMixin):
                 self._stream_exhausted = True
             else:
                 chunk = chunk.to(device=self.device, dtype=self.dtype)
-                self._validate_stream_chunk(chunk, is_first_chunk=False)
+                self.validate_stream_chunk(chunk, is_first_chunk=False)
                 chunk_outputs = self.get_audio_features(
                     input_features=chunk,
                     past_key_values=model_kwargs["encoder_past_key_values"],
@@ -116,7 +116,7 @@ class NemotronAsrStreamingGenerationMixin(ParakeetRNNTGenerationMixin):
             inputs_tensor,
         )
 
-    def _required_stream_chunk_frames(self, is_first_chunk: bool) -> int:
+    def required_stream_chunk_frames(self, is_first_chunk: bool) -> int:
         """
         The exact number of mel frames a streaming chunk must carry, given the attention right context.
 
@@ -134,14 +134,14 @@ class NemotronAsrStreamingGenerationMixin(ParakeetRNNTGenerationMixin):
             return 1 + subsampling_factor * right
         return subsampling_factor * (right + 1)
 
-    def _validate_stream_chunk(self, chunk, is_first_chunk: bool):
+    def validate_stream_chunk(self, chunk, is_first_chunk: bool):
         """
         Check a streaming mel chunk has exactly the size required by the attention right context.
 
         Cache-aware `chunked_limited` streaming consumes fixed-size chunks; a chunk of any other length
         (including a short final chunk) is an error. Pad the final chunk to the required length if needed.
         """
-        required = self._required_stream_chunk_frames(is_first_chunk)
+        required = self.required_stream_chunk_frames(is_first_chunk)
         n_frames = chunk.shape[1]
         if n_frames != required:
             which = "first" if is_first_chunk else "subsequent"
@@ -167,7 +167,7 @@ class NemotronAsrStreamingGenerationMixin(ParakeetRNNTGenerationMixin):
                     "The `input_features` generator did not yield any chunk."
                 ) from e
             first_chunk = first_chunk.to(device=self.device, dtype=self.dtype)
-            self._validate_stream_chunk(first_chunk, is_first_chunk=True)
+            self.validate_stream_chunk(first_chunk, is_first_chunk=True)
 
             model_kwargs.pop("input_features", None)
             model_kwargs["input_features_generator"] = generator

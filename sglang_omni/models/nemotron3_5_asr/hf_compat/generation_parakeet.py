@@ -21,11 +21,11 @@ from transformers.models.parakeet.generation_parakeet import (
     ParakeetRNNTGenerateOutput,
 )
 from transformers.models.parakeet.generation_parakeet import (
-    ParakeetRNNTGenerationMixin as _ParakeetRNNTGenerationMixin,
+    ParakeetRNNTGenerationMixin as TransformersParakeetRNNTGenerationMixin,
 )
 
 
-class ParakeetRNNTGenerationMixin(_ParakeetRNNTGenerationMixin):
+class ParakeetRNNTGenerationMixin(TransformersParakeetRNNTGenerationMixin):
     """Forward Nemotron streaming kwargs added by Transformers 5.13."""
 
     def _prepare_model_inputs(self, *args, **kwargs):

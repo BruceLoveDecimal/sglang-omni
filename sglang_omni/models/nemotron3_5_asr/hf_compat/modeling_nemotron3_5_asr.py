@@ -114,7 +114,7 @@ class Nemotron3_5AsrPreTrainedModel(PreTrainedModel):
 
         return lengths.to(dtype=torch.int)
 
-    def _get_output_attention_mask(
+    def get_output_attention_mask(
         self, attention_mask: torch.Tensor, target_length: int | None = None
     ):
         """

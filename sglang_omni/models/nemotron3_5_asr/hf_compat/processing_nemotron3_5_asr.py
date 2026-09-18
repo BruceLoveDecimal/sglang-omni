@@ -349,7 +349,7 @@ class Nemotron3_5AsrProcessor(ProcessorMixin):
             encodings = self.tokenizer(text, **output_kwargs["text_kwargs"])
 
         inputs["num_lookahead_tokens"] = self.default_num_lookahead_tokens
-        inputs["prompt_ids"] = self._resolve_prompt_ids(language, len(audio))
+        inputs["prompt_ids"] = self.resolve_prompt_ids(language, len(audio))
 
         if text is None:
             return inputs
@@ -406,7 +406,7 @@ class Nemotron3_5AsrProcessor(ProcessorMixin):
         self.default_num_lookahead_tokens = num_lookahead_tokens
 
     @property
-    def _subsampling_factor(self) -> int:
+    def subsampling_factor(self) -> int:
         output_kwargs = self._merge_kwargs(
             Nemotron3_5AsrProcessorKwargs,
             tokenizer_init_kwargs=self.tokenizer.init_kwargs,
@@ -414,10 +414,10 @@ class Nemotron3_5AsrProcessor(ProcessorMixin):
         return output_kwargs["audio_kwargs"]["subsampling_factor"]
 
     @property
-    def _encoder_frame_ms(self) -> float:
+    def encoder_frame_ms(self) -> float:
         """Duration in milliseconds of one subsampled encoder frame (`subsampling_factor * hop_length / sampling_rate`)."""
         return (
-            self._subsampling_factor
+            self.subsampling_factor
             * self.feature_extractor.hop_length
             / self.feature_extractor.sampling_rate
             * 1000
@@ -432,7 +432,7 @@ class Nemotron3_5AsrProcessor(ProcessorMixin):
         The model emits a chunk only once its last frame has its full lookahead, so the delay of a right
         context `r` is `(r + 1)` encoder frames, i.e. `(r + 1) * encoder_frame_ms`.
         """
-        return round((self.default_num_lookahead_tokens + 1) * self._encoder_frame_ms)
+        return round((self.default_num_lookahead_tokens + 1) * self.encoder_frame_ms)
 
     @property
     def supported_streaming_latencies_ms(self) -> dict[int, int]:
@@ -440,7 +440,7 @@ class Nemotron3_5AsrProcessor(ProcessorMixin):
         Mapping from each supported right attention context (`supported_num_lookahead_tokens`) to its streaming
         latency in milliseconds (`(num_lookahead_tokens + 1) * encoder_frame_ms`).
         """
-        frame_ms = self._encoder_frame_ms
+        frame_ms = self.encoder_frame_ms
         return {
             right: round((right + 1) * frame_ms)
             for right in self.supported_num_lookahead_tokens
@@ -452,7 +452,7 @@ class Nemotron3_5AsrProcessor(ProcessorMixin):
         Number of mel frames the first cache-aware streaming chunk must carry, for the model's
         `default_num_lookahead_tokens`: `1 + subsampling_factor * num_lookahead_tokens`.
         """
-        return 1 + self._subsampling_factor * self.default_num_lookahead_tokens
+        return 1 + self.subsampling_factor * self.default_num_lookahead_tokens
 
     @property
     def num_mel_frames_per_audio_chunk(self) -> int:
@@ -460,7 +460,7 @@ class Nemotron3_5AsrProcessor(ProcessorMixin):
         Number of mel frames each subsequent cache-aware streaming chunk must carry, for the model's
         `default_num_lookahead_tokens`: `subsampling_factor * (num_lookahead_tokens + 1)`.
         """
-        return self._subsampling_factor * (self.default_num_lookahead_tokens + 1)
+        return self.subsampling_factor * (self.default_num_lookahead_tokens + 1)
 
     @property
     def num_samples_first_audio_chunk(self) -> int:
@@ -485,7 +485,7 @@ class Nemotron3_5AsrProcessor(ProcessorMixin):
             + self.feature_extractor.win_length
         )
 
-    def _resolve_prompt_ids(
+    def resolve_prompt_ids(
         self, language: "str | list[str]", batch_size: int
     ) -> "torch.LongTensor":
         if isinstance(language, str):

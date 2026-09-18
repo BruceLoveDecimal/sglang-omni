@@ -109,7 +109,7 @@ class NemotronAsrStreamingFeatureExtractor(SequenceFeatureExtractor):
         )
         self.mel_filters = torch.from_numpy(mel_filters).to(torch.float32)
 
-    def _torch_extract_fbank_features(self, waveform, device="cpu", center=True):
+    def torch_extract_fbank_features(self, waveform, device="cpu", center=True):
         window = torch.hann_window(self.win_length, periodic=False, device=device)
         stft = torch.stft(
             waveform,
@@ -178,7 +178,7 @@ class NemotronAsrStreamingFeatureExtractor(SequenceFeatureExtractor):
                 pipeline.
             device (`str`, *optional*, defaults to `'cpu'`):
                 Specifies the device for computation of the log-mel spectrogram of audio signals in the
-                `_torch_extract_fbank_features` method. (e.g., "cpu", "cuda")
+                `torch_extract_fbank_features` method. (e.g., "cpu", "cuda")
             return_token_timestamps (`bool`, *optional*, defaults to `None`):
                 Deprecated. Use `return_attention_mask` instead from which the number of frames can be inferred.
             center (`bool`, *optional*, defaults to `True`):
@@ -263,7 +263,7 @@ class NemotronAsrStreamingFeatureExtractor(SequenceFeatureExtractor):
             )
             input_features = input_features.masked_fill(~timemask, 0.0)
 
-        input_features = self._torch_extract_fbank_features(
+        input_features = self.torch_extract_fbank_features(
             input_features, device, center=center
         )
         if center:

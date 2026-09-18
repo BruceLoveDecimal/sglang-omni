@@ -29,6 +29,12 @@ The processor retains plain-text `decode` and `batch_decode`, including
 RNN-T repeated-token handling, but omits token-level timestamp post-processing.
 Passing non-`None` `durations` to `decode` is unsupported and raises `ValueError`.
 
+Local helpers and properties omit leading underscores, and the imported Parakeet
+generation base is aliased as `TransformersParakeetRNNTGenerationMixin`.
+Transformers hooks retain their original names, including generation hooks,
+`_get_arguments_from_pretrained`, `_init_weights`, and
+`_get_subsampling_output_length`, which Parakeet generation calls on the encoder.
+
 Regenerate this directory from the pinned upstream commit and reapply those
 compatibility changes and scope reductions when updating it. Remove the
 backport once the repository dependency moves to Transformers 5.13 or newer.

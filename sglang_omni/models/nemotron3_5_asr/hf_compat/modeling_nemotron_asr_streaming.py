@@ -712,7 +712,7 @@ class NemotronAsrStreamingEncoderAttention(nn.Module):
 
         # terms (b) and (d) — slice to total_key_length to cover cache + current chunk
         matrix_bd = query_states_with_bias_v @ relative_key_states.permute(0, 2, 3, 1)
-        matrix_bd = self._rel_shift(matrix_bd)
+        matrix_bd = self.rel_shift(matrix_bd)
         matrix_bd = matrix_bd[..., :total_key_length]
         matrix_bd = matrix_bd * self.scaling
 
@@ -740,7 +740,7 @@ class NemotronAsrStreamingEncoderAttention(nn.Module):
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
-    def _rel_shift(self, attention_scores):
+    def rel_shift(self, attention_scores):
         """Relative position shift for Shaw et al. style attention. See appendix B of https://huggingface.co/papers/1901.02860."""
         batch_size, num_heads, query_length, position_length = attention_scores.shape
         attention_scores = nn.functional.pad(attention_scores, pad=(1, 0))
@@ -753,7 +753,7 @@ class NemotronAsrStreamingEncoderAttention(nn.Module):
         return attention_scores
 
 
-def _mask_subsampled_frames(
+def mask_subsampled_frames(
     hidden_states: torch.Tensor, lengths: torch.Tensor | None
 ) -> torch.Tensor:
     """Zero out time frames beyond each sequence's valid length so they don't leak into the next conv."""
@@ -790,7 +790,7 @@ class NemotronAsrStreamingEncoderSubsamplingLayer(nn.Module):
             lengths, streaming=padding_cache is not None
         )
         hidden_states = self.pointwise_conv(hidden_states)
-        return _mask_subsampled_frames(hidden_states, lengths), lengths
+        return mask_subsampled_frames(hidden_states, lengths), lengths
 
 
 class NemotronAsrStreamingEncoderSubsamplingConv2D(nn.Module):
@@ -831,7 +831,7 @@ class NemotronAsrStreamingEncoderSubsamplingConv2D(nn.Module):
         lengths = self.conv_in.output_length(
             lengths, streaming=padding_cache is not None
         )
-        hidden_states = self.act_fn(_mask_subsampled_frames(hidden_states, lengths))
+        hidden_states = self.act_fn(mask_subsampled_frames(hidden_states, lengths))
 
         # depthwise-separable stages
         for layer in self.layers:
@@ -987,7 +987,7 @@ class NemotronAsrStreamingPreTrainedModel(PreTrainedModel):
 
         return lengths.to(dtype=torch.int)
 
-    def _get_output_attention_mask(
+    def get_output_attention_mask(
         self, attention_mask: torch.Tensor, target_length: int | None = None
     ):
         """
@@ -1126,7 +1126,7 @@ class NemotronAsrStreamingEncoder(NemotronAsrStreamingPreTrainedModel):
 
         output_mask = None
         if attention_mask is not None:
-            output_mask = self._get_output_attention_mask(
+            output_mask = self.get_output_attention_mask(
                 attention_mask, target_length=seq_length
             )
 
@@ -1137,7 +1137,7 @@ class NemotronAsrStreamingEncoder(NemotronAsrStreamingPreTrainedModel):
             past_key_values=past_key_values,
             position_ids=position_ids,
             and_mask_function=chunked_limited_mask_function(
-                *self._resolve_attn_context(num_lookahead_tokens)
+                *self.resolve_attn_context(num_lookahead_tokens)
             ),
         )
 
@@ -1197,7 +1197,7 @@ class NemotronAsrStreamingEncoder(NemotronAsrStreamingPreTrainedModel):
             padding_cache=padding_cache,
         )
 
-    def _resolve_attn_context(
+    def resolve_attn_context(
         self, num_lookahead_tokens: int | None = None
     ) -> tuple[int, int]:
         if num_lookahead_tokens is None:
