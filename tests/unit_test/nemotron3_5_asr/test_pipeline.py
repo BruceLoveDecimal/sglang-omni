@@ -35,6 +35,7 @@ def test_config_leaves_defaults_to_factory() -> None:
     )
 
 
+@pytest.mark.parametrize("device", ["cpu", "mps"])
 @pytest.mark.parametrize("model_error", [False, True])
 @pytest.mark.parametrize(
     "request_languages",
@@ -47,6 +48,7 @@ def test_config_leaves_defaults_to_factory() -> None:
 def test_factory_transcribes_single_and_batched_requests(
     monkeypatch: pytest.MonkeyPatch,
     model_error: bool,
+    device: str,
     request_languages: list[tuple[str, str]],
 ) -> None:
     runner = Mock(spec=stages.Nemotron3_5ASRModelRunner)
@@ -66,9 +68,8 @@ def test_factory_transcribes_single_and_batched_requests(
         if model_error
         else lambda requests: [request.stage_payload for request in requests]
     )
-    monkeypatch.setattr(
-        stages, "Nemotron3_5ASRModelRunner", lambda *args, **kwargs: runner
-    )
+    runner_factory = Mock(return_value=runner)
+    monkeypatch.setattr(stages, "Nemotron3_5ASRModelRunner", runner_factory)
     monkeypatch.setattr(
         request_builders,
         "prepare_audio",
@@ -77,7 +78,10 @@ def test_factory_transcribes_single_and_batched_requests(
             duration_s=0.1,
         ),
     )
-    scheduler = stages.create_nemotron3_5_asr_executor("checkpoint", device="cpu")
+    monkeypatch.setattr(stages, "resolve_device_spec", lambda *args: device)
+    scheduler = stages.create_nemotron3_5_asr_executor("checkpoint", device=device)
+    assert runner_factory.call_args.kwargs["device"] == device
+    assert runner_factory.call_args.kwargs["dtype"] == "float32"
     assert scheduler.inbox.maxsize == 256
     payloads = [
         StagePayload(
