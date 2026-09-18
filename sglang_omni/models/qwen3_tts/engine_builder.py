@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from typing import Any
 
 import torch
+from sglang.srt.arg_groups.model_override_base import resolved_view
 from sglang.srt.runtime_context import get_model, get_schedule
 
 from sglang_omni.models.qwen3_tts import CAPABILITIES, request_builders
@@ -156,7 +157,7 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
                 checkpoint_dir
             ),
         )
-        disable_cuda_graph = bool(server_args.disable_cuda_graph)
+        disable_cuda_graph = bool(resolved_view(server_args).disable_cuda_graph)
         request_builders.set_qwen3_tts_preprocessing_context(
             model=model,
             wrapper=self.wrapper,
