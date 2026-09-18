@@ -187,3 +187,57 @@ all 655 learned parameter tensors passed conversion name/shape checks.
 Timings are smoke-test observations across response formats, not a throughput
 benchmark. The reproducible JSON report includes source-file and audio hashes
 so results can be tied to the implementation even when run from a dirty tree.
+
+
+## Apple Silicon (PyTorch MPS)
+
+The shared Torch runner also supports Apple GPU inference through MPS. It reuses
+CPU audio preprocessing and the existing Torch encoder, RNN-T decoder, batching,
+and native cache-aware streaming scheduler. No separate model implementation or
+weight conversion is required for an existing safetensors checkpoint.
+
+After `./install.sh`, explicitly disable MLX to select Torch MPS on Apple Silicon:
+
+```bash
+source .venv-apple/bin/activate
+SGLANG_USE_MLX=0 sgl-omni serve --model-path /path/to/nemotron-checkpoint
+```
+
+The platform selects `mps:0` automatically. The default precision is FP32.
+`SGLANG_USE_MLX=1` selects the separate native MLX backend instead. MPS uses the
+Torch scheduler's batching settings rather than the MLX single-request limit.
+The native PCM streaming path remains an internal runtime capability; HTTP
+`stream=true` returns SSE for a complete uploaded file.
+
+Validate MPS against the CPU reference and exercise the real HTTP server:
+
+```bash
+SGLANG_USE_MLX=0 PYTORCH_ENABLE_MPS_FALLBACK=0 \
+  python -m benchmarks.eval.verify_nemotron_mlx \
+  --backend mps --model-path /path/to/nemotron-checkpoint \
+  --output /tmp/nemotron-mps-validation.json
+```
+
+The check compares full offline token sequences and batched streaming tokens
+and frame advances across two fixtures, both language modes, and all four
+lookahead settings. It also checks HTTP formats, SSE, concurrent requests, and
+recovery after invalid input. MPS operator fallback is disabled during validation;
+audio preprocessing intentionally remains on CPU. These fixture checks are not
+a dataset-level WER evaluation or a sustained throughput benchmark.
+
+
+### MPS validation snapshot (2026-09-18)
+
+Apple M1 Pro, 32 GiB unified memory; FP32; Torch 2.13.0, Transformers 5.12.1,
+SGLang 0.5.19. MPS operator fallback was disabled.
+
+| Check | Result |
+|---|---|
+| Complete Torch CPU / MPS offline token sequences | 16/16 exact matches |
+| Batched cache-aware streaming | 16 streams, 370 chunks; exact tokens and frame advances |
+| HTTP/SSE requests | 24/24 expected responses, including invalid-input recovery |
+| Unit and shared serving/scheduling regressions | 281 passed |
+| Existing MLX regression | 16/16 exact token matches and 25/25 HTTP/SSE checks |
+
+The MPS check omits the MLX-specific 60-second rejection case. Broad WER,
+sustained throughput, and latency-distribution evaluation remain pending.

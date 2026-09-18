@@ -282,8 +282,7 @@ class Nemotron3_5ASRModelRunner:
         padding_cache = self.merge_padding_caches(
             [state.padding_cache for state in states]
         )
-        if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
+        self._synchronize_device()
         started_at_s = time.perf_counter()
         with self.model_lock, torch.inference_mode():
             encoder_outputs = self.model.get_audio_features(
@@ -377,8 +376,7 @@ class Nemotron3_5ASRModelRunner:
                         continue
                     next_active_indices.append(state_index)
                 active_indices = next_active_indices
-        if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
+        self._synchronize_device()
         elapsed_s = time.perf_counter() - started_at_s
 
         token_tensors = [
@@ -444,6 +442,13 @@ class Nemotron3_5ASRModelRunner:
                 )
             )
         return results
+
+    def _synchronize_device(self) -> None:
+        # Include asynchronous accelerator work in streaming compute timings.
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        elif self.device.type == "mps":
+            torch.mps.synchronize()
 
     def _generate_sequences(self, processor_inputs, *, max_new_tokens):
         from transformers.feature_extraction_utils import BatchFeature
