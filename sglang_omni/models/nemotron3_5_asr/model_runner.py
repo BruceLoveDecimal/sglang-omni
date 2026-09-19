@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from transformers.cache_utils import DynamicCache
+from transformers.configuration_utils import PreTrainedConfig
 
 from sglang_omni.models.weight_loader import resolve_dtype
 from sglang_omni.proto import StagePayload
@@ -154,39 +155,57 @@ class Nemotron3_5ASRModelRunner:
     @staticmethod
     def merge_attention_caches(
         caches: Sequence[DynamicCache | None],
+        *,
+        cache_config: PreTrainedConfig,
     ) -> DynamicCache | None:
         if all(cache is None for cache in caches):
             return None
         assert all(cache is not None for cache in caches)
         layer_count = len(caches[0].layers)
         assert all(len(cache.layers) == layer_count for cache in caches)
-        key_value_pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
+        merged_cache = DynamicCache(config=cache_config)
+        assert len(merged_cache.layers) == layer_count
         for layer_index in range(layer_count):
             layers = [cache.layers[layer_index] for cache in caches]
             sequence_lengths = {layer.get_seq_length() for layer in layers}
             assert len(sequence_lengths) == 1
-            key_value_pairs.append(
-                (
-                    torch.cat([layer.keys for layer in layers], dim=0),
-                    torch.cat([layer.values for layer in layers], dim=0),
-                )
+            assert all(type(layer) is type(layers[0]) for layer in layers)
+            # Preserve layer metadata such as sliding-window state and cumulative
+            # length.
+            merged_layer = copy(layers[0])
+            merged_layer.keys = torch.cat(
+                [layer.keys for layer in layers], dim=0
             )
-        return DynamicCache(ddp_cache_data=key_value_pairs)
+            merged_layer.values = torch.cat(
+                [layer.values for layer in layers], dim=0
+            )
+            merged_cache.layers[layer_index] = merged_layer
+        return merged_cache
 
     @staticmethod
     def split_attention_cache(
-        cache: DynamicCache, batch_size: int
+        cache: DynamicCache,
+        batch_size: int,
+        *,
+        cache_config: PreTrainedConfig,
     ) -> list[DynamicCache]:
-        request_caches: list[DynamicCache] = []
+        request_caches = [
+            DynamicCache(config=cache_config) for _ in range(batch_size)
+        ]
+        assert all(
+            len(request_cache.layers) == len(cache.layers)
+            for request_cache in request_caches
+        )
         for batch_index in range(batch_size):
-            key_value_pairs = [
-                (
-                    layer.keys[batch_index : batch_index + 1].clone(),
-                    layer.values[batch_index : batch_index + 1].clone(),
-                )
-                for layer in cache.layers
-            ]
-            request_caches.append(DynamicCache(ddp_cache_data=key_value_pairs))
+            for layer_index, layer in enumerate(cache.layers):
+                request_layer = copy(layer)
+                request_layer.keys = layer.keys[
+                    batch_index : batch_index + 1
+                ].clone()
+                request_layer.values = layer.values[
+                    batch_index : batch_index + 1
+                ].clone()
+                request_caches[batch_index].layers[layer_index] = request_layer
         return request_caches
 
     @staticmethod
@@ -277,7 +296,8 @@ class Nemotron3_5ASRModelRunner:
         input_features = torch.cat([chunk.input_features for chunk in chunks], dim=0)
         prompt_ids = torch.cat([chunk.prompt_ids.reshape(-1) for chunk in chunks])
         attention_cache = self.merge_attention_caches(
-            [state.attention_cache for state in states]
+            [state.attention_cache for state in states],
+            cache_config=self.model.config.encoder_config,
         )
         padding_cache = self.merge_padding_caches(
             [state.padding_cache for state in states]
@@ -296,7 +316,9 @@ class Nemotron3_5ASRModelRunner:
                 output_attention_mask=False,
             )
             split_attention = self.split_attention_cache(
-                encoder_outputs.past_key_values, len(states)
+                encoder_outputs.past_key_values,
+                len(states),
+                cache_config=self.model.config.encoder_config,
             )
             split_padding = self.split_padding_cache(
                 encoder_outputs.padding_cache, len(states)

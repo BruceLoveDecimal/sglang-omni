@@ -10,6 +10,7 @@ import pytest
 import torch
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
+from transformers.cache_utils import DynamicCache
 from transformers.generation import GenerationMixin
 
 from sglang_omni.models.nemotron3_5_asr.hf_compat import (
@@ -147,6 +148,58 @@ def test_local_model_preserves_streaming_results_and_caches_when_batched(
                 batched[0].padding_cache.layers[key].cache.data_ptr()
                 != batched[1].padding_cache.layers[key].cache.data_ptr()
             )
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_attention_cache_split_merge_preserves_sliding_window_state(
+    batch_size: int,
+) -> None:
+    config = NemotronAsrStreamingEncoderConfig(
+        hidden_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        intermediate_size=16,
+        sliding_window=5,
+    )
+    runner = object.__new__(Nemotron3_5ASRModelRunner)
+    request_caches = []
+    for request_index in range(batch_size):
+        cache = DynamicCache(config=config)
+        for update_index in range(3):
+            key_states = torch.full(
+                (1, 2, 2, 4),
+                float(request_index + update_index),
+            )
+            cache.layers[0].update(key_states, key_states)
+        request_caches.append(cache)
+
+    merged = runner.merge_attention_caches(
+        request_caches,
+        cache_config=config,
+    )
+    assert merged is not None
+    merged_layer = merged.layers[0]
+    assert merged_layer.is_sliding
+    assert merged_layer.keys.shape[0] == batch_size
+    assert merged_layer.keys.shape[-2] == 4
+    assert merged_layer.get_seq_length() == 6
+
+    split = runner.split_attention_cache(
+        merged,
+        batch_size,
+        cache_config=config,
+    )
+    assert len(split) == batch_size
+    for request_cache in split:
+        request_layer = request_cache.layers[0]
+        assert request_layer.is_sliding
+        assert request_layer.keys.shape[-2] == 4
+        assert request_layer.get_seq_length() == 6
+
+        new_key_states = torch.zeros((1, 2, 2, 4))
+        request_layer.update(new_key_states, new_key_states)
+        assert request_layer.keys.shape[-2] == 4
+        assert request_layer.get_seq_length() == 8
 
 
 def test_parakeet_compat_forwards_cache_aware_encoder_kwargs(monkeypatch) -> None:
