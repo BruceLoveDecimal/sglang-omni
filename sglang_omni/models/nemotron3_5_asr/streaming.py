@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import time
-from collections import defaultdict
+from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
@@ -207,7 +207,7 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
             **runner.streaming_chunk_spec
         )
         self.prompt_dictionary = dict(prompt_dictionary)
-        self.stream_states: dict[str, Nemotron3_5ASRStreamState] = {}
+        self.stream_states: OrderedDict[str, Nemotron3_5ASRStreamState] = OrderedDict()
         self.is_closed = False
         self.completed_streams = 0
         self.aborted_streams = 0
@@ -250,7 +250,6 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
     def on_stream_chunk_batch(self, items: list[tuple[str, StreamItem]]) -> None:
         failed: list[str] = []
         with self.state_lock:
-            touched: set[str] = set()
             for request_id, item in items:
                 if self.is_aborted(request_id):
                     continue
@@ -271,16 +270,57 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
                     self.abort_state(request_id)
                     self.aborted_streams += 1
                     failed.append(request_id)
-                    continue
-                touched.add(request_id)
-            ready = [
-                (request_id, state, state.pop_ready_window())
+        for request_id in dict.fromkeys(failed):
+            self.cleanup_aborted_request(request_id)
+
+    def has_ready_work(self) -> bool:
+        with self.state_lock:
+            return any(
+                not self.is_aborted(request_id)
+                and (
+                    state.is_input_done
+                    or (not state.has_reached_decode_limit and state.has_ready_window())
+                )
                 for request_id, state in self.stream_states.items()
-                if request_id in touched
-                and not self.is_aborted(request_id)
-                and not state.has_reached_decode_limit
-                and state.has_ready_window()
-            ]
+            )
+
+    def run_ready_step(self) -> None:
+        failed: list[str] = []
+        with self.state_lock:
+            ready: list[
+                tuple[str, Nemotron3_5ASRStreamState, Nemotron3_5ASRAudioWindow]
+            ] = []
+            for request_id, state in list(self.stream_states.items()):
+                if self.is_aborted(request_id):
+                    continue
+                try:
+                    if state.has_reached_decode_limit or not state.has_ready_window(
+                        finalizing=state.is_input_done
+                    ):
+                        if state.is_input_done:
+                            self.finish_stream(state)
+                        continue
+                    if (
+                        ready
+                        and state.model_chunk_index != ready[0][2].model_chunk_index
+                    ):
+                        continue
+                    ready.append(
+                        (
+                            request_id,
+                            state,
+                            state.pop_ready_window(finalizing=state.is_input_done),
+                        )
+                    )
+                    # Rotate selected requests behind those still waiting for a step.
+                    self.stream_states.move_to_end(request_id)
+                    if len(ready) == self.max_batch_size:
+                        break
+                except Exception as exc:
+                    self.emit_error(request_id, exc)
+                    self.abort_state(request_id)
+                    self.aborted_streams += 1
+                    failed.append(request_id)
             failed.extend(self.run_ready_windows(ready))
         for request_id in dict.fromkeys(failed):
             self.cleanup_aborted_request(request_id)
@@ -291,44 +331,36 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
             tuple[str, Nemotron3_5ASRStreamState, Nemotron3_5ASRAudioWindow]
         ],
     ) -> list[str]:
-        groups: dict[
-            int,
-            list[tuple[str, Nemotron3_5ASRStreamState, Nemotron3_5ASRAudioWindow]],
-        ] = defaultdict(list)
-        for item in ready:
-            groups[item[2].model_chunk_index].append(item)
-
+        if not ready:
+            return []
         failed: list[str] = []
-        for group in groups.values():
-            for offset in range(0, len(group), self.max_batch_size):
-                batch = group[offset : offset + self.max_batch_size]
-                try:
-                    prepared_chunks = [
-                        self.runner.prepare_streaming_chunk(
-                            window.waveform,
-                            language=state.language,
-                            is_first=window.is_first,
-                        )
-                        for _, state, window in batch
-                    ]
-                    batch_result = self.runner.run_streaming_batch(
-                        [state.decode for _, state, _ in batch],
-                        prepared_chunks,
-                        requested_languages=[state.language for _, state, _ in batch],
-                        max_new_tokens=[state.max_new_tokens for _, state, _ in batch],
-                    )
-                    for index, (request_id, state, _) in enumerate(batch):
-                        state.model_compute_s += batch_result.elapsed_s / len(batch)
-                        message = self.partial_message(state, batch_result, index)
-                        if message is None or self.is_aborted(request_id):
-                            continue
-                        self.outbox.put(message)
-                except Exception as exc:
-                    for request_id, _, _ in batch:
-                        self.emit_error(request_id, exc)
-                        self.abort_state(request_id)
-                        self.aborted_streams += 1
-                        failed.append(request_id)
+        try:
+            prepared_chunks = [
+                self.runner.prepare_streaming_chunk(
+                    window.waveform,
+                    language=state.language,
+                    is_first=window.is_first,
+                )
+                for _, state, window in ready
+            ]
+            batch_result = self.runner.run_streaming_batch(
+                [state.decode for _, state, _ in ready],
+                prepared_chunks,
+                requested_languages=[state.language for _, state, _ in ready],
+                max_new_tokens=[state.max_new_tokens for _, state, _ in ready],
+            )
+            for index, (request_id, state, _) in enumerate(ready):
+                state.model_compute_s += batch_result.elapsed_s / len(ready)
+                message = self.partial_message(state, batch_result, index)
+                if message is None or self.is_aborted(request_id):
+                    continue
+                self.outbox.put(message)
+        except Exception as exc:
+            for request_id, _, _ in ready:
+                self.emit_error(request_id, exc)
+                self.abort_state(request_id)
+                self.aborted_streams += 1
+                failed.append(request_id)
         return failed
 
     def partial_message(
@@ -362,33 +394,11 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
             metadata={"modality": "text"},
         )
 
-    def on_stream_done(self, request_id: str) -> list[OutgoingMessage]:
-        state = self.stream_states[request_id]
-        state.mark_done()
-        messages: list[OutgoingMessage] = []
-        while not state.has_reached_decode_limit and state.has_ready_window(
-            finalizing=True
-        ):
-            window = state.pop_ready_window(finalizing=True)
-            prepared_chunk = self.runner.prepare_streaming_chunk(
-                window.waveform,
-                language=state.language,
-                is_first=window.is_first,
-            )
-            batch_result = self.runner.run_streaming_batch(
-                [state.decode],
-                [prepared_chunk],
-                requested_languages=[state.language],
-                max_new_tokens=[state.max_new_tokens],
-            )
-            state.model_compute_s += batch_result.elapsed_s
-            partial = self.partial_message(state, batch_result, 0)
-            if partial is None:
-                continue
-            messages.append(partial)
+    def on_stream_done(self, request_id: str) -> None:
+        self.stream_states[request_id].mark_done()
 
+    def finish_stream(self, state: Nemotron3_5ASRStreamState) -> None:
         finalized_s = time.perf_counter()
-        self.completed_streams += 1
         final_payload = build_nemotron3_5_asr_result(
             state.payload,
             raw_text=state.raw_text,
@@ -404,14 +414,17 @@ class Nemotron3_5ASRStreamingScheduler(StreamingSimpleScheduler):
                 "streaming_latency_ms": state.spec.streaming_latency_ms,
             },
         )
-        messages.append(
-            OutgoingMessage(
-                request_id=request_id,
-                type="result",
-                data=final_payload,
-            )
+        self.complete_stream_request(
+            state.request_id,
+            [
+                OutgoingMessage(
+                    request_id=state.request_id,
+                    type="result",
+                    data=final_payload,
+                )
+            ],
         )
-        return messages
+        self.completed_streams += 1
 
     def clear_stream_state(self, request_id: str) -> None:
         self.stream_states.pop(request_id, None)
