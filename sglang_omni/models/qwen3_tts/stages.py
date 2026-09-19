@@ -30,6 +30,7 @@ from sglang_omni.models.qwen3_tts.streaming_vocoder import (
     DEFAULT_QWEN3_TTS_STREAM_STRIDE,
     Qwen3TTSStreamingVocoderScheduler,
 )
+from sglang_omni.platforms import current_platform
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleScheduler
 from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoint
@@ -49,6 +50,25 @@ _QWEN_TTS_INSTALL_HINT = (
     "docs/cookbook/qwen3_tts.md."
 )
 
+_NPU_UNSUPPORTED_ATTN_IMPLEMENTATIONS = frozenset(
+    {"flash_attention_2", "flash_attention_3", "flash_attention_4"}
+)
+
+
+def _resolve_qwen3_tts_attn_implementation(
+    device: str | torch.device,
+    attn_implementation: str | None,
+) -> str | None:
+    device_type = str(device).strip().partition(":")[0].lower()
+    if not current_platform.is_npu() or device_type != "npu":
+        return attn_implementation
+    if attn_implementation in _NPU_UNSUPPORTED_ATTN_IMPLEMENTATIONS:
+        raise ValueError(
+            "Qwen3-TTS speech tokenizer cannot use "
+            f"attn_implementation={attn_implementation!r} on NPU; use 'sdpa'"
+        )
+    return attn_implementation or "sdpa"
+
 
 def _load_qwen3_tts_tokenizer(
     model_path: str,
@@ -63,6 +83,9 @@ def _load_qwen3_tts_tokenizer(
     except ImportError as exc:
         raise RuntimeError(_QWEN_TTS_INSTALL_HINT) from exc
 
+    attn_implementation = _resolve_qwen3_tts_attn_implementation(
+        device, attn_implementation
+    )
     checkpoint_dir = _resolve_checkpoint(model_path)
     tokenizer_path = os.path.join(checkpoint_dir, "speech_tokenizer")
     torch_dtype = getattr(torch, dtype) if isinstance(dtype, str) else dtype
@@ -84,7 +107,11 @@ def _load_qwen3_tts_tokenizer(
             kwargs["attn_implementation"] = attn_implementation
 
         logger.info(
-            f"Loading Qwen3-TTS speech tokenizer from {tokenizer_path} on {device}"
+            "Loading Qwen3-TTS speech tokenizer from %s on %s "
+            "with attn_implementation=%s",
+            tokenizer_path,
+            device,
+            attn_implementation or "upstream-default",
         )
         tokenizer = Qwen3TTSTokenizer.from_pretrained(tokenizer_path, **kwargs)
         move_conv_padding_to_host(tokenizer.model.encoder)
