@@ -92,12 +92,18 @@ Multi-request DiT batches run packed by default. The transformer blocks run
 only valid text/reference/target tokens through Linear, Norm, FFN and non-
 causal variable-length FlashAttention. Original position IDs and separate CFG
 branches are preserved. Convolutional audio embeddings and the FP32 Euler state
-retain their padded layout; layout indices are built once per trajectory.
+retain their padded layout; layout indices and rotary tables are built once
+per trajectory.
 Singleton batches retain the padded execution path. Packing requires a CUDA
 BF16 backbone, a checkpoint with `attn_mask_enabled`, and SGLang's varlen
-FlashAttention, selected with SGLang's vision-attention policy: FA4 on sm100
-Blackwell and FA3 on sm80-sm90. The stage factory checks the checkpoint flag
-and runs one probe attention call before loading the DiT weights. When a check
+FlashAttention. The version follows SGLang's own predicates: FA4 wherever
+`is_blackwell` holds (sm100/sm110/sm120, CUDA >= 12.8; sm12x binds SGLang's
+`flash_attention_v4_sm120` entry point as its FlashAttentionBackend does) and
+FA3 wherever `_is_fa3_supported` holds (sm80-sm90, CUDA >= 12.3). FA4 on
+sm120 (RTX 5090) has been validated against the padded path; FA3 and FA4 on
+sm100 have not been exercised on hardware yet. The stage factory checks the
+checkpoint flag and runs one probe attention call before loading the DiT
+weights. When a check
 fails (`weight_dtype float32`, HIP, other devices, a missing kernel build) the
 engine logs the reason and keeps the padded path; set
 `--auk_engine.factory.enable_packed_dit true` to turn that into a startup

@@ -88,6 +88,51 @@ def test_packed_matches_padded_with_holes_and_stored_padding(
     assert flow.transformer.text_cond is None
 
 
+@pytest.mark.parametrize("enable_packed_dit", [False, True])
+@torch.inference_mode()
+def test_rope_tables_are_built_once_per_trajectory(monkeypatch, enable_packed_dit):
+    """Positions are fixed across Euler steps: three rotary tables per trajectory,
+    handed to the fused Q/K kernel as the same tensors, then dropped with the
+    text cache."""
+    monkeypatch.setattr("sglang_omni.models.auk.dit.flash_attention", reference_varlen)
+    flow, items = make_flow(), make_items()
+    rotary = flow.transformer.rotary_embed
+    original = rotary.forward
+    calls = []
+    monkeypatch.setattr(
+        rotary, "forward", lambda *a, **k: calls.append(1) or original(*a, **k)
+    )
+    keys = set()
+
+    class RecordingFusion:
+        """Stand-in for QKFusion: record the table key, run the native math."""
+
+        def __init__(self, attention):
+            self.attention = attention
+
+        def __call__(self, q, k, q_norm, k_norm, rope):
+            keys.add((rope[0].data_ptr(), tuple(rope[0].shape)))
+            self.attention.qk_fusion = None
+            try:
+                return self.attention.norm_rope(q, k, q_norm, k_norm, rope)
+            finally:
+                self.attention.qk_fusion = self
+
+    blocks = (
+        *flow.transformer.transformer_blocks,
+        *flow.transformer.single_transformer_blocks,
+    )
+    for block in blocks:
+        block.attn.qk_fusion = RecordingFusion(block.attn)
+    flow.sample_batch(
+        items, steps=4, cfg_strength=2.0, enable_packed_dit=enable_packed_dit
+    )
+    # Audio, text and joint tables: one build each, not one per Euler step.
+    assert len(calls) == 3
+    assert len(keys) == 3
+    assert flow.transformer.rope_cache is None
+
+
 @torch.inference_mode()
 def test_singleton_keeps_original_path(monkeypatch):
     def unexpected(*args):
@@ -100,34 +145,78 @@ def test_singleton_keeps_original_path(monkeypatch):
     torch.testing.assert_close(a[0], b[0], atol=0, rtol=0)
 
 
+def _fake_upstream(*, blackwell, fa3, fa4):
+    from types import SimpleNamespace
+
+    return lambda: SimpleNamespace(
+        is_blackwell=lambda: blackwell,
+        is_fa3_supported=lambda device=None: fa3,
+        is_fa4_available=lambda: fa4,
+        flash_attn_varlen_func=None,
+    )
+
+
 @pytest.mark.parametrize(
-    "capability, hip, fa3, fa4, expected",
+    "capability, hip, blackwell, fa3, fa4, expected",
     [
-        ((8, 0), False, True, True, 3),
-        ((9, 0), False, True, True, 3),
-        ((10, 0), False, True, True, 4),
-        ((10, 0), False, True, False, "FlashAttention 4 on sm100"),
-        ((12, 0), False, False, True, "unsupported on sm120"),
-        ((9, 4), True, True, True, "unsupported on HIP"),
-        ((7, 5), False, False, True, "unsupported on sm75"),
+        # SGLang's predicates decide: is_blackwell -> FA4, _is_fa3_supported -> FA3.
+        ((8, 0), False, False, True, True, 3),
+        ((9, 0), False, False, True, True, 3),
+        ((10, 0), False, True, True, True, 4),
+        ((10, 3), False, True, False, True, 4),
+        ((12, 0), False, True, False, True, 4),
+        ((12, 0), False, True, False, False, "FlashAttention 4 on sm120"),
+        ((9, 4), True, False, True, True, "unsupported on HIP"),
+        ((7, 5), False, False, False, True, "unsupported on sm75"),
     ],
 )
-def test_flash_version_policy(monkeypatch, capability, hip, fa3, fa4, expected):
-    import sglang.kernels.ops.attention.flash_attention_v3 as v3
-    import sglang.kernels.ops.attention.flash_attention_v4 as v4
-
+def test_flash_version_policy(
+    monkeypatch, capability, hip, blackwell, fa3, fa4, expected
+):
     packed.resolve_flash_version.cache_clear()
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: capability)
     monkeypatch.setattr(torch.version, "hip", "6.2" if hip else None)
-    monkeypatch.setattr(v3, "_is_fa3_supported", lambda device=None: fa3)
-    monkeypatch.setattr(v4, "is_flash_attention_v4_available", lambda: fa4)
+    monkeypatch.setattr(
+        packed, "upstream_flash", _fake_upstream(blackwell=blackwell, fa3=fa3, fa4=fa4)
+    )
     if isinstance(expected, int):
         assert packed.resolve_flash_version(torch.device("cuda", 0)) == expected
     else:
         with pytest.raises(ValueError, match=expected):
             packed.resolve_flash_version(torch.device("cuda", 0))
     packed.resolve_flash_version.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "version, major, expected",
+    [(4, 12, "sm120"), (4, 10, "generic:4"), (3, 9, "generic:3"), (3, 8, "generic:3")],
+)
+def test_varlen_kernel_dispatch_matches_flash_attention_backend(
+    monkeypatch, version, major, expected
+):
+    """FA4 on sm12x binds SGLang's flash_attention_v4_sm120 entry point, as its
+    FlashAttentionBackend does; everything else goes through the generic
+    flash_attn_varlen_func(ver=...) dispatcher."""
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    sm120 = ModuleType("sglang.kernels.ops.attention.flash_attention_v4_sm120")
+    sm120.flash_attn_varlen_func = lambda *a, **k: "sm120"
+    monkeypatch.setitem(sys.modules, sm120.__name__, sm120)
+    monkeypatch.setattr(
+        packed,
+        "upstream_flash",
+        lambda: SimpleNamespace(
+            flash_attn_varlen_func=lambda *a, ver, **k: f"generic:{ver}"
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (major, 0))
+    packed.varlen_func.cache_clear()
+    layout = SimpleNamespace(cu_seqlens=None, max_seqlen=4, flash_version=version)
+    q = torch.zeros(1)
+    assert packed.flash_attention(q, q, q, layout) == expected
+    packed.varlen_func.cache_clear()
 
 
 # Skip the real-kernel test with the gate's own reason on hosts it rejects.
@@ -142,24 +231,63 @@ finally:
 
 @pytest.mark.skipif(flash_unsupported is not None, reason=str(flash_unsupported))
 @torch.inference_mode()
-def test_packed_flash_cuda_matches_padded(monkeypatch):
+def test_packed_flash_cuda_matches_padded(monkeypatch, record_property):
+    """Kernel-level parity of every varlen call, then end-to-end parity.
+
+    Each FlashAttention call is compared row by row against fp32 SDPA over the
+    same bf16 inputs. The kernel rounds P and the output to bf16 (2^-8 relative
+    each) and accumulates in fp32, so the per-row max-abs error is bounded by
+    about one bf16 ulp of the largest value; ``KERNEL_ULPS`` times eps times
+    max|v| leaves a 2x margin. Observed on FA4 (RTX 5090, 16 calls): 0.26 ulp.
+    The numbers are recorded as test properties.
+    """
     from sglang_omni.models.auk.packed import flash_attention
+
+    KERNEL_ULPS = 2
+    eps = torch.finfo(torch.bfloat16).eps
+    row_errors = []
 
     def checked_attention(q, k, v, layout):
         output = flash_attention(q, k, v, layout)
-        reference = reference_varlen(q, k, v, layout)
-        torch.testing.assert_close(output, reference, atol=0.005, rtol=0.02)
+        reference = reference_varlen(q.float(), k.float(), v.float(), layout)
+        assert output.dtype == torch.bfloat16
+        row_error = (output.float() - reference).abs().amax(dim=(1, 2))
+        bound = KERNEL_ULPS * eps * v.abs().max()
+        row_errors.append(
+            (row_error.max().item(), row_error.mean().item(), bound.item())
+        )
+        assert torch.isfinite(output).all()
+        assert row_error.max() <= bound, (
+            f"varlen kernel row max-abs error {row_error.max().item():.4g} exceeds "
+            f"{bound.item():.4g} (ver={layout.flash_version}, rows={tuple(q.shape)})"
+        )
         return output
 
     monkeypatch.setattr("sglang_omni.models.auk.dit.flash_attention", checked_attention)
     flow, items = make_flow("cuda", torch.bfloat16), make_items("cuda")
     a = flow.sample_batch(items, steps=4, cfg_strength=2.0)
     b = flow.sample_batch(items, steps=4, cfg_strength=2.0, enable_packed_dit=True)
-    for output, reference in zip(b, a):
+    assert row_errors
+    worst_row, mean_row, bound = max(row_errors)
+    version = packed.resolve_flash_version(torch.device("cuda", 0))
+    record_property("flash_version", version)
+    record_property("flash_calls", len(row_errors))
+    record_property("flash_row_max_abs_error", worst_row)
+    record_property("flash_row_mean_abs_error", max(mean for _, mean, _ in row_errors))
+    record_property("flash_row_max_abs_bound", bound)
+    print(
+        f"varlen ver={version}: {len(row_errors)} calls, row max-abs error "
+        f"{worst_row:.4g} (bound {bound:.4g}), mean {mean_row:.4g}"
+    )
+    for i, (output, reference) in enumerate(zip(b, a)):
         assert output.dtype == torch.float32
         assert torch.isfinite(output).all()
         # Different GEMM/attention reductions accumulate through CFG and Euler.
         # Use the existing BF16-backbone diagnostic; real-model WER is evaluated
         # separately, rather than treating random-weight latents as audio quality.
         cosine = F.cosine_similarity(output.flatten(), reference.flatten(), dim=0)
+        max_abs = (output - reference).abs().max().item()
+        record_property(f"latent_{i}_cosine", cosine.item())
+        record_property(f"latent_{i}_max_abs_error", max_abs)
+        print(f"latent {i}: cosine {cosine.item():.6f}, max-abs {max_abs:.4g}")
         assert cosine > 0.99

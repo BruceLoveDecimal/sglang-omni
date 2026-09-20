@@ -4,19 +4,44 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import cache
+from functools import cache, partial
 
 import torch
 
 
+def upstream_flash():
+    """SGLang's own device predicates and varlen entry points.
+
+    Imported lazily: the padded path and CPU model loading never need Flash,
+    and tests substitute this to describe other hardware.
+    """
+    from types import SimpleNamespace
+
+    from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
+    from sglang.kernels.ops.attention.flash_attention_v3 import _is_fa3_supported
+    from sglang.kernels.ops.attention.flash_attention_v4 import (
+        is_flash_attention_v4_available,
+    )
+    from sglang.srt.utils import is_blackwell
+
+    return SimpleNamespace(
+        is_blackwell=is_blackwell,
+        is_fa3_supported=_is_fa3_supported,
+        is_fa4_available=is_flash_attention_v4_available,
+        flash_attn_varlen_func=flash_attn_varlen_func,
+    )
+
+
 @cache
 def resolve_flash_version(device: torch.device) -> int:
-    """Pick the SGLang varlen FlashAttention build that serves ``device``.
+    """Pick the SGLang varlen FlashAttention version that serves device.
 
-    Same policy as SGLang's VisionAttention: FA4 on sm100 Blackwell (sm103
-    excluded) and FA3 wherever ``_is_fa3_supported`` says so (sm80-sm90), so
-    an unsupported device is rejected with a reason instead of failing on the
-    first batch.
+    The decision reuses SGLang's predicates instead of an SM table of its own:
+    is_blackwell (sm100/sm110/sm120 with CUDA >= 12.8) selects FA4, the
+    version SGLang's FlashAttentionBackend runs on every Blackwell part, and
+    _is_fa3_supported (sm80-sm90 with CUDA >= 12.3) selects FA3. Both look
+    at the current CUDA device, as they do upstream. Anything else is rejected
+    with a reason at startup instead of failing on the first batch.
     """
     device = torch.device(device)
     if device.type != "cuda" or not torch.cuda.is_available():
@@ -26,29 +51,39 @@ def resolve_flash_version(device: torch.device) -> int:
             "Packed AuK DiT is unsupported on HIP: SGLang ships no FA3/FA4 varlen "
             "kernel there"
         )
+    flash = upstream_flash()
+    major, minor = torch.cuda.get_device_capability(device)
+    if flash.is_blackwell():
+        if flash.is_fa4_available():
+            return 4
+        raise ValueError(
+            f"Packed AuK DiT needs FlashAttention 4 on sm{major}{minor}, but "
+            "SGLang's FA4 varlen kernel is unavailable (install flash-attn-4)"
+        )
+    elif flash.is_fa3_supported():
+        return 3
     else:
-        # Lazy imports: the padded path and CPU model loading never need Flash.
-        from sglang.kernels.ops.attention.flash_attention_v3 import _is_fa3_supported
-        from sglang.kernels.ops.attention.flash_attention_v4 import (
-            is_flash_attention_v4_available,
+        raise ValueError(
+            f"Packed AuK DiT is unsupported on sm{major}{minor}: SGLang selects "
+            "FA3 on sm80-sm90 (CUDA >= 12.3) and FA4 on Blackwell (CUDA >= 12.8)"
         )
 
-        major, minor = torch.cuda.get_device_capability(device)
-        blackwell = major == 10 and minor != 3
-        if blackwell and is_flash_attention_v4_available():
-            return 4
-        elif blackwell:
-            raise ValueError(
-                f"Packed AuK DiT needs FlashAttention 4 on sm{major}{minor}, but "
-                "SGLang's FA4 varlen kernel is unavailable (install flash-attn-4)"
-            )
-        elif _is_fa3_supported(device):
-            return 3
-        else:
-            raise ValueError(
-                f"Packed AuK DiT is unsupported on sm{major}{minor}: SGLang FA3 "
-                "needs sm80-sm90 with CUDA >= 12.3"
-            )
+
+@cache
+def varlen_func(version: int, device: torch.device):
+    """The varlen kernel SGLang's FlashAttentionBackend binds for version.
+
+    FA4 on sm12x goes through flash_attention_v4_sm120, SGLang's own SM120
+    launch path; every other combination goes through the generic
+    flash_attn_varlen_func(ver=...) dispatcher.
+    """
+    if version == 4 and torch.cuda.get_device_capability(device)[0] == 12:
+        from sglang.kernels.ops.attention.flash_attention_v4_sm120 import (
+            flash_attn_varlen_func,
+        )
+
+        return flash_attn_varlen_func
+    return partial(upstream_flash().flash_attn_varlen_func, ver=version)
 
 
 def probe_flash_attention(device: torch.device, *, heads: int, head_dim: int) -> None:
@@ -71,19 +106,16 @@ def probe_flash_attention(device: torch.device, *, heads: int, head_dim: int) ->
 
 
 def flash_attention(q, k, v, layout):
-    # Lazy import: the default path and CPU model loading do not require Flash.
-    from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
-
-    return flash_attn_varlen_func(
+    # Keyword arguments: the SM120 entry point orders its parameters differently.
+    return varlen_func(layout.flash_version, q.device)(
         q,
         k,
         v,
-        layout.cu_seqlens,
-        layout.cu_seqlens,
-        layout.max_seqlen,
-        layout.max_seqlen,
+        cu_seqlens_q=layout.cu_seqlens,
+        cu_seqlens_k=layout.cu_seqlens,
+        max_seqlen_q=layout.max_seqlen,
+        max_seqlen_k=layout.max_seqlen,
         causal=False,
-        ver=layout.flash_version,
     )
 
 
@@ -92,9 +124,9 @@ def gather_rows(x, indices):
 
 
 def gather_rope(rope, indices, batch):
-    """Packed rows of ``[T, D]`` (shared) or ``[B, T, D]`` (per-request) frequencies.
+    """Packed rows of [T, D] (shared) or [B, T, D] (per-request) frequencies.
 
-    The DiT's ``RotaryEmbedding`` has no xpos, so ``scale`` is a scalar and
+    The DiT's RotaryEmbedding has no xpos, so scale is a scalar and
     passes through unchanged.
     """
     freqs, scale = rope
