@@ -38,3 +38,27 @@ The vocoder caches only the most recently used reference by audio content. A
 different reference, including switching back to the default, rebuilds the
 conditioning. Invalid references fail instead of silently using the default.
 Audio output remains non-streaming.
+
+## Chunked flow
+
+By default the vocoder denoises each utterance in one flow pass with full
+attention over the reference and the generated tokens. `chunked_flow` switches
+the flow to the checkpoint's streaming formulation: the reference primes
+per-timestep conformer and DiT caches, then every 25 tokens (plus 3 lookahead
+tokens) are denoised against those caches, which are bounded to the reference
+plus the most recent 100 frames. HiFT still vocodes the whole utterance once.
+
+```bash
+sgl-omni serve --model-path openbmb/MiniCPM-o-4_5 \
+  --code2wav.factory.chunked_flow true
+```
+
+Chunked flow captures CUDA graphs for the DiT step at startup: one for the
+regular chunk and one per 64-frame reference bucket up to 896 frames. Longer
+references fall back to eager execution. `chunked_flow_cuda_graph=false` keeps
+the chunked path eager for comparison. Chunked audio differs from the
+whole-utterance output because later chunks are not visible to earlier frames;
+compare quality before changing the default. Denoising 25-token chunks runs
+many small DiT steps, so on a single request it is slower than the
+whole-utterance pass; the option exists for bounded caches and as the basis for
+streaming audio output.

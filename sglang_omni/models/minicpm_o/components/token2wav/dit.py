@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
+from typing import Protocol
 
 import torch
 import torch.nn as nn
@@ -102,6 +103,34 @@ class Attention(torch.nn.Module):
         x = self.proj_drop(x)
         return x
 
+    def forward_chunk(
+        self, x: torch.Tensor, att_cache: torch.Tensor, attn_mask: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Attend over this chunk's keys followed by the cached ones.
+
+        Args:
+            x: (batch, frames, dim) chunk.
+            att_cache: (batch, heads, cached_frames, 2 * head_dim) keys and values.
+            attn_mask: (batch, frames, frames + cached_frames) bool, or None.
+        Returns:
+            The chunk output and the cache with this chunk's keys prepended.
+        """
+        b, t, c = x.shape
+        q = self.to_heads(self.to_q(x))
+        k = self.to_heads(self.to_k(x))
+        v = self.to_heads(self.to_v(x))
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        k_cache, v_cache = att_cache.chunk(2, dim=3)
+        k = torch.cat([k, k_cache], dim=2)
+        v = torch.cat([v, v_cache], dim=2)
+        new_att_cache = torch.cat([k, v], dim=3)
+        if attn_mask is not None:
+            attn_mask = attn_mask.unsqueeze(1)
+        x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        x = x.transpose(1, 2).reshape(b, t, -1)
+        return self.proj(x), new_att_cache
+
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return x * (1 + scale) + shift
@@ -164,6 +193,14 @@ class CausalConv1d(torch.nn.Conv1d):
         x = super(CausalConv1d, self).forward(x)
         return x
 
+    def forward_chunk(
+        self, x: torch.Tensor, cnn_cache: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convolve with the previous chunk's kernel_size - 1 trailing frames."""
+        x = torch.cat([cnn_cache, x], dim=2)
+        new_cnn_cache = x[..., -self.causal_padding[0] :]
+        return super(CausalConv1d, self).forward(x), new_cnn_cache
+
 
 class CausalConvBlock(nn.Module):
 
@@ -194,6 +231,32 @@ class CausalConvBlock(nn.Module):
         if mask is not None:
             x = x * mask
         return x
+
+    def forward_chunk(
+        self,
+        x: torch.Tensor,
+        cnn_cache: torch.Tensor,
+        frame_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the block on one chunk; the cache stacks both convs' contexts on dim 1.
+
+        Padded frames are zeroed before each conv so real frames see the same
+        context as an unpadded chunk would.
+        """
+        cnn_cache1, cnn_cache2 = cnn_cache.split(
+            (self.in_channels, self.out_channels), dim=1
+        )
+        if frame_mask is not None:
+            x = x * frame_mask
+        x = self.block[0](x)
+        x, new_cnn_cache1 = self.block[1].forward_chunk(x, cnn_cache1)
+        x = self.block[2:5](x)
+        if frame_mask is not None:
+            x = x * frame_mask
+        x = self.block[5](x)
+        x, new_cnn_cache2 = self.block[6].forward_chunk(x, cnn_cache2)
+        x = self.block[7](x)
+        return x, torch.cat((new_cnn_cache1, new_cnn_cache2), dim=1)
 
 
 class DiTBlock(nn.Module):
@@ -248,6 +311,37 @@ class DiTBlock(nn.Module):
         x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
+    def forward_chunk(
+        self,
+        x: torch.Tensor,
+        c: torch.Tensor,
+        cnn_cache: torch.Tensor,
+        att_cache: torch.Tensor,
+        attn_mask: torch.Tensor | None,
+        frame_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        (
+            shift_msa,
+            scale_msa,
+            gate_msa,
+            shift_mlp,
+            scale_mlp,
+            gate_mlp,
+            shift_conv,
+            scale_conv,
+            gate_conv,
+        ) = self.adaLN_modulation(c).chunk(9, dim=-1)
+        x_att, new_att_cache = self.attn.forward_chunk(
+            modulate(self.norm1(x), shift_msa, scale_msa), att_cache, attn_mask
+        )
+        x = x + gate_msa * x_att
+        x_conv, new_cnn_cache = self.conv.forward_chunk(
+            modulate(self.norm3(x), shift_conv, scale_conv), cnn_cache, frame_mask
+        )
+        x = x + gate_conv * x_conv
+        x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        return x, new_cnn_cache, new_att_cache
+
 
 class FinalLayer(nn.Module):
 
@@ -264,6 +358,20 @@ class FinalLayer(nn.Module):
         x = modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
         return x
+
+
+class ChunkStepRunner(Protocol):
+    """Replays a captured DiT chunk step when the shapes fit a captured graph."""
+
+    def run(
+        self,
+        x: torch.Tensor,
+        t_emb: torch.Tensor,
+        cnn_cache: torch.Tensor,
+        att_cache: torch.Tensor,
+        new_cnn_cache: torch.Tensor,
+        new_att_cache: torch.Tensor,
+    ) -> torch.Tensor | None: ...
 
 
 class DiT(nn.Module):
@@ -291,6 +399,10 @@ class DiT(nn.Module):
         )
         self.final_layer = FinalLayer(hidden_size, self.out_channels)
         self.initialize_weights()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.hidden_size = hidden_size
+        self.chunk_graphs: ChunkStepRunner | None = None
 
     def initialize_weights(self) -> None:
 
@@ -335,3 +447,106 @@ class DiT(nn.Module):
         x = self.final_layer(x, t)
         x = x.transpose(1, 2)
         return x
+
+    def pack_chunk_inputs(
+        self,
+        x: torch.Tensor,
+        mu: torch.Tensor,
+        t: torch.Tensor,
+        spks: torch.Tensor,
+        cond: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Concatenate the estimator inputs on channels and embed the timestep."""
+        t_emb = self.t_embedder(t).unsqueeze(1)
+        spks = repeat(spks, "b c -> b c t", t=x.shape[-1])
+        return pack([x, mu, spks, cond], "b * t")[0], t_emb
+
+    def empty_chunk_caches(
+        self, batch_size: int, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Zero conv context and an empty attention cache for a stream's first chunk."""
+        conv = self.blocks[0].conv
+        dtype = self.in_proj.weight.dtype
+        cnn_cache = torch.zeros(
+            len(self.blocks),
+            batch_size,
+            conv.in_channels + conv.out_channels,
+            conv.kernel_size - 1,
+            device=device,
+            dtype=dtype,
+        )
+        att_cache = torch.zeros(
+            len(self.blocks),
+            batch_size,
+            self.num_heads,
+            0,
+            2 * self.head_dim,
+            device=device,
+            dtype=dtype,
+        )
+        return cnn_cache, att_cache
+
+    def blocks_forward_chunk(
+        self,
+        x: torch.Tensor,
+        t_emb: torch.Tensor,
+        attn_mask: torch.Tensor | None,
+        frame_mask: torch.Tensor | None,
+        cnn_cache: torch.Tensor,
+        att_cache: torch.Tensor,
+        new_cnn_cache: torch.Tensor,
+        new_att_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the packed chunk through the blocks, writing caches into the outputs.
+
+        Args:
+            x: (batch, in_channels, frames) packed inputs.
+            attn_mask: (batch, frames, frames + cached_frames) bool, or None.
+            frame_mask: (batch, frames, 1) marking real frames, or None.
+            cnn_cache: (depth, batch, 2 * hidden, kernel - 1).
+            att_cache: (depth, batch, heads, cached_frames, 2 * head_dim).
+            new_att_cache: (depth, batch, heads, frames + cached_frames, 2 * head_dim).
+        """
+        x = self.in_proj(x.transpose(1, 2))
+        for idx, block in enumerate(self.blocks):
+            x, new_cnn_cache[idx], new_att_cache[idx] = block.forward_chunk(
+                x, t_emb, cnn_cache[idx], att_cache[idx], attn_mask, frame_mask
+            )
+        x = self.final_layer(x, t_emb)
+        return x.transpose(1, 2)
+
+    def forward_chunk(
+        self,
+        x: torch.Tensor,
+        mu: torch.Tensor,
+        t: torch.Tensor,
+        spks: torch.Tensor,
+        cond: torch.Tensor,
+        cnn_cache: torch.Tensor,
+        att_cache: torch.Tensor,
+        new_cnn_cache: torch.Tensor,
+        new_att_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        """Estimate one chunk's velocity, writing the updated caches into the outputs.
+
+        A captured graph is replayed when one fits the chunk and cache sizes.
+        """
+        packed, t_emb = self.pack_chunk_inputs(x, mu, t, spks, cond)
+        if self.chunk_graphs is None:
+            velocity = None
+        else:
+            velocity = self.chunk_graphs.run(
+                packed, t_emb, cnn_cache, att_cache, new_cnn_cache, new_att_cache
+            )
+        if velocity is None:
+            velocity = self.blocks_forward_chunk(
+                packed,
+                t_emb,
+                None,
+                None,
+                cnn_cache,
+                att_cache,
+                new_cnn_cache,
+                new_att_cache,
+            )
+        return velocity

@@ -77,6 +77,19 @@ class Upsample1D(nn.Module):
         outputs = self.conv(outputs)
         return (outputs, input_lengths * self.stride)
 
+    def forward_chunk(
+        self, inputs: torch.Tensor, cache: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Upsample one chunk; the cache holds the last 2 * stride upsampled frames."""
+        outputs = F.interpolate(inputs, scale_factor=self.scale_factor, mode="nearest")
+        if cache is None:
+            cache = outputs.new_zeros(
+                outputs.shape[0], outputs.shape[1], self.stride * 2
+            )
+        outputs = torch.cat([cache, outputs], dim=2)
+        new_cache = outputs[..., -self.stride * 2 :]
+        return self.conv(outputs), new_cache
+
 
 class PreLookaheadLayer(nn.Module):
 
@@ -100,6 +113,24 @@ class PreLookaheadLayer(nn.Module):
         outputs = outputs.transpose(1, 2).contiguous()
         outputs = outputs + inputs
         return outputs
+
+    def forward_chunk(
+        self, inputs: torch.Tensor, cache: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Consume the chunk's trailing lookahead frames instead of zero padding.
+
+        The output is pre_lookahead_len frames shorter than the input; the
+        cache holds the two conv2 context frames for the next chunk.
+        """
+        outputs = inputs.transpose(1, 2).contiguous()
+        outputs = F.leaky_relu(self.conv1(outputs))
+        if cache is None:
+            cache = outputs.new_zeros(outputs.shape[0], outputs.shape[1], 2)
+        new_cache = outputs[..., -2:]
+        outputs = torch.cat([cache, outputs], dim=2)
+        outputs = self.conv2(outputs)
+        outputs = outputs.transpose(1, 2).contiguous()
+        return outputs + inputs[:, : -self.pre_lookahead_len], new_cache
 
 
 class UpsampleConformerEncoderV2(torch.nn.Module):
@@ -200,7 +231,7 @@ class UpsampleConformerEncoderV2(torch.nn.Module):
         xs = self.pre_lookahead_layer(xs)
         xs = xs * masks.transpose(1, 2).to(xs)
         for layer in self.encoders:
-            xs = layer(xs, masks, pos_emb)
+            xs, _ = layer(xs, masks, pos_emb)
         xs = xs.transpose(1, 2).contiguous()
         xs, xs_lens = self.up_layer(xs, xs_lens)
         xs = xs.transpose(1, 2).contiguous()
@@ -209,10 +240,78 @@ class UpsampleConformerEncoderV2(torch.nn.Module):
         xs, pos_emb, masks = self.up_embed(xs, masks)
         xs = xs * masks.transpose(1, 2).to(xs)
         for layer in self.up_encoders:
-            xs = layer(xs, masks, pos_emb)
+            xs, _ = layer(xs, masks, pos_emb)
         if self.normalize_before:
             xs = self.after_norm(xs)
         return (xs, masks)
+
+    def forward_chunk(
+        self,
+        xs: torch.Tensor,
+        last_chunk: bool,
+        cnn_cache: torch.Tensor | None,
+        att_cache: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Encode one token chunk against the caches of the preceding chunks.
+
+        The chunk carries pre_lookahead_len trailing lookahead tokens unless it
+        is the last one, which is zero padded instead. The attention cache
+        stacks both conformer stacks along dim 0: the token-rate stack's keys
+        are repeated twice along time so they share the frame-rate layout.
+
+        Args:
+            xs: (batch, tokens, channels) embedded tokens.
+            cnn_cache: (batch, channels, 2 + 2 * stride) conv context.
+            att_cache: (blocks + up_blocks, batch, heads, 2 * cached_tokens, 2 * d_k).
+        Returns:
+            Encoded frames and the updated caches in the same layouts.
+        """
+        num_blocks = len(self.encoders)
+        if att_cache is None:
+            token_offset = 0
+            att_cache1: list[torch.Tensor | None] | torch.Tensor = [None] * num_blocks
+            att_cache2: list[torch.Tensor | None] | torch.Tensor = [None] * len(
+                self.up_encoders
+            )
+        else:
+            token_offset = att_cache.shape[3] // 2
+            att_cache1 = att_cache[:num_blocks, :, :, :token_offset]
+            att_cache2 = att_cache[num_blocks:]
+        if cnn_cache is None:
+            cnn_cache1 = cnn_cache2 = None
+        else:
+            cnn_cache1, cnn_cache2 = cnn_cache[:, :, :2], cnn_cache[:, :, 2:]
+        xs, _, _ = self.embed(xs, None)
+        if last_chunk:
+            xs = F.pad(xs, (0, 0, 0, self.pre_lookahead_layer.pre_lookahead_len))
+        xs, new_cnn_cache1 = self.pre_lookahead_layer.forward_chunk(xs, cnn_cache1)
+        pos_emb = self.embed.pos_enc.position_encoding(token_offset + xs.shape[1])
+        new_att_cache1 = []
+        for idx, layer in enumerate(self.encoders):
+            xs, layer_cache = layer(xs, None, pos_emb, att_cache1[idx])
+            new_att_cache1.append(layer_cache)
+        xs = xs.transpose(1, 2).contiguous()
+        xs, new_cnn_cache2 = self.up_layer.forward_chunk(xs, cnn_cache2)
+        xs = xs.transpose(1, 2).contiguous()
+        xs, _, _ = self.up_embed(xs, None)
+        pos_emb = self.up_embed.pos_enc.position_encoding(
+            token_offset * self.up_layer.stride + xs.shape[1]
+        )
+        new_att_cache2 = []
+        for idx, layer in enumerate(self.up_encoders):
+            xs, layer_cache = layer(xs, None, pos_emb, att_cache2[idx])
+            new_att_cache2.append(layer_cache)
+        if self.normalize_before:
+            xs = self.after_norm(xs)
+        new_att_cache = torch.cat(
+            [
+                torch.stack(new_att_cache1).repeat(1, 1, 1, 2, 1),
+                torch.stack(new_att_cache2),
+            ],
+            dim=0,
+        )
+        new_cnn_cache = torch.cat([new_cnn_cache1, new_cnn_cache2], dim=2)
+        return xs, new_cnn_cache, new_att_cache
 
 
 def make_pad_mask(lengths: torch.Tensor, max_len: int = 0) -> torch.Tensor:

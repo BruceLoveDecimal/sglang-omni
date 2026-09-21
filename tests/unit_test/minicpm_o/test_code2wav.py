@@ -187,6 +187,7 @@ def test_vocode_slices_waveforms_to_token_lengths() -> None:
             return wav, None
 
     model = MiniCPMOCode2Wav.__new__(MiniCPMOCode2Wav)
+    model.chunked_flow = False
     model.token2wav = SimpleNamespace(
         device=torch.device("cpu"),
         dtype=torch.float32,

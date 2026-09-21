@@ -112,10 +112,10 @@ class MultiHeadedAttention(nn.Module):
         return (q, k, v)
 
     def forward_attention(
-        self, value: torch.Tensor, scores: torch.Tensor, mask: torch.Tensor
+        self, value: torch.Tensor, scores: torch.Tensor, mask: torch.Tensor | None
     ) -> torch.Tensor:
         n_batch = value.size(0)
-        if mask.size(2) > 0:
+        if mask is not None:
             mask = mask.unsqueeze(1).eq(0)
             mask = mask[:, :, :, : scores.size(-1)]
             scores = scores.masked_fill(mask, -float("inf"))
@@ -154,10 +154,21 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        mask: torch.Tensor,
+        mask: torch.Tensor | None,
         pos_emb: torch.Tensor,
-    ) -> torch.Tensor:
+        cache: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Attend over the cached keys and values followed by the new frames.
+
+        Returns the layer output and the concatenated key/value cache
+        (batch, head, cache_frames + frames, 2 * d_k).
+        """
         q, k, v = self.forward_qkv(query, key, value)
+        if cache is not None:
+            key_cache, value_cache = torch.split(cache, cache.size(-1) // 2, dim=-1)
+            k = torch.cat([key_cache, k], dim=2)
+            v = torch.cat([value_cache, v], dim=2)
+        new_cache = torch.cat((k, v), dim=-1)
         q = q.transpose(1, 2)
         n_batch_pos = pos_emb.size(0)
         p = self.linear_pos(pos_emb).view(n_batch_pos, -1, self.h, self.d_k)
@@ -169,7 +180,7 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
         if matrix_ac.shape != matrix_bd.shape:
             matrix_bd = self.rel_shift(matrix_bd)
         scores = (matrix_ac + matrix_bd) / math.sqrt(self.d_k)
-        return self.forward_attention(v, scores, mask)
+        return self.forward_attention(v, scores, mask), new_cache
 
 
 class EspnetRelPositionalEncoding(torch.nn.Module):
@@ -204,13 +215,14 @@ class EspnetRelPositionalEncoding(torch.nn.Module):
         pe = torch.cat([pe_positive, pe_negative], dim=1)
         self.pe = pe.to(device=x.device, dtype=x.dtype)
 
+    def position_encoding(self, size: int) -> torch.Tensor:
+        """Relative encodings for a window of the given size, once pe is placed."""
+        return self.pe[:, self.pe.size(1) // 2 - size + 1 : self.pe.size(1) // 2 + size]
+
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         self.extend_pe(x)
         x = x * self.xscale
-        size = x.size(1)
-        pos_emb = self.pe[
-            :, self.pe.size(1) // 2 - size + 1 : self.pe.size(1) // 2 + size
-        ]
+        pos_emb = self.position_encoding(x.size(1))
         return (self.dropout(x), self.dropout(pos_emb))
 
 
@@ -278,12 +290,16 @@ class ConformerEncoderLayer(nn.Module):
         self.normalize_before = normalize_before
 
     def forward(
-        self, x: torch.Tensor, mask: torch.Tensor, pos_emb: torch.Tensor
-    ) -> torch.Tensor:
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor | None,
+        pos_emb: torch.Tensor,
+        att_cache: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         residual = x
         if self.normalize_before:
             x = self.norm_mha(x)
-        x_att = self.self_attn(x, x, x, mask, pos_emb)
+        x_att, new_att_cache = self.self_attn(x, x, x, mask, pos_emb, att_cache)
         x = residual + self.dropout(x_att)
         if not self.normalize_before:
             x = self.norm_mha(x)
@@ -293,4 +309,4 @@ class ConformerEncoderLayer(nn.Module):
         x = residual + self.dropout(self.feed_forward(x))
         if not self.normalize_before:
             x = self.norm_ff(x)
-        return x
+        return x, new_att_cache

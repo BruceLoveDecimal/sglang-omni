@@ -14,6 +14,10 @@ import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
 
+from sglang_omni.models.minicpm_o.components.token2wav.flow_chunk_graph import (
+    ChunkGraphKey,
+    DiTChunkGraphs,
+)
 from sglang_omni.models.weight_loader import resolve_dtype, resolve_model_path
 from sglang_omni.preprocessing.cache_key import hash_bytes, reference_path_cache_key
 
@@ -22,6 +26,17 @@ FLOW_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 OUTPUT_SAMPLE_RATE = 24000
 CODEC_TOKEN_RATE = 25
 SAMPLES_PER_CODEC_TOKEN = OUTPUT_SAMPLE_RATE // CODEC_TOKEN_RATE
+
+# Chunked flow: 25 tokens per chunk, three silence tokens ahead of the first
+# chunk, and attention caches bounded to the prompt plus 100 frames.
+CHUNK_TOKENS = 25
+SILENCE_TOKEN = 4218
+SILENCE_PREFIX_TOKENS = 3
+CHUNK_CACHE_KEEP_FRAMES = 100
+# Graph buckets: attention cost follows the padded cache, so several cache
+# sizes are captured for the regular chunk; prompts bucket by 64 frames.
+CHUNK_CACHE_FRAME_BUCKETS = (256, 512, 768, 1024)
+PROMPT_GRAPH_FRAME_BUCKET = 64
 
 
 class MiniCPMOCode2Wav(nn.Module):
@@ -35,6 +50,8 @@ class MiniCPMOCode2Wav(nn.Module):
         dtype: str | torch.dtype | None = None,
         n_timesteps: int = 10,
         prompt_wav: str | None = None,
+        chunked_flow: bool = False,
+        chunked_flow_cuda_graph: bool = True,
     ) -> None:
         super().__init__()
         from sglang_omni.models.minicpm_o.components.token2wav.vocoder import Token2Wav
@@ -65,6 +82,9 @@ class MiniCPMOCode2Wav(nn.Module):
             self.token2wav = Token2Wav(
                 Path(asset_dir), device=dev, dtype=torch_dtype, n_timesteps=n_timesteps
             )
+            self.chunked_flow = chunked_flow
+            if chunked_flow and chunked_flow_cuda_graph:
+                self.capture_chunk_graphs()
 
         if prompt_wav is None:
             default_wav = os.path.join(model_dir, "assets", "HT_ref_audio.wav")
@@ -126,6 +146,117 @@ class MiniCPMOCode2Wav(nn.Module):
             self.prompt_cache_key = prompt_key
         return self.token2wav.cache
 
+    def capture_chunk_graphs(self) -> None:
+        """Capture DiT graphs for the regular chunk and bucketed prompt lengths."""
+        flow = self.token2wav.flow
+        prompt_frame_limit = max(CHUNK_CACHE_FRAME_BUCKETS) - CHUNK_CACHE_KEEP_FRAMES
+        keys = [
+            ChunkGraphKey(CHUNK_TOKENS * flow.up_rate, cache_frames)
+            for cache_frames in CHUNK_CACHE_FRAME_BUCKETS
+        ]
+        keys += [
+            ChunkGraphKey(frames, 0)
+            for frames in range(
+                PROMPT_GRAPH_FRAME_BUCKET,
+                prompt_frame_limit + 1,
+                PROMPT_GRAPH_FRAME_BUCKET,
+            )
+        ]
+        graphs = DiTChunkGraphs(
+            flow.decoder.estimator,
+            device=self.token2wav.device,
+            autocast_dtype=(
+                None if self.token2wav.dtype == torch.float32 else self.token2wav.dtype
+            ),
+            keys=keys,
+        )
+        graphs.capture()
+        flow.decoder.estimator.chunk_graphs = graphs
+
+    def chunked_mel(
+        self,
+        tokens: Sequence[int],
+        prompt: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        """Generate one sequence's mel chunk by chunk with bounded attention caches.
+
+        Each chunk is CHUNK_TOKENS tokens plus the flow's lookahead; the last
+        chunk takes whatever remains. Three silence tokens lead the stream and
+        their frames are dropped, so the result has up_rate frames per token.
+        """
+        flow = self.token2wav.flow
+        prompt_tokens, _, embedding, prompt_mel = prompt
+        device = self.token2wav.device
+        n_timesteps = self.token2wav.n_timesteps
+        silence = torch.full(
+            (1, SILENCE_PREFIX_TOKENS),
+            SILENCE_TOKEN,
+            dtype=prompt_tokens.dtype,
+            device=device,
+        )
+        cache = flow.setup_chunk_cache(
+            torch.cat([prompt_tokens, silence], dim=1),
+            prompt_mel.to(flow.encoder_proj.weight.dtype),
+            embedding,
+            n_timesteps,
+        )
+        stream = [SILENCE_TOKEN] * SILENCE_PREFIX_TOKENS + list(tokens)
+        window = CHUNK_TOKENS + flow.pre_lookahead_len
+        prompt_frames = prompt_mel.shape[1]
+        mels = []
+        position = 0
+        while len(stream) - position >= window:
+            chunk = torch.tensor(
+                [stream[position : position + window]], dtype=torch.int32, device=device
+            )
+            mel, cache = flow.inference_chunk(
+                chunk, embedding, cache, False, n_timesteps
+            )
+            cache.truncate(prompt_frames, CHUNK_CACHE_KEEP_FRAMES)
+            mels.append(mel)
+            position += CHUNK_TOKENS
+        if position < len(stream):
+            chunk = torch.tensor([stream[position:]], dtype=torch.int32, device=device)
+            mel, _ = flow.inference_chunk(chunk, embedding, cache, True, n_timesteps)
+            mels.append(mel)
+        return torch.cat(mels, dim=2)[:, :, SILENCE_PREFIX_TOKENS * flow.up_rate :]
+
+    def batched_mel(
+        self,
+        token_sequences: Sequence[Sequence[int]],
+        prompt: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        """Generate the batch's mel in one whole-utterance flow pass."""
+        (
+            prompt_speech_tokens,
+            prompt_speech_tokens_lens,
+            speaker_embedding,
+            prompt_mels,
+        ) = prompt
+        batch_size = len(token_sequences)
+        device = self.token2wav.device
+        speech_tokens = pad_sequence(
+            [
+                torch.tensor(tokens, dtype=torch.int32, device=device)
+                for tokens in token_sequences
+            ],
+            batch_first=True,
+        )
+        speech_tokens_lens = torch.tensor(
+            [len(tokens) for tokens in token_sequences],
+            dtype=torch.int32,
+            device=device,
+        )
+        return self.token2wav.flow.inference(
+            speech_tokens,
+            speech_tokens_lens,
+            prompt_speech_tokens.expand(batch_size, -1).contiguous(),
+            prompt_speech_tokens_lens.expand(batch_size).contiguous(),
+            prompt_mels.expand(batch_size, -1, -1).contiguous(),
+            speaker_embedding.expand(batch_size, -1).contiguous(),
+            self.token2wav.n_timesteps,
+        )
+
     def vocode(
         self,
         token_sequences: Sequence[Sequence[int]],
@@ -137,48 +268,22 @@ class MiniCPMOCode2Wav(nn.Module):
         elif any(len(tokens) == 0 for tokens in token_sequences):
             raise ValueError("codec token sequences must be non-empty")
         else:
-            (
-                prompt_speech_tokens,
-                prompt_speech_tokens_lens,
-                speaker_embedding,
-                prompt_mels,
-            ) = self.speaker_prompt(prompt_wav)
+            prompt = self.speaker_prompt(prompt_wav)
             batch_size = len(token_sequences)
             token_lens = [len(tokens) for tokens in token_sequences]
-            speech_tokens = pad_sequence(
-                [
-                    torch.tensor(
-                        tokens, dtype=torch.int32, device=self.token2wav.device
-                    )
-                    for tokens in token_sequences
-                ],
-                batch_first=True,
-            )
-            speech_tokens_lens = torch.tensor(
-                token_lens, dtype=torch.int32, device=self.token2wav.device
-            )
-            prompt_speech_tokens = prompt_speech_tokens.expand(
-                batch_size, -1
-            ).contiguous()
-            prompt_speech_tokens_lens = prompt_speech_tokens_lens.expand(
-                batch_size
-            ).contiguous()
-            speaker_embedding = speaker_embedding.expand(batch_size, -1).contiguous()
-            prompt_mels = prompt_mels.expand(batch_size, -1, -1).contiguous()
             with torch.amp.autocast(
                 "cuda",
                 dtype=self.token2wav.dtype,
                 enabled=self.token2wav.dtype != torch.float32,
             ):
-                mel = self.token2wav.flow.inference(
-                    speech_tokens,
-                    speech_tokens_lens,
-                    prompt_speech_tokens,
-                    prompt_speech_tokens_lens,
-                    prompt_mels,
-                    speaker_embedding,
-                    self.token2wav.n_timesteps,
-                )
+                if self.chunked_flow:
+                    rows = [
+                        self.chunked_mel(tokens, prompt)[0].transpose(0, 1)
+                        for tokens in token_sequences
+                    ]
+                    mel = pad_sequence(rows, batch_first=True).transpose(1, 2)
+                else:
+                    mel = self.batched_mel(token_sequences, prompt)
             length_groups: dict[int, list[int]] = defaultdict(list)
             for idx, token_len in enumerate(token_lens):
                 length_groups[token_len * self.token2wav.flow.up_rate].append(idx)
