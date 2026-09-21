@@ -139,12 +139,7 @@ class MiniCPMOCode2Wav(nn.Module):
         token_sequences: Sequence[Sequence[int]],
         prompt_wav: str | bytes | Sequence[str | bytes] | None = None,
     ) -> list[np.ndarray]:
-        """Vocode a batch of codec-token sequences.
-
-        ``prompt_wav`` may be a single reference shared by the whole batch or
-        one reference per row, so mixed-reference and mixed-length rows batch
-        into a single flow forward and a single HiFT forward.
-        """
+        """Batch flow across references and preserve each HiFT sequence boundary."""
         if not token_sequences:
             return []
         if any(len(tokens) == 0 for tokens in token_sequences):
@@ -235,18 +230,28 @@ class MiniCPMOCode2Wav(nn.Module):
                 self.token2wav.n_timesteps,
             )
 
-        # One HiFT forward for the whole batch: pad to the longest mel, run once,
-        # then trim each row below. Exact-length grouping would fall back to one
-        # row per call whenever token lengths differ.
         up_rate = self.token2wav.flow.up_rate
-        max_mel_len = max(token_len * up_rate for token_len in token_lens)
-        speech_feat = mel[:, :, :max_mel_len].float().contiguous()
-        # note (MayDomine): HiFT stays FP32 when the flow runs in half precision.
-        wav, _ = self.token2wav.hift(speech_feat=speech_feat)
-        wav = wav.float().cpu()
-
-        waveforms: list[np.ndarray] = []
+        length_groups: dict[int, list[int]] = {}
         for idx, token_len in enumerate(token_lens):
-            n_samples = token_len * SAMPLES_PER_CODEC_TOKEN
-            waveforms.append(wav[idx].reshape(-1)[:n_samples].numpy())
-        return waveforms
+            length_groups.setdefault(token_len, []).append(idx)
+
+        waveform_rows: dict[int, torch.Tensor] = {}
+        # note (MayDomine): padding changes HiFT's noncausal convolution boundaries.
+        for token_len, indices in length_groups.items():
+            speech_feat = mel[indices, :, : token_len * up_rate].float().contiguous()
+            wav, _ = self.token2wav.hift(speech_feat=speech_feat)
+            for row, idx in enumerate(indices):
+                waveform_rows[idx] = wav[row].reshape(-1)[
+                    : token_len * SAMPLES_PER_CODEC_TOKEN
+                ]
+        wav = (
+            pad_sequence(
+                [waveform_rows[idx] for idx in range(batch_size)], batch_first=True
+            )
+            .float()
+            .cpu()
+        )
+        return [
+            wav[idx, : token_len * SAMPLES_PER_CODEC_TOKEN].numpy()
+            for idx, token_len in enumerate(token_lens)
+        ]

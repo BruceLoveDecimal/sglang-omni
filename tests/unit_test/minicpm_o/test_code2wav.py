@@ -285,6 +285,26 @@ def test_vocode_mixed_references_and_lengths_share_one_batch() -> None:
     ]
 
 
+def test_vocode_mixed_lengths_preserve_hift_boundaries() -> None:
+    class BoundarySensitiveHiFT:
+        def __call__(self, speech_feat: torch.Tensor) -> tuple[torch.Tensor, None]:
+            kernel = speech_feat.new_ones(1, 1, 3)
+            hidden = (
+                torch.nn.functional.conv1d(speech_feat[:, :1], kernel, padding=1) + 1
+            )
+            samples = torch.nn.functional.conv1d(hidden, kernel, padding=1)
+            waveform = samples.repeat_interleave(SAMPLES_PER_CODEC_TOKEN // 2, dim=-1)
+            return waveform, None
+
+    model = _batch_model()
+    model.token2wav.hift = BoundarySensitiveHiFT()
+    sequences = [[1, 2], [3, 4, 5], [6, 7]]
+    batched = model.vocode(sequences, b"ref")
+    for tokens, waveform in zip(sequences, batched, strict=True):
+        reference = model.vocode([tokens], b"ref")[0]
+        np.testing.assert_array_equal(waveform, reference)
+
+
 def test_vocode_rejects_empty_sequences() -> None:
     model = MiniCPMOCode2Wav.__new__(MiniCPMOCode2Wav)
     assert model.vocode([], b"ref") == []
