@@ -99,9 +99,11 @@ def test_qk_fusion_is_shared_by_attention_blocks_and_cleared(monkeypatch):
     )
     dit.qk_fusion.tables["request"] = (torch.ones(1),) * 3
     dit.text_cond = dit.text_uncond = torch.ones(1)
+    dit.rope_cache = (torch.ones(1),) * 3
     dit.clear_cache()
     assert not dit.qk_fusion.tables
     assert dit.text_cond is None and dit.text_uncond is None
+    assert dit.rope_cache is None
 
 
 def test_qk_fusion_can_be_disabled(monkeypatch):

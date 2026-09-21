@@ -277,7 +277,7 @@ def create_auk_engine_executor(
         if enable_packed_dit:
             raise ValueError(reason) from cause
         else:
-            logger.warning("Packed AuK DiT disabled: %s", reason)
+            logger.warning(f"Packed AuK DiT disabled: {reason}")
             return False
 
     # Resolved before _load_flow so an unusable device, checkpoint or kernel is

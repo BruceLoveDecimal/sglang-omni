@@ -17,7 +17,7 @@ from sglang_omni.models.auk.packed import flash_attention, gather_rope, gather_r
 
 
 def modulation(value, token_batch):
-    """Broadcast a per-request modulation row over padded ``[B, T, D]`` or packed rows."""
+    """Broadcast a per-request modulation row over padded [B, T, D] or packed rows."""
     if token_batch is None:
         return value[:, None]
     elif value.shape[0] == 1:
@@ -29,7 +29,7 @@ def modulation(value, token_batch):
 
 
 def attention_bias(key_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """Additive SDPA bias ``[B, 1, 1, K]`` from a boolean key-padding mask ``[B, K]``."""
+    """Additive SDPA bias [B, 1, 1, K] from a boolean key-padding mask [B, K]."""
     # -inf is safe: every request has at least one valid text token and audio
     # frame, so no softmax row is fully masked.
     bias = torch.zeros(key_mask.shape, dtype=dtype, device=key_mask.device)
@@ -221,7 +221,7 @@ class Attention(nn.Module):
 
     @staticmethod
     def attend(q, k, v, bias: torch.Tensor | None):
-        """SDPA with an optional additive key bias ``[B, 1, 1, K]``, then merge heads."""
+        """SDPA with an optional additive key bias [B, 1, 1, K], then merge heads."""
         batch = q.shape[0]
         out = F.scaled_dot_product_attention(
             q, k, v, attn_mask=bias, dropout_p=0.0, is_causal=False
@@ -290,7 +290,7 @@ class Attention(nn.Module):
         return x_out, c_out
 
     def forward_packed(self, x, c, rope, c_rope, layout):
-        """Attention over packed ``[tokens, D]`` rows bounded by ``layout.cu_seqlens``."""
+        """Attention over packed [tokens, D] rows bounded by layout.cu_seqlens."""
 
         def project(rows, linear, q_norm, k_norm, positions):
             q, k, v = linear(rows).view(rows.shape[0], 3, self.heads, -1).unbind(1)
@@ -571,6 +571,7 @@ class AuKDit(nn.Module):
 
         self.text_cond: torch.Tensor | None = None
         self.text_uncond: torch.Tensor | None = None
+        self.rope_cache: tuple | None = None
         self.qk_fusion = None
 
         self.initialize_weights()
@@ -590,9 +591,49 @@ class AuKDit(nn.Module):
         nn.init.constant_(self.proj_out.bias, 0)
 
     def clear_cache(self) -> None:
-        self.text_cond, self.text_uncond = None, None
+        self.text_cond, self.text_uncond, self.rope_cache = None, None, None
         if self.qk_fusion is not None:
             self.qk_fusion.clear()
+
+    def rope_tables(
+        self,
+        seq_len: int,
+        text_len: int,
+        audio_positions: torch.Tensor | None,
+        joint_positions: torch.Tensor | None,
+        packed_layout,
+        cache: bool,
+    ):
+        """Audio, text and joint rotary tables, built once per trajectory.
+
+        Positions do not change between Euler steps, so cache=True keeps
+        the tables next to the text projections. Every step then hands the
+        same freqs tensors to the blocks: the fused Q/K kernel's cos/sin cache
+        stays at three entries instead of growing by three per step, and the
+        t.max() sync inside RotaryEmbedding.forward runs once.
+        """
+        if cache and self.rope_cache is not None:
+            return self.rope_cache
+        rope_audio = (
+            self.rotary_embed.forward_from_seq_len(seq_len)
+            if audio_positions is None
+            else self.rotary_embed(audio_positions)
+        )
+        rope_text = self.rotary_embed.forward_from_seq_len(text_len)
+        rope_joint = (
+            self.rotary_embed.forward_from_seq_len(text_len + seq_len)
+            if joint_positions is None
+            else self.rotary_embed(joint_positions)
+        )
+        if packed_layout is not None:
+            batch = packed_layout.batch
+            rope_audio = gather_rope(rope_audio, packed_layout.audio_indices, batch)
+            rope_text = gather_rope(rope_text, packed_layout.text_indices, batch)
+            rope_joint = gather_rope(rope_joint, packed_layout.joint_indices, batch)
+        tables = (rope_audio, rope_text, rope_joint)
+        if cache:
+            self.rope_cache = tables
+        return tables
 
     @property
     def dtype(self) -> torch.dtype:
@@ -712,22 +753,13 @@ class AuKDit(nn.Module):
 
         seq_len = x.shape[1]
         text_len = c.shape[1]
-        rope_audio = (
-            self.rotary_embed.forward_from_seq_len(seq_len)
-            if audio_positions is None
-            else self.rotary_embed(audio_positions)
+        rope_audio, rope_text, rope_joint = self.rope_tables(
+            seq_len, text_len, audio_positions, joint_positions, packed_layout, cache
         )
-        rope_text = self.rotary_embed.forward_from_seq_len(text_len)
 
         if packed_layout is not None:
             x = gather_rows(x, packed_layout.audio_indices)
             c = gather_rows(c, packed_layout.text_indices)
-            rope_audio = gather_rope(
-                rope_audio, packed_layout.audio_indices, packed_layout.batch
-            )
-            rope_text = gather_rope(
-                rope_text, packed_layout.text_indices, packed_layout.batch
-            )
             # Packed rows carry no padding, so there is nothing to mask.
             audio_mask = c_mask = joint_bias = single_bias = single_mask = None
         elif audio_mask is None:
@@ -755,22 +787,16 @@ class AuKDit(nn.Module):
                 packed_layout=packed_layout,
             )
 
-        rope = (
-            self.rotary_embed.forward_from_seq_len(text_len + seq_len)
-            if joint_positions is None
-            else self.rotary_embed(joint_positions)
-        )
         if packed_layout is None:
             x = torch.cat([c, x], dim=1)
         else:
             x = torch.cat([c, x], dim=0).index_select(0, packed_layout.single_order)
-            rope = gather_rope(rope, packed_layout.joint_indices, packed_layout.batch)
         for block in self.single_transformer_blocks:
             x = block(
                 x,
                 t,
                 mask=single_mask,
-                rope=rope,
+                rope=rope_joint,
                 bias=single_bias,
                 packed_layout=packed_layout,
             )
