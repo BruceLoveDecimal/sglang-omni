@@ -92,8 +92,9 @@ Multi-request DiT batches run packed by default. The transformer blocks run
 only valid text/reference/target tokens through Linear, Norm, FFN and non-
 causal variable-length FlashAttention. Original position IDs and separate CFG
 branches are preserved. Convolutional audio embeddings and the FP32 Euler state
-retain their padded layout; layout indices and rotary tables are built once
-per trajectory.
+retain their padded layout. Layout indices, rotary tables, text projections,
+reference embeddings and timestep embeddings are built once per trajectory
+and handed to every Euler step as one plan.
 Singleton batches retain the padded execution path. Packing requires a CUDA
 BF16 backbone, a checkpoint with `attn_mask_enabled`, and SGLang's varlen
 FlashAttention. The version follows SGLang's own predicates: FA4 wherever

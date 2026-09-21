@@ -85,15 +85,13 @@ def test_packed_matches_padded_with_holes_and_stored_padding(
     permuted = flow.sample_batch(items[::-1], enable_packed_dit=True, **sampling)
     for a, b in zip(permuted[::-1], actual):
         torch.testing.assert_close(a, b, atol=1e-9, rtol=1e-8)
-    assert flow.transformer.text_cond is None
 
 
 @pytest.mark.parametrize("enable_packed_dit", [False, True])
 @torch.inference_mode()
 def test_rope_tables_are_built_once_per_trajectory(monkeypatch, enable_packed_dit):
     """Positions are fixed across Euler steps: three rotary tables per trajectory,
-    handed to the fused Q/K kernel as the same tensors, then dropped with the
-    text cache."""
+    handed to the fused Q/K kernel as the same tensors on every step."""
     monkeypatch.setattr("sglang_omni.models.auk.dit.flash_attention", reference_varlen)
     flow, items = make_flow(), make_items()
     rotary = flow.transformer.rotary_embed
@@ -105,13 +103,13 @@ def test_rope_tables_are_built_once_per_trajectory(monkeypatch, enable_packed_di
     keys = set()
 
     class RecordingFusion:
-        """Stand-in for QKFusion: record the table key, run the native math."""
+        """Stand-in for fused_norm_rope: record the table, run the native math."""
 
         def __init__(self, attention):
             self.attention = attention
 
         def __call__(self, q, k, q_norm, k_norm, rope):
-            keys.add((rope[0].data_ptr(), tuple(rope[0].shape)))
+            keys.add((rope.freqs.data_ptr(), tuple(rope.freqs.shape)))
             self.attention.qk_fusion = None
             try:
                 return self.attention.norm_rope(q, k, q_norm, k_norm, rope)
@@ -130,7 +128,6 @@ def test_rope_tables_are_built_once_per_trajectory(monkeypatch, enable_packed_di
     # Audio, text and joint tables: one build each, not one per Euler step.
     assert len(calls) == 3
     assert len(keys) == 3
-    assert flow.transformer.rope_cache is None
 
 
 @torch.inference_mode()
