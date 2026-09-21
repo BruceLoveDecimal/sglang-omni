@@ -6,14 +6,16 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import partial
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 
-from sglang_omni.models.auk.dit import AuKDit
+from sglang_omni.models.auk.dit import AuKDit, AuKDitPlan
 from sglang_omni.models.auk.packed import PackedLayout
+from sglang_omni.models.auk.step_cuda_graph import AuKStepCudaGraphRunner
 
 
 def request_generator(
@@ -29,6 +31,14 @@ def fuse_hidden_states(hidden_states, layer_weights, layer_scale):
     stacked = F.layer_norm(hidden_states[:, 1:], [d_llm])
     weights = F.softmax(layer_weights, dim=0)
     return (stacked * weights[None, :, None, None]).sum(dim=1) * layer_scale
+
+
+def pad_rows(tensor: torch.Tensor, rows: int) -> torch.Tensor:
+    """Pad axis 1 up to rows with zeros, i.e. False for a boolean mask."""
+    extra = rows - tensor.shape[1]
+    if extra <= 0:
+        return tensor
+    return F.pad(tensor, [0, 0] * (tensor.ndim - 2) + [0, extra])
 
 
 def build_time_grid(
@@ -80,6 +90,7 @@ class AuKFlowMatching(nn.Module):
         cfg_strength: float,
         sway_sampling_coef: float | None = None,
         t_grid: Sequence[float] | None = None,
+        step_graph: AuKStepCudaGraphRunner | None = None,
     ) -> torch.Tensor:
         return self.sample_batch(
             [item],
@@ -87,6 +98,7 @@ class AuKFlowMatching(nn.Module):
             cfg_strength=cfg_strength,
             sway_sampling_coef=sway_sampling_coef,
             t_grid=t_grid,
+            step_graph=step_graph,
         )[0]
 
     @torch.no_grad()
@@ -99,18 +111,27 @@ class AuKFlowMatching(nn.Module):
         sway_sampling_coef: float | None = None,
         t_grid: Sequence[float] | None = None,
         enable_packed_dit: bool = False,
+        step_graph: AuKStepCudaGraphRunner | None = None,
     ) -> list[torch.Tensor]:
+        """Integrate the velocity field for a batch of requests.
+
+        With a step graph the batch pads to one of that runner's declared
+        shapes, so one captured step can be replayed for every NFE step. A
+        multi-request batch no declared shape covers runs packed instead when
+        enable_packed_dit is set.
+        """
         device = next(self.parameters()).device
         dim = self.transformer.latent_dim
         # Inputs follow the backbone dtype; y stays fp32 through type promotion.
         weight_dtype = self.transformer.dtype
 
-        def pack(tensors):
-            return (
+        def pack(tensors, rows=None):
+            packed = (
                 tensors[0].unsqueeze(0)
                 if len(tensors) == 1
                 else pad_sequence(tensors, batch_first=True)
             )
+            return packed if rows is None else pad_rows(packed, rows)
 
         references = [
             (
@@ -120,13 +141,27 @@ class AuKFlowMatching(nn.Module):
             )
             for item in items
         ]
-        ref = pack(references).to(weight_dtype)
+        # note(Dayuxiaoshui): a runner declines a batch no captured shape
+        # covers, so the padding carries both decisions: no padding, no bind.
+        padding = None
+        if step_graph is not None:
+            padding = step_graph.pad_lengths(
+                frames=max(item.target_frames for item in items),
+                ref=max(reference.shape[0] for reference in references),
+                text=max(item.conditioning.shape[0] for item in items),
+                batch=len(items),
+            )
+        frame_rows, ref_rows, text_rows = (
+            padding if padding is not None else (None, None, None)
+        )
+
+        ref = pack(references, ref_rows).to(weight_dtype)
         ref_mask = (
             torch.arange(ref.shape[1], device=device)[None, :]
             < torch.tensor([item.ref_length for item in items], device=device)[:, None]
         )
-        text = pack([item.conditioning for item in items]).to(weight_dtype)
-        text_mask = pack([item.text_mask for item in items])
+        text = pack([item.conditioning for item in items], text_rows).to(weight_dtype)
+        text_mask = pack([item.text_mask for item in items], text_rows)
         noise = []
         for item in items:
             generator = request_generator(item.seed, device)
@@ -139,9 +174,11 @@ class AuKFlowMatching(nn.Module):
                     generator=generator,
                 )
             )
-        y0 = pack(noise)
+        y0 = pack(noise, frame_rows)
         mask = audio_positions = joint_positions = None
-        if len(items) > 1:
+        # note(Dayuxiaoshui): positions come from the real lengths, so a padded
+        # batch places each request's frames where the unpadded one would.
+        if len(items) > 1 or padding is not None:
             target_positions = torch.arange(y0.shape[1], device=device)[None, :]
             mask = (
                 target_positions
@@ -175,7 +212,9 @@ class AuKFlowMatching(nn.Module):
             )
 
         cfg = cfg_strength >= 1e-5
-        if not enable_packed_dit or len(items) == 1:
+        # Packed rows have no fixed shape to capture, so a batch a graph covers
+        # stays padded and packing serves the batches no declared shape does.
+        if padding is not None or not enable_packed_dit or len(items) == 1:
             packed_layout = None
         elif not self.transformer.attn_mask_enabled:
             raise ValueError("Packed AuK DiT requires attn_mask_enabled")
@@ -207,17 +246,41 @@ class AuKFlowMatching(nn.Module):
             audio_positions=audio_positions,
             joint_positions=joint_positions,
             packed_layout=packed_layout,
-            time_grid=t,
             cfg=cfg,
         )
-        # Fixed-grid Euler integration, matching the released inference recipe.
-        y = y0
-        for step in range(t.numel() - 1):
-            pred = self.transformer(
-                y.to(weight_dtype), plan.time_embeddings[step : step + 1], plan
-            )
+        time_embeddings = self.transformer.time_embed(t[:-1])
+
+        def step(plan, time_embedding, x):
+            pred = self.transformer(x.to(weight_dtype), time_embedding, plan)
             if cfg:
                 v_cond, v_uncond = torch.chunk(pred, 2, dim=0)
                 pred = v_cond + (v_cond - v_uncond) * cfg_strength
-            y = y + (t[step + 1] - t[step]) * pred
-        return [latent[: item.target_frames] for item, latent in zip(items, y)]
+            return pred
+
+        fn = None
+        if padding is not None:
+            # The runner keys and copies a flat mapping, so the plan is spread
+            # over its tensors on the way in and rebuilt inside the capture.
+            fn = step_graph.bind(
+                lambda inputs, time_embedding, x: step(
+                    AuKDitPlan.from_inputs(inputs), time_embedding, x
+                ),
+                plan.to_inputs(),
+                x=y0,
+                time=time_embeddings[:1],
+                baked=(cfg_strength,),
+            )
+        if fn is None:
+            fn = partial(step, plan)
+        result = integrate(fn, y0, t, time_embeddings)
+        return [latent[: item.target_frames] for item, latent in zip(items, result)]
+
+
+def integrate(
+    fn, y0: torch.Tensor, t: torch.Tensor, time_embeddings: torch.Tensor
+) -> torch.Tensor:
+    """Fixed-grid Euler integration, matching the released inference recipe."""
+    y = y0
+    for step in range(t.numel() - 1):
+        y = y + (t[step + 1] - t[step]) * fn(time_embeddings[step : step + 1], y)
+    return y

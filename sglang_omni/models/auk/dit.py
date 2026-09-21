@@ -6,7 +6,10 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields
+from types import MethodType
+from typing import Any, NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -27,10 +30,13 @@ def modulation(value: torch.Tensor, packed: bool) -> torch.Tensor:
     return value[0] if packed else value[:, None]
 
 
-@dataclass(frozen=True)
-class RopeTable:
+class Rope(NamedTuple):
     """Rotary frequencies of one token stream plus the trig tables the fused
-    Q/K kernel reads, built once per trajectory."""
+    Q/K kernel reads, built once per trajectory.
+
+    A compiled block reads the tables as plain tensors from here, so a
+    trajectory adds no guards of its own.
+    """
 
     freqs: torch.Tensor
     scale: torch.Tensor | float
@@ -38,7 +44,7 @@ class RopeTable:
     sin: torch.Tensor
 
     @classmethod
-    def build(cls, freqs: torch.Tensor, scale: torch.Tensor | float) -> RopeTable:
+    def build(cls, freqs: torch.Tensor, scale: torch.Tensor | float) -> Rope:
         return cls(freqs, scale, freqs.cos(), freqs.sin())
 
 
@@ -220,7 +226,7 @@ class Attention(nn.Module):
 
     @staticmethod
     def apply_rope(
-        q: torch.Tensor, k: torch.Tensor, rope: RopeTable
+        q: torch.Tensor, k: torch.Tensor, rope: Rope
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return (
             apply_rotary_pos_emb(q, rope.freqs, rope.scale),
@@ -236,7 +242,7 @@ class Attention(nn.Module):
         )
         return out.transpose(1, 2).reshape(batch, -1, q.shape[1] * q.shape[3])
 
-    def norm_rope(self, q, k, q_norm, k_norm, rope: RopeTable):
+    def norm_rope(self, q, k, q_norm, k_norm, rope: Rope):
         if self.qk_fusion is not None:
             return self.qk_fusion(q, k, q_norm, k_norm, rope)
         return self.apply_rope(q_norm(q), k_norm(k), rope)
@@ -246,8 +252,8 @@ class Attention(nn.Module):
         x: torch.Tensor,
         c: torch.Tensor | None = None,
         mask: torch.Tensor | None = None,
-        rope: RopeTable | None = None,
-        c_rope: RopeTable | None = None,
+        rope: Rope | None = None,
+        c_rope: Rope | None = None,
         c_mask: torch.Tensor | None = None,
         bias: torch.Tensor | None = None,
         packed_layout: PackedLayout | None = None,
@@ -334,7 +340,7 @@ class Attention(nn.Module):
         self,
         x: torch.Tensor,
         mask: torch.Tensor | None,
-        rope: RopeTable,
+        rope: Rope,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         query, key, value = self.to_qkv(x).chunk(3, dim=-1)
@@ -374,7 +380,7 @@ class DiTBlock(nn.Module):
         x: torch.Tensor,
         t: torch.Tensor,
         mask: torch.Tensor | None = None,
-        rope: RopeTable | None = None,
+        rope: Rope | None = None,
         bias: torch.Tensor | None = None,
         packed_layout: PackedLayout | None = None,
     ) -> torch.Tensor:
@@ -428,8 +434,8 @@ class MMDiTBlock(nn.Module):
         c: torch.Tensor,
         t: torch.Tensor,
         mask: torch.Tensor | None = None,
-        rope: RopeTable | None = None,
-        c_rope: RopeTable | None = None,
+        rope: Rope | None = None,
+        c_rope: Rope | None = None,
         c_mask: torch.Tensor | None = None,
         bias: torch.Tensor | None = None,
         packed_layout: PackedLayout | None = None,
@@ -499,13 +505,40 @@ class AuKDitPlan:
     single_mask: torch.Tensor | None
     joint_bias: torch.Tensor | None
     single_bias: torch.Tensor | None
-    rope_audio: RopeTable
-    rope_text: RopeTable
-    rope_joint: RopeTable
-    time_embeddings: torch.Tensor
+    rope_audio: Rope
+    rope_text: Rope
+    rope_joint: Rope
     packed_layout: PackedLayout | None
     cfg: bool
     prompt_len: int
+
+    def to_inputs(self) -> dict[str, Any]:
+        """The plan as the flat mapping a step graph keys on and copies into
+        its static buffers, with each rope table spread over its tensors."""
+        assert self.packed_layout is None, "packed rows have no fixed shape to capture"
+        inputs: dict[str, Any] = {}
+        for field in fields(self):
+            value = getattr(self, field.name)
+            if isinstance(value, Rope):
+                inputs.update(
+                    (f"{field.name}.{k}", v) for k, v in value._asdict().items()
+                )
+            else:
+                inputs[field.name] = value
+        return inputs
+
+    @classmethod
+    def from_inputs(cls, inputs: Mapping[str, Any]) -> AuKDitPlan:
+        kwargs: dict[str, Any] = {}
+        for name, value in inputs.items():
+            head, _, tail = name.partition(".")
+            if tail:
+                kwargs.setdefault(head, {})[tail] = value
+            else:
+                kwargs[name] = value
+        return cls(
+            **{k: Rope(**v) if isinstance(v, dict) else v for k, v in kwargs.items()}
+        )
 
 
 @dataclass
@@ -600,6 +633,23 @@ class AuKDit(nn.Module):
         nn.init.constant_(self.proj_out.weight, 0)
         nn.init.constant_(self.proj_out.bias, 0)
 
+    def enable_fused_qk_norm_rope(
+        self, fusion: Callable[..., tuple[torch.Tensor, torch.Tensor]]
+    ) -> None:
+        """Route every block's Q/K norm and rope through the fused kernel."""
+        for block in (*self.transformer_blocks, *self.single_transformer_blocks):
+            block.attn.qk_fusion = fusion
+
+    def enable_compiled_blocks(self) -> None:
+        """Fold each block's elementwise chain into its matmul stream."""
+        # note(Dayuxiaoshui): compiling the unbound class forward gives all
+        # blocks of a kind one graph, because inline_inbuilt_nn_modules feeds
+        # the parameters in as inputs, so 30 blocks cost two compiles.
+        for blocks in (self.transformer_blocks, self.single_transformer_blocks):
+            compiled = torch.compile(type(blocks[0]).forward, dynamic=True)
+            for block in blocks:
+                block.forward = MethodType(compiled, block)
+
     @property
     def dtype(self) -> torch.dtype:
         return self.proj_out.weight.dtype
@@ -616,14 +666,12 @@ class AuKDit(nn.Module):
         audio_positions: torch.Tensor | None,
         joint_positions: torch.Tensor | None,
         packed_layout: PackedLayout | None,
-        time_grid: torch.Tensor,
         cfg: bool,
     ) -> AuKDitPlan:
         """Embed the inputs one trajectory's Euler steps share.
 
         ref may be zero-width. target_mask and the position rows are None for
-        a singleton batch, which then runs exactly as upstream does. time_grid
-        holds the steps' start times plus the final one.
+        a singleton batch, which then runs exactly as upstream does.
         """
         batch = text.shape[0]
         c = self.txt_norm(self.txt_proj(text))
@@ -696,10 +744,9 @@ class AuKDit(nn.Module):
             single_mask=single_mask,
             joint_bias=joint_bias,
             single_bias=single_bias,
-            rope_audio=RopeTable.build(*rope_audio),
-            rope_text=RopeTable.build(*rope_text),
-            rope_joint=RopeTable.build(*rope_joint),
-            time_embeddings=self.time_embed(time_grid[:-1]),
+            rope_audio=Rope.build(*rope_audio),
+            rope_text=Rope.build(*rope_text),
+            rope_joint=Rope.build(*rope_joint),
             packed_layout=packed_layout,
             cfg=cfg,
             prompt_len=prompt_len,
@@ -710,8 +757,8 @@ class AuKDit(nn.Module):
     ) -> torch.Tensor:
         """Velocity of the noised latent x [B, T, latent_dim] at one step.
 
-        time_embedding is that step's row of plan.time_embeddings; with cfg
-        the result stacks the conditional rows above the unconditional ones.
+        time_embedding is the step's [1, dim] row of time_embed; with cfg the
+        result stacks the conditional rows above the unconditional ones.
         """
         layout = plan.packed_layout
         packed = layout is not None

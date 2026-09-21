@@ -198,7 +198,7 @@ def checkpoint_flow():
     if not torch.cuda.is_available():
         pytest.skip("AuK packed parity requires CUDA")
     from sglang_omni.models.auk import packed
-    from sglang_omni.models.auk.fused_qk_norm_rope import fused_norm_rope
+    from sglang_omni.models.auk.fused_qk_norm_rope import fused_qk_norm_rope
     from sglang_omni.models.auk.stages import load_flow
     from sglang_omni.utils.checkpoint import resolve_checkpoint
 
@@ -206,12 +206,12 @@ def checkpoint_flow():
         packed.resolve_flash_version(torch.device("cuda", 0))
     except (ImportError, ValueError) as exc:
         pytest.skip(str(exc))
-    flow = load_flow(resolve_checkpoint(checkpoint), "cuda", torch.bfloat16)
+    flow = load_flow(resolve_checkpoint(checkpoint), "cuda", torch.bfloat16, False)
     for block in (
         *flow.transformer.transformer_blocks,
         *flow.transformer.single_transformer_blocks,
     ):
-        block.attn.qk_fusion = fused_norm_rope
+        block.attn.qk_fusion = fused_qk_norm_rope
     return flow
 
 

@@ -88,6 +88,12 @@ Base AuK uses Euler integration with factory defaults `nfe=32`, `cfg_strength=2.
 
 The DiT stores its weights in BF16 and runs without autocast by default (`--auk_engine.factory.weight_dtype bfloat16`), which removes the per-step FP32-to-BF16 weight casts. Set `--auk_engine.factory.weight_dtype float32` to keep FP32 weights with BF16 autocast instead; that is the upstream-exact recipe the parity test compares against, at roughly 1.3x the sampling time. The ODE state is integrated in FP32 in both modes.
 
+Two further sampling-speed options are on by default. `--auk_engine.factory.enable_dit_torch_compile` compiles each transformer block once for all blocks of its kind, folding the modulation, gating, and normalization chain into the matmul stream. `--auk_engine.factory.enable_dit_cuda_graph` captures one whole Euler step as a CUDA graph and replays it for every NFE step: only the noised latent and the timestep change between steps, so one capture serves a whole trajectory, and every later request whose shape it covers. Set either to `false` to fall back. The graph removes op-issue time and nothing else, so what it is worth depends on whether issuing a step costs more than running it; benchmark it on your own card before assuming it does.
+
+Graph capture requires padding, so a batch pads up to a declared capture shape -- a `(batch, frames, reference frames, text tokens)` tuple -- and only to one that covers it on every axis. The default list is the cross product of five frame rungs (192 to 768 frames, roughly 4s to 15s of audio), two conditioning profiles (an instruction alone, and a cloned voice carrying its reference's own tokens), and batch sizes 1 and 2; set your own with `--auk_engine.factory.dit_cuda_graph_capture_shapes`. A batch no declared shape covers -- a long reference, a wide batch -- runs the step eagerly and unpadded, since padding only pays for itself when it buys a replay.
+
+Padded rows are computed and discarded, not blended in: the attention bias sends masked keys to `-inf`, the convolutional position embedding masks its own input, and rope positions come from the real lengths, so a padded batch produces what the unpadded one does. `enable_dit_cuda_graph` is refused on a checkpoint whose config disables `attn_mask_enabled`, since that bias is what makes padding neutral. Block compilation and every declared capture are paid at startup rather than under the first request that needs each shape, because entering a capture synchronizes the whole device and empties the allocator cache while the conditioning and decode stages are running in the same process. A shape left without enough free device memory to capture logs a warning and runs eagerly; trim the list if startup time or graph memory matters. Sampling stays reproducible for a fixed input shape, but a different padded width is a different numerical path.
+
 Multi-request DiT batches run packed by default. The transformer blocks run
 only valid text/reference/target tokens through Linear, Norm, FFN and non-
 causal variable-length FlashAttention. Original position IDs and separate CFG
@@ -108,8 +114,10 @@ weights. When a check
 fails (`weight_dtype float32`, HIP, other devices, a missing kernel build) the
 engine logs the reason and keeps the padded path; set
 `--auk_engine.factory.enable_packed_dit true` to turn that into a startup
-error, or `false` to keep the padded path unconditionally. Packing does not
-enable CUDA graph capture. Different attention and GEMM reductions can change
+error, or `false` to keep the padded path unconditionally. Packed rows have no
+fixed shape to capture, so a batch a declared CUDA graph shape covers (see
+above) stays padded and replays its graph; packing serves the batches no
+declared shape does. Different attention and GEMM reductions can change
 generated waveforms relative to the padded path.
 
 `seed` initializes separate request-local generators for target noise and reference VAE posterior sampling, without changing the process RNG. Sampling is reproducible for fixed inputs; different batch shapes or compute backends can still produce numerical differences. Multiple structured references are rejected.

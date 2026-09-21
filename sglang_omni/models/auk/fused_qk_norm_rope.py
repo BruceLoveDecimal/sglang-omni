@@ -4,8 +4,9 @@
 import torch
 import triton
 import triton.language as tl
+from torch import nn
 
-from sglang_omni.models.auk.dit import RopeTable
+from sglang_omni.models.auk.dit import Rope
 
 
 @triton.jit(
@@ -84,14 +85,19 @@ def norm_rope_kernel(
     tl.store(K_OUT + row * HEAD_DIM + dim, k * cosine + k_pair * sine)
 
 
-def fused_norm_rope(
+def fused_qk_norm_rope(
     q: torch.Tensor,
     k: torch.Tensor,
-    q_norm: torch.nn.RMSNorm,
-    k_norm: torch.nn.RMSNorm,
-    rope: RopeTable,
+    q_norm: nn.RMSNorm,
+    k_norm: nn.RMSNorm,
+    rope: Rope,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Attention.norm_rope in one launch, reading the plan's trig tables."""
+    """Attention.norm_rope in one launch, reading the plan's trig tables.
+
+    The tables come in on the rope tuple rather than from a cache of this
+    module's own: the blocks that call this are compiled, and a lookup keyed on
+    the freqs pointer would make every trajectory a new guard to recompile for.
+    """
     if rope.scale != 1.0:
         raise ValueError("AuK Q/K fusion requires XPos disabled")
     cosine, sine = rope.cos, rope.sin
@@ -107,7 +113,8 @@ def fused_norm_rope(
     q_out = torch.empty(q.shape, device=q.device, dtype=output_dtype)
     k_out = torch.empty_like(q_out)
     epsilon = torch.finfo(output_dtype).eps if q_norm.eps is None else q_norm.eps
-    # Runtime sequence/outer strides share a kernel across request lengths.
+    # note(Dayuxiaoshui): runtime sequence and outer strides, so one kernel is
+    # shared across request lengths.
     norm_rope_kernel[(q.shape[2], q.shape[1], q.shape[0])](
         q,
         k,

@@ -103,7 +103,7 @@ def test_rope_tables_are_built_once_per_trajectory(monkeypatch, enable_packed_di
     keys = set()
 
     class RecordingFusion:
-        """Stand-in for fused_norm_rope: record the table, run the native math."""
+        """Stand-in for fused_qk_norm_rope: record the table, run the native math."""
 
         def __init__(self, attention):
             self.attention = attention
