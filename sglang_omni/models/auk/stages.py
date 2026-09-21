@@ -312,15 +312,13 @@ def create_auk_engine_executor(
         enable_packed_dit=packed,
     )
     if enable_dit_fused_qk_norm_rope and device.type == "cuda" and not config.is_flash:
-        from sglang_omni.models.auk.fused_qk_norm_rope import QKFusion
+        from sglang_omni.models.auk.fused_qk_norm_rope import fused_norm_rope
 
-        fusion = QKFusion()
-        flow.transformer.qk_fusion = fusion
         for block in (
             *flow.transformer.transformer_blocks,
             *flow.transformer.single_transformer_blocks,
         ):
-            block.attn.qk_fusion = fusion
+            block.attn.qk_fusion = fused_norm_rope
     return scheduler(
         lambda payloads: sample_batch(
             payloads,

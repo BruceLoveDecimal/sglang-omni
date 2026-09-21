@@ -93,7 +93,9 @@ def probe_flash_attention(device: torch.device, *, heads: int, head_dim: int) ->
     stage construction rather than on the first multi-request batch.
     """
     mask = torch.ones(2, 4, dtype=torch.bool, device=device)
-    layout = PackedLayout.build(mask, mask, prompt_width=0, target_width=4)
+    layout = PackedLayout.build(
+        mask, mask, prompt_width=0, target_width=4, max_seqlen=8
+    )
     q = torch.randn(16, heads, head_dim, dtype=torch.bfloat16, device=device)
     out = flash_attention(q, q, q, layout)
     if torch.isfinite(out).all():
@@ -134,21 +136,17 @@ def gather_rope(rope, indices, batch):
     return gather_rows(freqs, indices).unsqueeze(0), scale
 
 
-@dataclass
+@dataclass(frozen=True)
 class PackedLayout:
     audio_indices: torch.Tensor
     text_indices: torch.Tensor
-    audio_batch: torch.Tensor
-    text_batch: torch.Tensor
     joint_indices: torch.Tensor
     # Permutations between separate packed streams and request-major streams.
     double_order: torch.Tensor
     double_inverse: torch.Tensor
     single_order: torch.Tensor
-    single_batch: torch.Tensor
     target_rows: torch.Tensor
     target_indices: torch.Tensor
-    target_batch: torch.Tensor
     cu_seqlens: torch.Tensor
     max_seqlen: int
     batch: int
@@ -156,47 +154,46 @@ class PackedLayout:
     flash_version: int
 
     @classmethod
-    def build(cls, audio_mask, text_mask, prompt_width, target_width):
+    def build(cls, audio_mask, text_mask, prompt_width, target_width, max_seqlen):
         """Build once per trajectory, outside the Euler loop and graph capture.
 
         Select the masks themselves, not a prefix inferred from their sums:
         text and reference tensors can contain stored padding and holes.
+        max_seqlen bounds every request's joint length from host-side
+        lengths, so the build only synchronizes for the nonzero calls.
         """
         batch, audio_width = audio_mask.shape
         text_width = text_mask.shape[1]
+        joint_width = text_width + audio_width
         ai = audio_mask.flatten().nonzero().flatten()
         ci = text_mask.flatten().nonzero().flatten()
         ab = ai // audio_width
         cb = ci // text_width
         double_order = torch.argsort(torch.cat((ab, cb)), stable=True)
         single_order = torch.argsort(torch.cat((cb, ab)), stable=True)
-        single_mask = torch.cat((text_mask, audio_mask), dim=1)
-        ji = single_mask.flatten().nonzero().flatten()
-        joint_width = text_width + audio_width
-        single_batch = ji // joint_width
+        # Row-major indices into [batch, text ++ audio], in single-stream order.
+        ji = torch.cat(
+            (
+                cb * joint_width + ci % text_width,
+                ab * joint_width + text_width + ai % audio_width,
+            )
+        ).index_select(0, single_order)
         local = ji % joint_width - text_width - prompt_width
         target_rows = (local >= 0).nonzero().flatten()
-        target_batch = single_batch.index_select(0, target_rows)
-        target_indices = target_batch * target_width + local.index_select(
-            0, target_rows
-        )
-        lengths = single_mask.sum(1, dtype=torch.int32)
+        target_indices = (ji // joint_width) * target_width + local
+        lengths = torch.cat((text_mask, audio_mask), dim=1).sum(1, dtype=torch.int32)
         cu = torch.cat((lengths.new_zeros(1), lengths.cumsum(0, dtype=torch.int32)))
         return cls(
             ai,
             ci,
-            ab,
-            cb,
             ji,
             double_order,
             torch.argsort(double_order),
             single_order,
-            single_batch,
             target_rows,
-            target_indices,
-            target_batch,
+            target_indices.index_select(0, target_rows),
             cu,
-            int(lengths.max().item()),
+            max_seqlen,
             batch,
             target_width,
             # The kernel is CUDA-only; a non-CUDA layout only ever reaches a
