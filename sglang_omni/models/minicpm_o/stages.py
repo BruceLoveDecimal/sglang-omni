@@ -209,11 +209,13 @@ def create_code2wav_executor(
     max_batch_size: int = 8,
     max_batch_wait_ms: float = 0.0,
     batch_wait_when_idle: bool = False,
+    chunk_tokens: int,
     dtype: str | None = None,
     max_batch_cost: int | None = None,
 ) -> SimpleScheduler:
     model = MiniCPMOCode2Wav(
         model_path,
+        chunk_tokens=chunk_tokens,
         device=str(resolve_concrete_device(device, gpu_id)),
         dtype=dtype,
     )

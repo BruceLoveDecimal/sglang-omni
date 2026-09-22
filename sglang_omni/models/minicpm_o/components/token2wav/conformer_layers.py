@@ -112,12 +112,11 @@ class MultiHeadedAttention(nn.Module):
         return (q, k, v)
 
     def forward_attention(
-        self, value: torch.Tensor, scores: torch.Tensor, mask: torch.Tensor
+        self, value: torch.Tensor, scores: torch.Tensor, mask: torch.Tensor | None
     ) -> torch.Tensor:
         n_batch = value.size(0)
-        if mask.size(2) > 0:
+        if mask is not None:
             mask = mask.unsqueeze(1).eq(0)
-            mask = mask[:, :, :, : scores.size(-1)]
             scores = scores.masked_fill(mask, -float("inf"))
             attn = torch.softmax(scores, dim=-1).masked_fill(mask, 0.0)
         else:
@@ -151,13 +150,25 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
 
     def forward(
         self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        mask: torch.Tensor,
+        x: torch.Tensor,
+        mask: torch.Tensor | None,
         pos_emb: torch.Tensor,
-    ) -> torch.Tensor:
-        q, k, v = self.forward_qkv(query, key, value)
+        cache: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Attend over cached keys and values followed by the current chunk.
+
+        Args:
+            mask: (batch, 1, cached + time) key mask, or None for all valid.
+            cache: (batch, heads, cached, 2 * d_k) keys and values from earlier chunks.
+        Returns:
+            The attention output and the cache extended with this chunk.
+        """
+        q, k, v = self.forward_qkv(x, x, x)
+        if cache is not None:
+            key_cache, value_cache = torch.split(cache, cache.size(-1) // 2, dim=-1)
+            k = torch.cat([key_cache, k], dim=2)
+            v = torch.cat([value_cache, v], dim=2)
+        new_cache = torch.cat((k, v), dim=-1)
         q = q.transpose(1, 2)
         n_batch_pos = pos_emb.size(0)
         p = self.linear_pos(pos_emb).view(n_batch_pos, -1, self.h, self.d_k)
@@ -169,7 +180,7 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
         if matrix_ac.shape != matrix_bd.shape:
             matrix_bd = self.rel_shift(matrix_bd)
         scores = (matrix_ac + matrix_bd) / math.sqrt(self.d_k)
-        return self.forward_attention(v, scores, mask)
+        return self.forward_attention(v, scores, mask), new_cache
 
 
 class EspnetRelPositionalEncoding(torch.nn.Module):
@@ -179,18 +190,17 @@ class EspnetRelPositionalEncoding(torch.nn.Module):
         self.d_model = d_model
         self.xscale = math.sqrt(self.d_model)
         self.dropout = torch.nn.Dropout(p=dropout_rate)
-        self.pe = None
-        self.extend_pe(torch.tensor(0.0).expand(1, max_len))
+        self.pe: torch.Tensor | None = None
+        self.extend_pe(max_len, torch.tensor(0.0))
 
-    def extend_pe(self, x: torch.Tensor) -> None:
-        if self.pe is not None:
-            if self.pe.size(1) >= x.size(1) * 2 - 1:
-                if self.pe.dtype != x.dtype or self.pe.device != x.device:
-                    self.pe = self.pe.to(dtype=x.dtype, device=x.device)
-                return
-        pe_positive = torch.zeros(x.size(1), self.d_model)
-        pe_negative = torch.zeros(x.size(1), self.d_model)
-        position = torch.arange(0, x.size(1), dtype=torch.float32).unsqueeze(1)
+    def extend_pe(self, size: int, like: torch.Tensor) -> None:
+        if self.pe is not None and self.pe.size(1) >= size * 2 - 1:
+            if self.pe.dtype != like.dtype or self.pe.device != like.device:
+                self.pe = self.pe.to(dtype=like.dtype, device=like.device)
+            return
+        pe_positive = torch.zeros(size, self.d_model)
+        pe_negative = torch.zeros(size, self.d_model)
+        position = torch.arange(0, size, dtype=torch.float32).unsqueeze(1)
         div_term = torch.exp(
             torch.arange(0, self.d_model, 2, dtype=torch.float32)
             * -(math.log(10000.0) / self.d_model)
@@ -202,12 +212,12 @@ class EspnetRelPositionalEncoding(torch.nn.Module):
         pe_positive = torch.flip(pe_positive, [0]).unsqueeze(0)
         pe_negative = pe_negative[1:].unsqueeze(0)
         pe = torch.cat([pe_positive, pe_negative], dim=1)
-        self.pe = pe.to(device=x.device, dtype=x.dtype)
+        self.pe = pe.to(device=like.device, dtype=like.dtype)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        self.extend_pe(x)
+    def forward(self, x: torch.Tensor, size: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Scale x and return relative encodings covering size cached-plus-new positions."""
+        self.extend_pe(size, x)
         x = x * self.xscale
-        size = x.size(1)
         pos_emb = self.pe[
             :, self.pe.size(1) // 2 - size + 1 : self.pe.size(1) // 2 + size
         ]
@@ -231,12 +241,9 @@ class LinearNoSubsampling(torch.nn.Module):
         )
         self.pos_enc = pos_enc_class
 
-    def forward(
-        self, x: torch.Tensor, x_mask: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, size: int) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.out(x)
-        x, pos_emb = self.pos_enc(x)
-        return (x, pos_emb, x_mask)
+        return self.pos_enc(x, size)
 
 
 class PositionwiseFeedForward(torch.nn.Module):
@@ -278,12 +285,16 @@ class ConformerEncoderLayer(nn.Module):
         self.normalize_before = normalize_before
 
     def forward(
-        self, x: torch.Tensor, mask: torch.Tensor, pos_emb: torch.Tensor
-    ) -> torch.Tensor:
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor | None,
+        pos_emb: torch.Tensor,
+        att_cache: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         residual = x
         if self.normalize_before:
             x = self.norm_mha(x)
-        x_att = self.self_attn(x, x, x, mask, pos_emb)
+        x_att, new_att_cache = self.self_attn(x, mask, pos_emb, att_cache)
         x = residual + self.dropout(x_att)
         if not self.normalize_before:
             x = self.norm_mha(x)
@@ -293,4 +304,4 @@ class ConformerEncoderLayer(nn.Module):
         x = residual + self.dropout(self.feed_forward(x))
         if not self.normalize_before:
             x = self.norm_ff(x)
-        return x
+        return x, new_att_cache

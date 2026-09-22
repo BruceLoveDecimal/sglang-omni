@@ -231,10 +231,15 @@ class HiFTGenerator(nn.Module):
         return x
 
     @torch.inference_mode()
-    def forward(self, speech_feat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, speech_feat: torch.Tensor, cache_source: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Vocode mel frames; cache_source replays the excitation of overlapping frames."""
         f0 = self.f0_predictor(speech_feat)
         s = self.f0_upsamp(f0[:, None]).transpose(1, 2)
         s, _, _ = self.m_source(s)
         s = s.transpose(1, 2)
+        if cache_source is not None:
+            s[:, :, : cache_source.shape[2]] = cache_source
         generated_speech = self.decode(x=speech_feat, s=s)
         return (generated_speech, s)

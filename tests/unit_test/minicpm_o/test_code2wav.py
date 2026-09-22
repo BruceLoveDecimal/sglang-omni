@@ -16,12 +16,28 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 
 from sglang_omni.models.minicpm_o.components.code2wav import (
+    MEL_OVERLAP_FRAMES,
     SAMPLES_PER_CODEC_TOKEN,
+    SAMPLES_PER_MEL_FRAME,
+    SOURCE_OVERLAP_SAMPLES,
     MiniCPMOCode2Wav,
+    plan_chunks,
 )
-from sglang_omni.models.minicpm_o.components.token2wav.dit import TimestepEmbedder
+from sglang_omni.models.minicpm_o.components.token2wav.conformer import (
+    UpsampleConformerEncoderV2,
+)
+from sglang_omni.models.minicpm_o.components.token2wav.dit import DiT, TimestepEmbedder
+from sglang_omni.models.minicpm_o.components.token2wav.flow import (
+    CausalConditionalCFM,
+    CausalMaskedDiffWithXvec,
+    FlowCacheRow,
+    flow_cache_row,
+    stack_flow_caches,
+    trim_flow_cache,
+)
 from sglang_omni.models.minicpm_o.config import MiniCPMOSpeechPipelineConfig
 from sglang_omni.models.minicpm_o.payload_types import MiniCPMOPipelineState
 from sglang_omni.models.minicpm_o.routing import (
@@ -32,6 +48,9 @@ from sglang_omni.models.minicpm_o.stages import vocode_code2wav_payloads
 from sglang_omni.proto import OmniRequest, StagePayload
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+MEL_BINS = 6
+SPEAKER_DIM = 4
+PROMPT_TOKENS = {b"a": 3, b"b": 5, b"c": 4}
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
@@ -131,7 +150,7 @@ def test_native_vocoder_with_checkpoint() -> None:
     checkpoint = _checkpoint_dir()
     if checkpoint is None or not torch.cuda.is_available():
         pytest.skip("Set MINICPMO_CHECKPOINT and provide CUDA for vocoder validation")
-    model = MiniCPMOCode2Wav(str(checkpoint), device="cuda:0")
+    model = MiniCPMOCode2Wav(str(checkpoint), chunk_tokens=25, device="cuda:0")
     tokens = [1498, 1734, 3732, 3726, 3645]
     output = model(codec_tokens=torch.tensor(tokens))
     waveform = output["waveform"]
@@ -148,9 +167,9 @@ def test_native_vocoder_batch_matches_single_request_shapes() -> None:
     checkpoint = _checkpoint_dir()
     if checkpoint is None or not torch.cuda.is_available():
         pytest.skip("Set MINICPMO_CHECKPOINT and provide CUDA for vocoder validation")
-    model = MiniCPMOCode2Wav(str(checkpoint), device="cuda:0")
-    tokens_a = [1498, 1734, 3732, 3726, 3645]
-    tokens_b = tokens_a + [3645, 3726]
+    model = MiniCPMOCode2Wav(str(checkpoint), chunk_tokens=25, device="cuda:0")
+    tokens_a = [1498, 1734, 3732, 3726, 3645] * 8
+    tokens_b = tokens_a + [3645, 3726] * 5
     batched = model.vocode([tokens_a, tokens_b], None)
     single_a = model.vocode([tokens_a], None)[0]
     single_b = model.vocode([tokens_b], None)[0]
@@ -216,46 +235,232 @@ def test_speech_pipeline_enables_code2wav_batching_by_default() -> None:
     assert code2wav.factory.max_batch_size == 8
     assert code2wav.factory.max_batch_wait_ms == 0.0
     assert code2wav.factory.batch_wait_when_idle is False
+    assert code2wav.factory.chunk_tokens == 25
 
 
-def test_vocode_slices_waveforms_to_token_lengths() -> None:
-    class FakeFlow:
-        up_rate = 2
+def test_plan_chunks_gives_lookahead_to_all_but_the_last_chunk() -> None:
+    assert plan_chunks(60, 25, 3) == [(0, 25, False), (25, 50, False), (50, 60, True)]
+    assert plan_chunks(28, 25, 3) == [(0, 28, True)]
+    assert plan_chunks(29, 25, 3) == [(0, 25, False), (25, 29, True)]
+    assert plan_chunks(1, 25, 3) == [(0, 1, True)]
 
-        def inference(
-            self,
-            speech_tokens: torch.Tensor,
-            speech_tokens_lens: torch.Tensor,
-            *args: object,
-        ) -> torch.Tensor:
-            frames = speech_tokens.shape[1] * self.up_rate
-            return torch.zeros(speech_tokens.shape[0], 80, frames)
 
-    class FakeHiFT:
-        def __call__(self, speech_feat: torch.Tensor) -> tuple[torch.Tensor, None]:
-            samples = speech_feat.shape[-1] * (SAMPLES_PER_CODEC_TOKEN // 2)
-            wav = speech_feat.new_ones(speech_feat.shape[0], 1, samples)
-            return wav, None
+def _small_flow(seed: int = 0) -> CausalMaskedDiffWithXvec:
+    torch.manual_seed(seed)
+    encoder = UpsampleConformerEncoderV2(
+        input_size=8,
+        output_size=8,
+        attention_heads=2,
+        linear_units=16,
+        num_blocks=2,
+        num_up_blocks=1,
+        dropout_rate=0.0,
+        positional_dropout_rate=0.0,
+    )
+    estimator = DiT(
+        in_channels=4 * MEL_BINS,
+        out_channels=MEL_BINS,
+        depth=2,
+        num_heads=2,
+        head_dim=4,
+        hidden_size=8,
+    )
+    flow = CausalMaskedDiffWithXvec(
+        encoder,
+        CausalConditionalCFM(estimator),
+        input_size=8,
+        output_size=MEL_BINS,
+        spk_embed_dim=SPEAKER_DIM,
+    )
+    # The checkpoint-style zero init would make the estimator ignore its caches.
+    for parameter in flow.parameters():
+        parameter.data.normal_(0, 0.2)
+    return flow.eval()
 
+
+def _fake_speaker_prompt(
+    reference: bytes,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    length = PROMPT_TOKENS[reference]
+    generator = torch.Generator().manual_seed(length)
+    tokens = torch.randint(0, 100, (1, length), generator=generator, dtype=torch.int32)
+    embedding = torch.randn(1, SPEAKER_DIM, generator=generator)
+    mel = torch.randn(1, 2 * length, MEL_BINS, generator=generator)
+    return tokens, torch.tensor([length], dtype=torch.int32), embedding, mel
+
+
+class _OverlapSensitiveHiFT:
+    """Deterministic stand-in whose output depends on neighbours and the source cache."""
+
+    def __call__(
+        self, speech_feat: torch.Tensor, cache_source: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        kernel = speech_feat.new_ones(1, 1, 3)
+        hidden = F.conv1d(speech_feat[:, :1], kernel, padding=1) + 1
+        source = hidden.repeat_interleave(SAMPLES_PER_MEL_FRAME, dim=-1)
+        if cache_source is not None:
+            source[:, :, : cache_source.shape[2]] = cache_source
+        wav = F.conv1d(source, kernel, padding=1).squeeze(1)
+        return wav, source
+
+
+def _chunked_model(chunk_tokens: int = 4) -> MiniCPMOCode2Wav:
     model = MiniCPMOCode2Wav.__new__(MiniCPMOCode2Wav)
     model.token2wav = SimpleNamespace(
         device=torch.device("cpu"),
         dtype=torch.float32,
-        n_timesteps=10,
-        flow=FakeFlow(),
-        hift=FakeHiFT(),
+        n_timesteps=2,
+        flow=_small_flow(),
+        hift=_OverlapSensitiveHiFT(),
     )
-    model.speaker_prompt = lambda prompt_wav: (
-        torch.zeros(1, 1, dtype=torch.int32),
-        torch.tensor([1], dtype=torch.int32),
-        torch.zeros(1, 4),
-        torch.zeros(1, 1, 80),
+    model.chunk_tokens = chunk_tokens
+    model.default_prompt_wav = None
+    model.prompt_cache = OrderedDict()
+    model.prompt_cache_capacity = 4
+    model.flow_cache = OrderedDict()
+    model.flow_cache_capacity = 4
+    model.speech_window = torch.hamming_window(
+        2 * SOURCE_OVERLAP_SAMPLES, periodic=False
     )
-    waveforms = model.vocode([[1, 2], [3, 4, 5]], b"ref")
-    assert [wave.shape for wave in waveforms] == [
-        (2 * SAMPLES_PER_CODEC_TOKEN,),
-        (3 * SAMPLES_PER_CODEC_TOKEN,),
+    model.speaker_prompt = _fake_speaker_prompt
+    return model
+
+
+def _sequences(lengths: list[int]) -> list[list[int]]:
+    generator = torch.Generator().manual_seed(7)
+    return [
+        torch.randint(0, 100, (length,), generator=generator).tolist()
+        for length in lengths
     ]
+
+
+def test_vocode_batch_matches_single_rows_across_references_and_lengths() -> None:
+    model = _chunked_model()
+    sequences = _sequences([3, 9, 12, 5, 8])
+    references = [b"a", b"b", b"a", b"c", b"b"]
+    batched = model.vocode(sequences, references)
+    for tokens, reference, waveform in zip(sequences, references, batched, strict=True):
+        assert waveform.shape == (len(tokens) * SAMPLES_PER_CODEC_TOKEN,)
+        single = model.vocode([tokens], reference)[0]
+        np.testing.assert_allclose(waveform, single, rtol=1e-4, atol=1e-4)
+
+
+def test_vocode_reuses_reference_flow_state_across_rows_and_calls() -> None:
+    model = _chunked_model()
+    flow = model.token2wav.flow
+    model.token2wav.flow.prompt_cache = MagicMock(wraps=flow.prompt_cache)
+    model.vocode(_sequences([4, 6, 5]), [b"a", b"b", b"a"])
+    model.vocode(_sequences([7]), b"b")
+    assert model.token2wav.flow.prompt_cache.call_count == 2
+
+
+def test_vocode_overlap_windows_carry_the_previous_chunk_tail() -> None:
+    model = _chunked_model(chunk_tokens=4)
+    tokens = _sequences([13])[0]
+    hift = model.token2wav.hift
+    calls: list[tuple[int, int]] = []
+
+    def recording_hift(
+        speech_feat: torch.Tensor, cache_source: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        calls.append(
+            (
+                speech_feat.shape[-1],
+                0 if cache_source is None else cache_source.shape[-1],
+            )
+        )
+        return hift(speech_feat, cache_source)
+
+    model.token2wav.hift = recording_hift
+    waveform = model.vocode([tokens], b"a")[0]
+    assert waveform.shape == (13 * SAMPLES_PER_CODEC_TOKEN,)
+    assert calls == [
+        (8, 0),
+        (8 + MEL_OVERLAP_FRAMES, SOURCE_OVERLAP_SAMPLES),
+        (10 + MEL_OVERLAP_FRAMES, SOURCE_OVERLAP_SAMPLES),
+    ]
+
+
+def test_decode_chunk_masks_shorter_cached_histories() -> None:
+    flow = _small_flow()
+    rows = []
+    embeddings = []
+    for reference in (b"a", b"b"):
+        tokens, _, embedding, mel = _fake_speaker_prompt(reference)
+        rows.append(flow.prompt_cache(tokens, mel, embedding, 2))
+        embeddings.append(embedding)
+    chunk = torch.randint(0, 100, (2, 7), dtype=torch.int32)
+    batched_mel, batched_cache = flow.decode_chunk(
+        chunk,
+        torch.cat(embeddings),
+        stack_flow_caches(
+            [FlowCacheRow(batch=row, index=0) for row in rows], flow.up_rate
+        ),
+        last_chunk=False,
+        n_timesteps=2,
+    )
+    assert batched_mel.shape == (2, MEL_BINS, 8)
+    assert batched_cache.token_lens == [7, 9]
+    for idx in range(2):
+        row_cache = flow_cache_row(batched_cache, idx, flow.up_rate)
+        single_mel, single_cache = flow.decode_chunk(
+            chunk[idx : idx + 1],
+            embeddings[idx],
+            rows[idx],
+            last_chunk=False,
+            n_timesteps=2,
+        )
+        torch.testing.assert_close(
+            batched_mel[idx : idx + 1], single_mel, atol=1e-4, rtol=1e-4
+        )
+        torch.testing.assert_close(
+            row_cache.estimator_att, single_cache.estimator_att, atol=1e-4, rtol=1e-4
+        )
+        torch.testing.assert_close(
+            row_cache.encoder.token_att,
+            single_cache.encoder.token_att,
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
+def test_trim_flow_cache_keeps_reference_and_recent_tail() -> None:
+    flow = _small_flow()
+    tokens, _, embedding, mel = _fake_speaker_prompt(b"b")
+    cache = flow.prompt_cache(tokens, mel, embedding, 2)
+    _, cache = flow.decode_chunk(
+        torch.randint(0, 100, (1, 6), dtype=torch.int32),
+        embedding,
+        cache,
+        last_chunk=True,
+        n_timesteps=2,
+    )
+    assert cache.token_lens == [11]
+    trimmed = trim_flow_cache(cache, tail_tokens=2, up_rate=flow.up_rate)
+    assert trimmed.token_lens == [7]
+    assert trimmed.encoder.token_att.shape[3] == 7
+    assert trimmed.encoder.frame_att.shape[3] == 14
+    assert trimmed.estimator_att.shape[5] == 14
+    torch.testing.assert_close(
+        trimmed.estimator_att[..., :10, :], cache.estimator_att[..., :10, :]
+    )
+    torch.testing.assert_close(
+        trimmed.estimator_att[..., 10:, :], cache.estimator_att[..., -4:, :]
+    )
+    assert trim_flow_cache(trimmed, tail_tokens=2, up_rate=flow.up_rate) is trimmed
+
+
+def test_stack_flow_caches_reuses_an_intact_batch() -> None:
+    flow = _small_flow()
+    tokens, _, embedding, mel = _fake_speaker_prompt(b"a")
+    batch = stack_flow_caches(
+        [FlowCacheRow(batch=flow.prompt_cache(tokens, mel, embedding, 2), index=0)] * 2,
+        flow.up_rate,
+    )
+    rows = [FlowCacheRow(batch=batch, index=idx) for idx in range(2)]
+    assert stack_flow_caches(rows, flow.up_rate) is batch
+    assert stack_flow_caches(rows[::-1], flow.up_rate) is not batch
+    assert stack_flow_caches(rows[:1], flow.up_rate).token_lens == [3]
 
 
 def test_vocode_rejects_mismatched_reference_count() -> None:
@@ -279,80 +484,6 @@ def test_prompt_cache_reuses_references_across_calls() -> None:
     for reference in (b"a", b"b", b"a", b"c", b"b"):
         model.speaker_prompt(reference)
     assert model.token2wav.prepare_prompt.call_count == 3
-
-
-def _batch_model() -> MiniCPMOCode2Wav:
-    class FakeFlow:
-        up_rate = 2
-
-        def inference(
-            self,
-            speech_tokens: torch.Tensor,
-            speech_tokens_lens: torch.Tensor,
-            prompt_tokens: torch.Tensor,
-            prompt_tokens_lens: torch.Tensor,
-            prompt_mels: torch.Tensor,
-            speaker_embedding: torch.Tensor,
-            n_timesteps: int,
-        ) -> torch.Tensor:
-            frames = (speech_tokens_lens + prompt_tokens_lens).max() * self.up_rate
-            return torch.zeros(speech_tokens.shape[0], 80, frames)
-
-    class FakeHiFT:
-        def __call__(self, speech_feat: torch.Tensor) -> tuple[torch.Tensor, None]:
-            samples = speech_feat.shape[-1] * (SAMPLES_PER_CODEC_TOKEN // 2)
-            return speech_feat.new_ones(speech_feat.shape[0], 1, samples), None
-
-    model = MiniCPMOCode2Wav.__new__(MiniCPMOCode2Wav)
-    model.token2wav = SimpleNamespace(
-        device=torch.device("cpu"),
-        dtype=torch.float32,
-        n_timesteps=10,
-        flow=FakeFlow(),
-        hift=FakeHiFT(),
-    )
-
-    def speaker_prompt(prompt_wav: bytes | None):
-        prompt_len = 1 if prompt_wav in (None, b"ref") else 3
-        return (
-            torch.zeros(1, prompt_len, dtype=torch.int32),
-            torch.tensor([prompt_len], dtype=torch.int32),
-            torch.zeros(1, 4),
-            torch.zeros(1, prompt_len * 2, 80),
-        )
-
-    model.speaker_prompt = speaker_prompt
-    return model
-
-
-def test_vocode_mixed_references_and_lengths_share_one_batch() -> None:
-    model = _batch_model()
-    waveforms = model.vocode([[1, 2], [3, 4, 5], [6]], [b"ref", b"other", b"ref"])
-    assert [wave.shape for wave in waveforms] == [
-        (2 * SAMPLES_PER_CODEC_TOKEN,),
-        (3 * SAMPLES_PER_CODEC_TOKEN,),
-        (SAMPLES_PER_CODEC_TOKEN,),
-    ]
-
-
-def test_vocode_mixed_lengths_preserve_hift_boundaries() -> None:
-    class BoundarySensitiveHiFT:
-        def __call__(self, speech_feat: torch.Tensor) -> tuple[torch.Tensor, None]:
-            kernel = speech_feat.new_ones(1, 1, 3)
-            hidden = (
-                torch.nn.functional.conv1d(speech_feat[:, :1], kernel, padding=1) + 1
-            )
-            samples = torch.nn.functional.conv1d(hidden, kernel, padding=1)
-            waveform = samples.repeat_interleave(SAMPLES_PER_CODEC_TOKEN // 2, dim=-1)
-            return waveform, None
-
-    model = _batch_model()
-    model.token2wav.hift = BoundarySensitiveHiFT()
-    sequences = [[1, 2], [3, 4, 5], [6, 7]]
-    batched = model.vocode(sequences, b"ref")
-    for tokens, waveform in zip(sequences, batched, strict=True):
-        reference = model.vocode([tokens], b"ref")[0]
-        np.testing.assert_array_equal(waveform, reference)
 
 
 def test_vocode_rejects_empty_sequences() -> None:

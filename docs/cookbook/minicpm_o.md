@@ -36,7 +36,17 @@ Token2wav uses the checkpoint's `assets/HT_ref_audio.wav` when available.
 
 The vocoder keeps an LRU cache of up to 32 speaker references, so switching back
 to a cached reference reuses its conditioning. Inline references are keyed by
-audio content; file references account for file metadata. Flow inference batches
-different references and token lengths together. HiFT groups rows by generated
-length to preserve waveform boundaries. Invalid references fail instead of
-silently using the default. Audio output remains non-streaming.
+audio content; file references account for file metadata. Invalid references
+fail instead of silently using the default.
+
+Decoding runs in fixed windows of `chunk_tokens` codec tokens (25 by default,
+one second of audio) plus three lookahead tokens. Flow attention and
+convolution state carries across windows per request, and the reference's own
+state is computed once and kept for up to four references. Chunks of the same
+width from different requests, including different references and lengths, run
+in one flow batch and one HiFT batch; HiFT re-vocodes the previous window's
+last eight mel frames and cross-fades the overlap so window boundaries stay
+seamless. Each row's flow state holds attention caches for every denoising step
+over the reference plus its last 100 frames, so Code2Wav memory grows with
+`max_batch_size` and reference length; lower `max_batch_size` or
+`max_batch_cost` on small GPUs. Audio output remains non-streaming.

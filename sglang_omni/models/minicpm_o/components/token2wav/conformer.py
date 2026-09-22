@@ -34,6 +34,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Literal
 
 import torch
@@ -47,6 +48,16 @@ from sglang_omni.models.minicpm_o.components.token2wav.conformer_layers import (
     PositionwiseFeedForward,
     RelPositionMultiHeadedAttention,
 )
+
+
+@dataclass(kw_only=True)
+class EncoderCache:
+    """Per-chunk state of the encoder, batch-first after the layer axis."""
+
+    token_att: torch.Tensor  # (num_blocks, batch, heads, tokens, 2 * d_k)
+    frame_att: torch.Tensor  # (num_up_blocks, batch, heads, frames, 2 * d_k)
+    lookahead_conv: torch.Tensor  # (batch, channels, 2)
+    upsample_conv: torch.Tensor  # (batch, channels, 2 * stride)
 
 
 class Upsample1D(nn.Module):
@@ -70,12 +81,16 @@ class Upsample1D(nn.Module):
         )
 
     def forward(
-        self, inputs: torch.Tensor, input_lengths: torch.Tensor
+        self, inputs: torch.Tensor, cache: torch.Tensor | None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         outputs = F.interpolate(inputs, scale_factor=self.scale_factor, mode="nearest")
-        outputs = F.pad(outputs, (self.stride * 2, 0), value=0.0)
-        outputs = self.conv(outputs)
-        return (outputs, input_lengths * self.stride)
+        if cache is None:
+            cache = outputs.new_zeros(
+                outputs.shape[0], outputs.shape[1], self.stride * 2
+            )
+        outputs = torch.cat([cache, outputs], dim=2)
+        new_cache = outputs[..., -self.stride * 2 :]
+        return self.conv(outputs), new_cache
 
 
 class PreLookaheadLayer(nn.Module):
@@ -89,17 +104,20 @@ class PreLookaheadLayer(nn.Module):
         )
         self.conv2 = nn.Conv1d(channels, channels, kernel_size=3, stride=1, padding=0)
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, inputs: torch.Tensor, cache: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Consume pre_lookahead_len trailing tokens as lookahead context."""
         outputs = inputs.transpose(1, 2).contiguous()
-        outputs = F.pad(
-            outputs, (0, self.pre_lookahead_len), mode="constant", value=0.0
-        )
         outputs = F.leaky_relu(self.conv1(outputs))
-        outputs = F.pad(outputs, (2, 0), mode="constant", value=0.0)
+        if cache is None:
+            cache = outputs.new_zeros(outputs.shape[0], outputs.shape[1], 2)
+        new_cache = outputs[..., -2:]
+        outputs = torch.cat([cache, outputs], dim=2)
         outputs = self.conv2(outputs)
         outputs = outputs.transpose(1, 2).contiguous()
-        outputs = outputs + inputs
-        return outputs
+        outputs = outputs + inputs[:, : -self.pre_lookahead_len]
+        return outputs, new_cache
 
 
 class UpsampleConformerEncoderV2(torch.nn.Module):
@@ -191,35 +209,70 @@ class UpsampleConformerEncoderV2(torch.nn.Module):
         )
 
     def forward(
-        self, xs: torch.Tensor, xs_lens: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        T = xs.size(1)
-        masks = ~make_pad_mask(xs_lens, T).unsqueeze(1)
-        xs, pos_emb, masks = self.embed(xs, masks)
-        xs = xs * masks.transpose(1, 2).to(xs)
-        xs = self.pre_lookahead_layer(xs)
-        xs = xs * masks.transpose(1, 2).to(xs)
-        for layer in self.encoders:
-            xs = layer(xs, masks, pos_emb)
+        self,
+        xs: torch.Tensor,
+        *,
+        last_chunk: bool,
+        cache: EncoderCache | None,
+        token_key_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, EncoderCache]:
+        """Encode one chunk of token embeddings on top of the cached history.
+
+        Args:
+            xs: (batch, tokens, input_size); non-final chunks carry
+                pre_lookahead_len extra trailing tokens that are consumed here.
+            token_key_mask: (batch, cached tokens) validity of left-padded cache
+                positions, or None when every row's cache is full.
+        """
+        batch, tokens = xs.shape[0], xs.shape[1]
+        lookahead = self.pre_lookahead_layer.pre_lookahead_len
+        out_tokens = tokens if last_chunk else tokens - lookahead
+        cached_tokens = 0 if cache is None else cache.token_att.shape[3]
+        xs, pos_emb = self.embed(xs, cached_tokens + out_tokens)
+        if last_chunk:
+            xs = F.pad(xs, (0, 0, 0, lookahead))
+        xs, lookahead_conv = self.pre_lookahead_layer(
+            xs, None if cache is None else cache.lookahead_conv
+        )
+        if token_key_mask is None:
+            token_mask = None
+            frame_mask = None
+        else:
+            new_tokens = token_key_mask.new_ones(batch, out_tokens)
+            token_mask = torch.cat([token_key_mask, new_tokens], dim=1).unsqueeze(1)
+            stride = self.up_layer.stride
+            frame_mask = torch.cat(
+                [
+                    token_key_mask.repeat_interleave(stride, dim=1),
+                    token_key_mask.new_ones(batch, out_tokens * stride),
+                ],
+                dim=1,
+            ).unsqueeze(1)
+        token_att = []
+        for idx, layer in enumerate(self.encoders):
+            xs, layer_cache = layer(
+                xs, token_mask, pos_emb, None if cache is None else cache.token_att[idx]
+            )
+            token_att.append(layer_cache)
         xs = xs.transpose(1, 2).contiguous()
-        xs, xs_lens = self.up_layer(xs, xs_lens)
+        xs, upsample_conv = self.up_layer(
+            xs, None if cache is None else cache.upsample_conv
+        )
         xs = xs.transpose(1, 2).contiguous()
-        T = xs.size(1)
-        masks = ~make_pad_mask(xs_lens, T).unsqueeze(1)
-        xs, pos_emb, masks = self.up_embed(xs, masks)
-        xs = xs * masks.transpose(1, 2).to(xs)
-        for layer in self.up_encoders:
-            xs = layer(xs, masks, pos_emb)
+        cached_frames = 0 if cache is None else cache.frame_att.shape[3]
+        xs, pos_emb = self.up_embed(xs, cached_frames + xs.shape[1])
+        frame_att = []
+        for idx, layer in enumerate(self.up_encoders):
+            xs, layer_cache = layer(
+                xs, frame_mask, pos_emb, None if cache is None else cache.frame_att[idx]
+            )
+            frame_att.append(layer_cache)
         if self.normalize_before:
             xs = self.after_norm(xs)
-        return (xs, masks)
-
-
-def make_pad_mask(lengths: torch.Tensor, max_len: int = 0) -> torch.Tensor:
-    batch_size = lengths.size(0)
-    max_len = max_len if max_len > 0 else lengths.max().item()
-    seq_range = torch.arange(0, max_len, dtype=torch.int64, device=lengths.device)
-    seq_range_expand = seq_range.unsqueeze(0).expand(batch_size, max_len)
-    seq_length_expand = lengths.unsqueeze(-1)
-    mask = seq_range_expand >= seq_length_expand
-    return mask
+        new_cache = EncoderCache(
+            token_att=torch.stack(token_att),
+            frame_att=torch.stack(frame_att),
+            lookahead_conv=lookahead_conv,
+            upsample_conv=upsample_conv,
+        )
+        return xs, new_cache

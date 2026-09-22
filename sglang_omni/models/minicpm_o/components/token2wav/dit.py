@@ -81,7 +81,18 @@ class Attention(torch.nn.Module):
         ts = ts.transpose(1, 2)
         return ts
 
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        att_cache: torch.Tensor | None,
+        key_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Attend over cached keys and values followed by the current chunk.
+
+        Args:
+            att_cache: (batch, heads, cached, 2 * head_dim) from earlier chunks.
+            key_mask: (batch, cached + time) validity, or None for all valid.
+        """
         b, t, c = x.shape
         q = self.to_q(x)
         k = self.to_k(x)
@@ -91,7 +102,12 @@ class Attention(torch.nn.Module):
         v = self.to_heads(v)
         q = self.q_norm(q)
         k = self.k_norm(k)
-        attn_mask = attn_mask.unsqueeze(1)
+        if att_cache is not None:
+            k_cache, v_cache = att_cache.chunk(2, dim=3)
+            k = torch.cat([k_cache, k], dim=2)
+            v = torch.cat([v_cache, v], dim=2)
+        new_att_cache = torch.cat([k, v], dim=3)
+        attn_mask = None if key_mask is None else key_mask[:, None, None, :]
         x = F.scaled_dot_product_attention(
             q,
             k,
@@ -102,7 +118,7 @@ class Attention(torch.nn.Module):
         x = x.transpose(1, 2).reshape(b, t, -1)
         x = self.proj(x)
         x = self.proj_drop(x)
-        return x
+        return x, new_att_cache
 
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -164,10 +180,14 @@ class CausalConv1d(torch.nn.Conv1d):
         super(CausalConv1d, self).__init__(in_channels, out_channels, kernel_size)
         self.causal_padding = (kernel_size - 1, 0)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.pad(x, self.causal_padding)
-        x = super(CausalConv1d, self).forward(x)
-        return x
+    def forward(
+        self, x: torch.Tensor, cache: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if cache is None:
+            cache = x.new_zeros(x.shape[0], self.in_channels, self.causal_padding[0])
+        x = torch.cat([cache, x], dim=2)
+        new_cache = x[..., -self.causal_padding[0] :]
+        return super(CausalConv1d, self).forward(x), new_cache
 
 
 class CausalConvBlock(nn.Module):
@@ -191,14 +211,19 @@ class CausalConvBlock(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor, mask: torch.Tensor | None = None
-    ) -> torch.Tensor:
-        if mask is not None:
-            x = x * mask
-        x = self.block(x)
-        if mask is not None:
-            x = x * mask
-        return x
+        self, x: torch.Tensor, cache: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run both causal convolutions; cache is (batch, in + out channels, 2)."""
+        if cache is None:
+            cache1, cache2 = None, None
+        else:
+            cache1, cache2 = cache.split((self.in_channels, self.out_channels), dim=1)
+        x = self.block[0](x)
+        x, new_cache1 = self.block[1](x, cache1)
+        x = self.block[2:6](x)
+        x, new_cache2 = self.block[6](x, cache2)
+        x = self.block[7](x)
+        return x, torch.cat((new_cache1, new_cache2), dim=1)
 
 
 class DiTBlock(nn.Module):
@@ -233,8 +258,13 @@ class DiTBlock(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor, c: torch.Tensor, attn_mask: torch.Tensor
-    ) -> torch.Tensor:
+        self,
+        x: torch.Tensor,
+        c: torch.Tensor,
+        conv_cache: torch.Tensor | None,
+        att_cache: torch.Tensor | None,
+        key_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         (
             shift_msa,
             scale_msa,
@@ -246,12 +276,16 @@ class DiTBlock(nn.Module):
             scale_conv,
             gate_conv,
         ) = self.adaLN_modulation(c).chunk(9, dim=-1)
-        x = x + gate_msa * self.attn(
-            modulate(self.norm1(x), shift_msa, scale_msa), attn_mask
+        x_att, new_att_cache = self.attn(
+            modulate(self.norm1(x), shift_msa, scale_msa), att_cache, key_mask
         )
-        x = x + gate_conv * self.conv(modulate(self.norm3(x), shift_conv, scale_conv))
+        x = x + gate_msa * x_att
+        x_conv, new_conv_cache = self.conv(
+            modulate(self.norm3(x), shift_conv, scale_conv), conv_cache
+        )
+        x = x + gate_conv * x_conv
         x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
-        return x
+        return x, new_conv_cache, new_att_cache
 
 
 class FinalLayer(nn.Module):
@@ -319,24 +353,35 @@ class DiT(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        mask: torch.Tensor,
         mu: torch.Tensor,
         t: torch.Tensor,
-        spks: torch.Tensor | None = None,
-        cond: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        spks: torch.Tensor,
+        cond: torch.Tensor,
+        *,
+        conv_cache: torch.Tensor | None,
+        att_cache: torch.Tensor | None,
+        key_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Estimate one chunk; caches are stacked per block on the leading axis."""
         t = self.t_embedder(t).unsqueeze(1)
         x = pack([x, mu], "b * t")[0]
-        if spks is not None:
-            spks = repeat(spks, "b c -> b c t", t=x.shape[-1])
-            x = pack([x, spks], "b * t")[0]
-        if cond is not None:
-            x = pack([x, cond], "b * t")[0]
+        spks = repeat(spks, "b c -> b c t", t=x.shape[-1])
+        x = pack([x, spks], "b * t")[0]
+        x = pack([x, cond], "b * t")[0]
         x = x.transpose(1, 2)
-        attn_mask = mask.bool()
         x = self.in_proj(x)
-        for block in self.blocks:
-            x = block(x, t, attn_mask)
+        conv_caches = []
+        att_caches = []
+        for idx, block in enumerate(self.blocks):
+            x, block_conv_cache, block_att_cache = block(
+                x,
+                t,
+                None if conv_cache is None else conv_cache[idx],
+                None if att_cache is None else att_cache[idx],
+                key_mask,
+            )
+            conv_caches.append(block_conv_cache)
+            att_caches.append(block_att_cache)
         x = self.final_layer(x, t)
         x = x.transpose(1, 2)
-        return x
+        return x, torch.stack(conv_caches), torch.stack(att_caches)
