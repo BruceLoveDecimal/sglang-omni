@@ -44,6 +44,58 @@ FLOW_PROMPT_CACHE_CAPACITY = 4
 SPEAKER_PROMPT_CACHE_CAPACITY = 32
 
 
+class HiFTGraphs:
+    """Replay HiFT through CUDA graphs on windows whose shape repeats across chunks.
+
+    Steady-state windows of one deployment take two shapes: the first chunk of a
+    row and every following one. Final chunks vary in width and stay eager.
+    """
+
+    def __init__(self, hift: nn.Module) -> None:
+        self.hift = hift
+        self.pool = torch.cuda.graph_pool_handle()
+        self.graphs: dict[
+            tuple[int, int, int],
+            tuple[
+                torch.cuda.CUDAGraph,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ],
+        ] = {}
+
+    def __call__(
+        self, mel: torch.Tensor, cache_source: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        source_len = 0 if cache_source is None else cache_source.shape[2]
+        key = (mel.shape[0], mel.shape[2], source_len)
+        entry = self.graphs.get(key)
+        if entry is None:
+            static_mel = mel.clone()
+            static_source = mel.new_zeros(mel.shape[0], 1, source_len)
+            if cache_source is not None:
+                static_source.copy_(cache_source)
+            source_arg = static_source if cache_source is not None else None
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(2):
+                    self.hift(static_mel, source_arg)
+            torch.cuda.current_stream().wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=self.pool):
+                speech, source = self.hift(static_mel, source_arg)
+            entry = (graph, static_mel, static_source, speech, source)
+            self.graphs[key] = entry
+        graph, static_mel, static_source, speech, source = entry
+        static_mel.copy_(mel)
+        if cache_source is not None:
+            static_source.copy_(cache_source)
+        graph.replay()
+        return speech.clone(), source.clone()
+
+
 @dataclass(kw_only=True)
 class RowState:
     """Decoding progress of one request across chunks."""
@@ -131,6 +183,7 @@ class MiniCPMOCode2Wav(nn.Module):
         self.speech_window = torch.hamming_window(
             2 * SOURCE_OVERLAP_SAMPLES, periodic=False, device=dev
         )
+        self.hift_graphs = HiFTGraphs(self.token2wav.hift)
         self.sample_rate = OUTPUT_SAMPLE_RATE
         self.eval()
 
@@ -310,7 +363,8 @@ class MiniCPMOCode2Wav(nn.Module):
                     dim=2,
                 )
                 source_overlap = torch.stack([row.source_overlap for row in members])
-                speech, source = hift(
+                vocoder = hift if last or self.hift_graphs is None else self.hift_graphs
+                speech, source = vocoder(
                     mel, source_overlap if source_overlap.shape[2] else None
                 )
                 speech_overlap = torch.stack([row.speech_overlap for row in members])

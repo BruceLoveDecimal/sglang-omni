@@ -23,6 +23,7 @@ from sglang_omni.models.minicpm_o.components.code2wav import (
     SAMPLES_PER_CODEC_TOKEN,
     SAMPLES_PER_MEL_FRAME,
     SOURCE_OVERLAP_SAMPLES,
+    HiFTGraphs,
     MiniCPMOCode2Wav,
     plan_chunks,
 )
@@ -37,6 +38,10 @@ from sglang_omni.models.minicpm_o.components.token2wav.flow import (
     flow_cache_row,
     stack_flow_caches,
     trim_flow_cache,
+)
+from sglang_omni.models.minicpm_o.components.token2wav.hift import (
+    ConvRNNF0Predictor,
+    HiFTGenerator,
 )
 from sglang_omni.models.minicpm_o.config import MiniCPMOSpeechPipelineConfig
 from sglang_omni.models.minicpm_o.payload_types import MiniCPMOPipelineState
@@ -314,6 +319,7 @@ def _chunked_model(chunk_tokens: int = 4) -> MiniCPMOCode2Wav:
         hift=_OverlapSensitiveHiFT(),
     )
     model.chunk_tokens = chunk_tokens
+    model.hift_graphs = None
     model.default_prompt_wav = None
     model.prompt_cache = OrderedDict()
     model.prompt_cache_capacity = 4
@@ -461,6 +467,51 @@ def test_stack_flow_caches_reuses_an_intact_batch() -> None:
     assert stack_flow_caches(rows, flow.up_rate) is batch
     assert stack_flow_caches(rows[::-1], flow.up_rate) is not batch
     assert stack_flow_caches(rows[:1], flow.up_rate).token_lens == [3]
+
+
+def test_hift_istft_matches_torch() -> None:
+    hift = HiFTGenerator(in_channels=MEL_BINS, base_channels=16).eval()
+    torch.manual_seed(0)
+    n_fft = hift.istft_params["n_fft"]
+    magnitude = torch.rand(2, n_fft // 2 + 1, 40) * 3
+    phase = torch.rand(2, n_fft // 2 + 1, 40) * 6
+    expected = torch.istft(
+        torch.complex(magnitude * phase.cos(), magnitude * phase.sin()),
+        n_fft,
+        hift.istft_params["hop_len"],
+        n_fft,
+        window=hift.stft_window,
+    )
+    torch.testing.assert_close(hift.istft(magnitude, phase), expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_hift_graphs_replay_steady_windows_and_reuse_shapes() -> None:
+    torch.manual_seed(0)
+    hift = (
+        HiFTGenerator(
+            in_channels=MEL_BINS,
+            base_channels=16,
+            f0_predictor=ConvRNNF0Predictor(in_channels=MEL_BINS),
+        )
+        .cuda()
+        .eval()
+    )
+    graphs = HiFTGraphs(hift)
+    mel = torch.randn(2, MEL_BINS, 8 + MEL_OVERLAP_FRAMES, device="cuda")
+    cache = torch.randn(2, 1, SOURCE_OVERLAP_SAMPLES, device="cuda")
+    with torch.inference_mode():
+        speech, source = graphs(mel, cache)
+        again, _ = graphs(mel * 0.5, cache)
+        first_chunk, _ = graphs(mel[:, :, MEL_OVERLAP_FRAMES:], None)
+        eager, eager_source = hift(mel, cache)
+    assert speech.shape == eager.shape == (2, 16 * SAMPLES_PER_MEL_FRAME)
+    assert source.shape == eager_source.shape
+    assert first_chunk.shape == (2, 8 * SAMPLES_PER_MEL_FRAME)
+    torch.testing.assert_close(source[:, :, :SOURCE_OVERLAP_SAMPLES], cache)
+    assert not torch.equal(speech, again)
+    assert torch.isfinite(speech).all() and torch.isfinite(again).all()
+    assert len(graphs.graphs) == 2
 
 
 def test_vocode_rejects_mismatched_reference_count() -> None:

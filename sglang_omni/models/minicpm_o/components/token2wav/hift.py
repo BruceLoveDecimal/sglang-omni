@@ -171,8 +171,15 @@ class HiFTGenerator(nn.Module):
         self.ups.apply(init_weights)
         self.conv_post.apply(init_weights)
         self.reflection_pad = nn.ReflectionPad1d((1, 0))
-        self.stft_window = torch.from_numpy(
-            get_window("hann", istft_params["n_fft"], fftbins=True).astype(np.float32)
+        # A buffer moves with the module, so graph capture sees no host copy.
+        self.register_buffer(
+            "stft_window",
+            torch.from_numpy(
+                get_window("hann", istft_params["n_fft"], fftbins=True).astype(
+                    np.float32
+                )
+            ),
+            persistent=False,
         )
         self.f0_predictor = (
             ConvRNNF0Predictor() if f0_predictor is None else f0_predictor
@@ -184,24 +191,32 @@ class HiFTGenerator(nn.Module):
             self.istft_params["n_fft"],
             self.istft_params["hop_len"],
             self.istft_params["n_fft"],
-            window=self.stft_window.to(x.device),
+            window=self.stft_window,
             return_complex=True,
         )
         spec = torch.view_as_real(spec)
         return (spec[..., 0], spec[..., 1])
 
     def istft(self, magnitude: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
+        """Centered inverse STFT by overlap-add; torch.istft syncs the host."""
         magnitude = torch.clip(magnitude, max=100.0)
-        real = magnitude * torch.cos(phase)
-        img = magnitude * torch.sin(phase)
-        inverse_transform = torch.istft(
-            torch.complex(real, img),
-            self.istft_params["n_fft"],
-            self.istft_params["hop_len"],
-            self.istft_params["n_fft"],
-            window=self.stft_window.to(magnitude.device),
+        spec = torch.complex(magnitude * torch.cos(phase), magnitude * torch.sin(phase))
+        n_fft, hop = self.istft_params["n_fft"], self.istft_params["hop_len"]
+        batch, _, num_frames = spec.shape
+        length = n_fft + hop * (num_frames - 1)
+        window = self.stft_window.reshape(1, n_fft, 1)
+        frames = torch.fft.irfft(spec, n=n_fft, dim=1) * window
+        signal = F.fold(
+            frames, output_size=(1, length), kernel_size=(1, n_fft), stride=(1, hop)
         )
-        return inverse_transform
+        envelope = F.fold(
+            (window * window).expand(1, n_fft, num_frames),
+            output_size=(1, length),
+            kernel_size=(1, n_fft),
+            stride=(1, hop),
+        )
+        signal = signal.reshape(batch, length) / envelope.reshape(1, length)
+        return signal[:, n_fft // 2 : length - n_fft // 2]
 
     def decode(self, x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
         s_stft_real, s_stft_imag = self.stft(s.squeeze(1))
