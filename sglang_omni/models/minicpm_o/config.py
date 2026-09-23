@@ -119,6 +119,7 @@ def code2wav_stage(*, gpu: int, process: str) -> StageConfig:
             max_batch_wait_ms=0.0,
             batch_wait_when_idle=False,
             enable_flow_variable_length=True,
+            hift_max_padding_waste=1.5,
         ),
         # Note (Chenyang): As a general comment and my usual understanding
         # of SGLang Omni, SGLang Omni has a poor runtime which leads to a
