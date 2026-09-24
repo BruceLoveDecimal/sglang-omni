@@ -232,6 +232,7 @@ def create_code2wav_executor(
         batch_wait_when_idle=batch_wait_when_idle,
         request_cost_fn=codec_token_cost,
         max_batch_cost=max_batch_cost,
+        shutdown_callback=model.close_reference_pool,
     )
 
 

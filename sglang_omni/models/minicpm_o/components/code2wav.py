@@ -4,9 +4,13 @@
 from __future__ import annotations
 
 import io
+import logging
 import os
+import threading
+import time
 from collections import OrderedDict
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +26,26 @@ FLOW_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 OUTPUT_SAMPLE_RATE = 24000
 CODEC_TOKEN_RATE = 25
 SAMPLES_PER_CODEC_TOKEN = OUTPUT_SAMPLE_RATE // CODEC_TOKEN_RATE
+DEFAULT_PROMPT_CACHE_CAPACITY = 32
+DEFAULT_REFERENCE_WORKERS = 8
+
+logger = logging.getLogger(__name__)
+
+
+def positive_int_env(name: str, default: int) -> int:
+    """Read a positive integer configuration value."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    else:
+        try:
+            value = int(raw)
+        except ValueError as error:
+            raise ValueError(f"{name} must be an integer, got {raw!r}") from error
+        if value < 1:
+            raise ValueError(f"{name} must be positive, got {value}")
+        else:
+            return value
 
 
 class MiniCPMOCode2Wav(nn.Module):
@@ -38,6 +62,19 @@ class MiniCPMOCode2Wav(nn.Module):
         enable_flow_variable_length: bool = False,
     ) -> None:
         super().__init__()
+        self.prompt_cache_capacity: int = positive_int_env(
+            "MINICPMO_PROMPT_CACHE_CAPACITY", DEFAULT_PROMPT_CACHE_CAPACITY
+        )
+        self.reference_workers: int = positive_int_env(
+            "MINICPMO_REF_WORKERS", DEFAULT_REFERENCE_WORKERS
+        )
+        self.reference_lock: threading.Lock = threading.Lock()
+        self.prompt_cache_lock: threading.Lock = threading.Lock()
+        self.reference_executor: ThreadPoolExecutor | None = None
+        self.references_closed: bool = False
+        self.reference_hits: int = 0
+        self.reference_misses: int = 0
+        self.reference_evictions: int = 0
         from sglang_omni.models.minicpm_o.components.token2wav.vocoder import Token2Wav
 
         dev = torch.device(device)
@@ -83,8 +120,9 @@ class MiniCPMOCode2Wav(nn.Module):
             pass
         self.default_prompt_wav = prompt_wav
         # Keyed by reference so a mixed-reference batch never thrashes one slot.
-        self.prompt_cache: OrderedDict[str, tuple] = OrderedDict()
-        self.prompt_cache_capacity = 32
+        self.prompt_cache: OrderedDict[
+            str, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = OrderedDict()
         self.sample_rate = OUTPUT_SAMPLE_RATE
         self.eval()
 
@@ -119,24 +157,79 @@ class MiniCPMOCode2Wav(nn.Module):
     def prompt_key(prompt_wav: str | bytes) -> str:
         if isinstance(prompt_wav, bytes):
             return f"bytes:{hash_bytes(prompt_wav)}"
-        return reference_path_cache_key(prompt_wav) or f"path:{prompt_wav}"
+        else:
+            return reference_path_cache_key(prompt_wav) or f"path:{prompt_wav}"
 
     def speaker_prompt(
         self, prompt_wav: str | bytes | None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         prompt_wav = self.resolve_prompt_wav(prompt_wav)
         prompt_key = self.prompt_key(prompt_wav)
-        cached = self.prompt_cache.get(prompt_key)
-        if cached is not None:
-            self.prompt_cache.move_to_end(prompt_key)
-            return cached
+        with self.prompt_cache_lock:
+            cached = self.prompt_cache.get(prompt_key)
+            if cached is not None:
+                self.prompt_cache.move_to_end(prompt_key)
+                self.reference_hits += 1
+                return cached
+            else:
+                self.reference_misses += 1
         # Bytes references decode in memory; they are not spilled to a temp file.
         source = io.BytesIO(prompt_wav) if isinstance(prompt_wav, bytes) else prompt_wav
         prompt = self.token2wav.prepare_prompt(source)
-        self.prompt_cache[prompt_key] = prompt
-        if len(self.prompt_cache) > self.prompt_cache_capacity:
-            self.prompt_cache.popitem(last=False)
+        with self.prompt_cache_lock:
+            self.prompt_cache[prompt_key] = prompt
+            if len(self.prompt_cache) > self.prompt_cache_capacity:
+                self.prompt_cache.popitem(last=False)
+                self.reference_evictions += 1
         return prompt
+
+    def prepare_references(
+        self, references: Sequence[str | bytes | None]
+    ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Prepare unique speaker references and restore the requested row order."""
+        with self.reference_lock:
+            if self.references_closed:
+                raise RuntimeError("Code2Wav reference preparation is closed")
+            resolved = [self.resolve_prompt_wav(reference) for reference in references]
+            keys = [self.prompt_key(reference) for reference in resolved]
+            unique = dict(zip(keys, resolved, strict=True))
+            started = time.perf_counter()
+            if len(unique) > 1 and self.reference_workers > 1:
+                if self.reference_executor is None:
+                    self.reference_executor = ThreadPoolExecutor(
+                        max_workers=self.reference_workers,
+                        thread_name_prefix="minicpmo-ref",
+                    )
+                futures = [
+                    self.reference_executor.submit(self.speaker_prompt, reference)
+                    for reference in unique.values()
+                ]
+                try:
+                    prepared = [future.result() for future in futures]
+                finally:
+                    # note (MayDomine): failed batches must drain GPU preparation too.
+                    wait(futures)
+            else:
+                prepared = [
+                    self.speaker_prompt(reference) for reference in unique.values()
+                ]
+            by_key = dict(zip(unique, prepared, strict=True))
+            logger.debug(
+                f"minicpm_code2wav_ref_prep rows={len(references)} "
+                f"unique={len(unique)} workers={self.reference_workers} "
+                f"wall_ms={(time.perf_counter() - started) * 1000.0:.1f} "
+                f"hits={self.reference_hits} misses={self.reference_misses} "
+                f"evictions={self.reference_evictions}"
+            )
+            return [by_key[key] for key in keys]
+
+    def close_reference_pool(self) -> None:
+        """Drain reference preparation and permanently close the worker pool."""
+        with self.reference_lock:
+            self.references_closed = True
+            if self.reference_executor is not None:
+                self.reference_executor.shutdown(wait=True)
+                self.reference_executor = None
 
     def vocode(
         self,
@@ -175,7 +268,7 @@ class MiniCPMOCode2Wav(nn.Module):
         # instead of copying, and mixed references concatenate along the batch.
         # References of different lengths pad to a common token width here; the
         # flow re-derives each row's real width from prompt_speech_tokens_lens.
-        prompts = [self.speaker_prompt(reference) for reference in references]
+        prompts = self.prepare_references(references)
         if len({id(prompt) for prompt in prompts}) == 1:
             (
                 prompt_speech_tokens,

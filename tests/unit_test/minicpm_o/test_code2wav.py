@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import base64
+import io
 import math
 import os
 import subprocess
 import sys
-from collections import OrderedDict
+import threading
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,8 +19,10 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
+import soundfile as sf
 import torch
 
+from sglang_omni.models.minicpm_o import stages
 from sglang_omni.models.minicpm_o.components.code2wav import (
     SAMPLES_PER_CODEC_TOKEN,
     MiniCPMOCode2Wav,
@@ -32,8 +37,43 @@ from sglang_omni.models.minicpm_o.routing import (
 )
 from sglang_omni.models.minicpm_o.stages import vocode_code2wav_payloads
 from sglang_omni.proto import OmniRequest, StagePayload
+from sglang_omni.scheduling.messages import IncomingMessage
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def prompt_result(value: int) -> vocoder.SpeakerPrompt:
+    return (
+        torch.full((1, 2), value, dtype=torch.int32),
+        torch.tensor([2], dtype=torch.int32),
+        torch.zeros(1, 4),
+        torch.zeros(1, 4, 80),
+    )
+
+
+@pytest.fixture
+def mock_token2wav(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    (tmp_path / "assets" / "token2wav").mkdir(parents=True)
+    monkeypatch.delenv("MINICPMO_REF_WORKERS", raising=False)
+    monkeypatch.delenv("MINICPMO_PROMPT_CACHE_CAPACITY", raising=False)
+    backend = MagicMock()
+    backend.prepare_prompt.side_effect = lambda source: prompt_result(
+        source.getvalue()[0]
+    )
+    monkeypatch.setattr(vocoder, "Token2Wav", MagicMock(return_value=backend))
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    return backend
+
+
+@pytest.fixture
+def reference_model(
+    tmp_path: Path, mock_token2wav: MagicMock
+) -> Iterator[MiniCPMOCode2Wav]:
+    model = MiniCPMOCode2Wav(str(tmp_path))
+    try:
+        yield model
+    finally:
+        model.close_reference_pool()
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
@@ -165,6 +205,47 @@ def test_native_vocoder_batch_matches_single_request_shapes() -> None:
     assert all(np.isfinite(wave).all() for wave in (*batched, single_a, single_b))
 
 
+@pytest.mark.accelerator
+@pytest.mark.parametrize("enable_variable_length", [False, True])
+def test_parallel_reference_preparation_preserves_checkpoint_waveforms(
+    enable_variable_length: bool,
+) -> None:
+    checkpoint = _checkpoint_dir()
+    if checkpoint is None or not torch.cuda.is_available():
+        pytest.skip("Set MINICPMO_CHECKPOINT and provide CUDA for vocoder validation")
+    reference_path = checkpoint / "assets" / "HT_ref_audio.wav"
+    audio, sample_rate = sf.read(reference_path, dtype="float32", always_2d=True)
+    short_reference = io.BytesIO()
+    sf.write(
+        short_reference,
+        audio[: audio.shape[0] // 2],
+        sample_rate,
+        format="wav",
+    )
+    references = [str(reference_path), short_reference.getvalue(), str(reference_path)]
+    tokens = [1498, 1734, 3732, 3726, 3645]
+    sequences = [tokens, tokens + [3645, 3726], tokens[:3]]
+    model = MiniCPMOCode2Wav(
+        str(checkpoint),
+        device="cuda:0",
+        enable_flow_variable_length=enable_variable_length,
+    )
+    try:
+        with torch.inference_mode():
+            model.reference_workers = 1
+            torch.manual_seed(0)
+            serial = model.vocode(sequences, references)
+            model.prompt_cache.clear()
+            model.reference_workers = 2
+            torch.manual_seed(0)
+            parallel = model.vocode(sequences, references)
+        for actual, expected in zip(parallel, serial, strict=True):
+            assert np.isfinite(actual).all()
+            np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-4)
+    finally:
+        model.close_reference_pool()
+
+
 def _data_uri(audio: bytes) -> str:
     return "data:audio/wav;base64," + base64.b64encode(audio).decode("ascii")
 
@@ -261,12 +342,13 @@ def test_vocode_slices_waveforms_to_token_lengths() -> None:
         flow=FakeFlow(),
         hift=FakeHiFT(),
     )
-    model.speaker_prompt = lambda prompt_wav: (
+    prompt = (
         torch.zeros(1, 1, dtype=torch.int32),
         torch.tensor([1], dtype=torch.int32),
         torch.zeros(1, 4),
         torch.zeros(1, 1, 80),
     )
+    model.prepare_references = lambda references: [prompt] * len(references)
     waveforms = model.vocode([[1, 2], [3, 4, 5]], b"ref")
     assert [wave.shape for wave in waveforms] == [
         (2 * SAMPLES_PER_CODEC_TOKEN,),
@@ -280,21 +362,220 @@ def test_vocode_rejects_mismatched_reference_count() -> None:
         model.vocode([[1], [2]], [b"a"])
 
 
-def test_prompt_cache_reuses_references_across_calls() -> None:
-    model = MiniCPMOCode2Wav.__new__(MiniCPMOCode2Wav)
-    model.default_prompt_wav = None
-    model.prompt_cache = OrderedDict()
-    model.prompt_cache_capacity = 4
-    model.token2wav = SimpleNamespace(prepare_prompt=MagicMock())
-    model.token2wav.prepare_prompt.return_value = (
-        torch.zeros(1, 2, dtype=torch.int32),
-        torch.tensor([2], dtype=torch.int32),
-        torch.zeros(1, 4),
-        torch.zeros(1, 4, 80),
+def test_prompt_cache_reuses_references_and_evicts_least_recent(
+    reference_model: MiniCPMOCode2Wav, mock_token2wav: MagicMock
+) -> None:
+    reference_model.prompt_cache_capacity = 2
+    for reference in (b"a", b"b", b"a", b"c", b"a", b"b"):
+        prompt = reference_model.prepare_references([reference])[0]
+        assert prompt[0][0, 0].item() == reference[0]
+    assert mock_token2wav.prepare_prompt.call_count == 4
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_prepare_references_deduplicates_identical_rows(
+    reference_model: MiniCPMOCode2Wav, mock_token2wav: MagicMock, workers: int
+) -> None:
+    reference_model.reference_workers = workers
+    prompts = reference_model.prepare_references([b"a"] * 8)
+    assert len(prompts) == 8
+    assert all(prompt is prompts[0] for prompt in prompts)
+    assert prompts[0][0][0, 0].item() == ord("a")
+    mock_token2wav.prepare_prompt.assert_called_once()
+
+
+def test_prepare_references_runs_in_parallel_and_restores_row_order(
+    reference_model: MiniCPMOCode2Wav, mock_token2wav: MagicMock
+) -> None:
+    both_started = threading.Barrier(2, timeout=5)
+    second_finished = threading.Event()
+
+    def prepare(source: io.BytesIO) -> vocoder.SpeakerPrompt:
+        reference = source.getvalue()
+        both_started.wait()
+        if reference == b"a":
+            assert second_finished.wait(5)
+        else:
+            second_finished.set()
+        return prompt_result(reference[0])
+
+    mock_token2wav.prepare_prompt.side_effect = prepare
+    reference_model.reference_workers = 2
+    reference_model.prompt_cache_capacity = 1
+    prompts = reference_model.prepare_references([b"a", b"b", b"a", b"b"])
+    assert [prompt[0][0, 0].item() for prompt in prompts] == [97, 98, 97, 98]
+    assert prompts[0] is prompts[2]
+    assert prompts[1] is prompts[3]
+    assert mock_token2wav.prepare_prompt.call_count == 2
+
+
+@pytest.mark.parametrize(
+    ("workers", "capacity", "expected_workers", "expected_capacity"),
+    [(None, None, 8, 32), ("1", "1", 1, 1), ("3", "2", 3, 2)],
+)
+def test_reference_configuration_is_read_by_constructor(
+    tmp_path: Path,
+    mock_token2wav: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    workers: str | None,
+    capacity: str | None,
+    expected_workers: int,
+    expected_capacity: int,
+) -> None:
+    if workers is not None:
+        monkeypatch.setenv("MINICPMO_REF_WORKERS", workers)
+    if capacity is not None:
+        monkeypatch.setenv("MINICPMO_PROMPT_CACHE_CAPACITY", capacity)
+    model = MiniCPMOCode2Wav(str(tmp_path))
+    try:
+        assert model.reference_workers == expected_workers
+        assert model.prompt_cache_capacity == expected_capacity
+        assert vocoder.Token2Wav.call_args.kwargs["dtype"] == torch.float32
+    finally:
+        model.close_reference_pool()
+
+
+@pytest.mark.parametrize(
+    "name", ["MINICPMO_REF_WORKERS", "MINICPMO_PROMPT_CACHE_CAPACITY"]
+)
+@pytest.mark.parametrize("value", ["0", "-1", "abc", "1.5", ""])
+def test_reference_configuration_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch, name: str, value: str
+) -> None:
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=name):
+        MiniCPMOCode2Wav("unused")
+
+
+def test_failed_reference_batch_drains_workers_and_can_retry(
+    reference_model: MiniCPMOCode2Wav, mock_token2wav: MagicMock
+) -> None:
+    slow_started = threading.Event()
+    failed = threading.Event()
+    release = threading.Event()
+
+    def prepare(source: io.BytesIO) -> vocoder.SpeakerPrompt:
+        reference = source.getvalue()
+        if reference == b"a":
+            assert slow_started.wait(5)
+            failed.set()
+            raise ValueError("invalid reference")
+        else:
+            slow_started.set()
+            assert release.wait(5)
+            return prompt_result(reference[0])
+
+    mock_token2wav.prepare_prompt.side_effect = prepare
+    reference_model.reference_workers = 2
+    with ThreadPoolExecutor(max_workers=1) as caller:
+        preparation = caller.submit(reference_model.prepare_references, [b"a", b"b"])
+        try:
+            assert failed.wait(5)
+            with pytest.raises(TimeoutError):
+                preparation.result(timeout=0.1)
+        finally:
+            release.set()
+        with pytest.raises(ValueError, match="invalid reference"):
+            preparation.result(timeout=5)
+
+    mock_token2wav.prepare_prompt.side_effect = lambda source: prompt_result(
+        source.getvalue()[0]
     )
-    for reference in (b"a", b"b", b"a", b"c", b"b"):
-        model.speaker_prompt(reference)
-    assert model.token2wav.prepare_prompt.call_count == 3
+    prompts = reference_model.prepare_references([b"a", b"b"])
+    assert [prompt[0][0, 0].item() for prompt in prompts] == [97, 98]
+    assert mock_token2wav.prepare_prompt.call_count == 3
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_close_waits_for_reference_preparation_and_rejects_new_work(
+    reference_model: MiniCPMOCode2Wav, mock_token2wav: MagicMock, workers: int
+) -> None:
+    started = threading.Event()
+    closing = threading.Event()
+    release = threading.Event()
+    preparation_threads: set[threading.Thread] = set()
+
+    def prepare(source: io.BytesIO) -> vocoder.SpeakerPrompt:
+        preparation_threads.add(threading.current_thread())
+        started.set()
+        assert release.wait(5)
+        return prompt_result(source.getvalue()[0])
+
+    def close() -> None:
+        closing.set()
+        reference_model.close_reference_pool()
+
+    mock_token2wav.prepare_prompt.side_effect = prepare
+    reference_model.reference_workers = workers
+    with ThreadPoolExecutor(max_workers=2) as callers:
+        preparation = callers.submit(reference_model.prepare_references, [b"a", b"b"])
+        try:
+            assert started.wait(5)
+            shutdown = callers.submit(close)
+            assert closing.wait(5)
+            with pytest.raises(TimeoutError):
+                shutdown.result(timeout=0.1)
+        finally:
+            release.set()
+        assert len(preparation.result(timeout=5)) == 2
+        shutdown.result(timeout=5)
+    assert all(not thread.is_alive() for thread in preparation_threads)
+    reference_model.close_reference_pool()
+    with pytest.raises(RuntimeError, match="closed"):
+        reference_model.prepare_references([b"c", b"d"])
+    assert mock_token2wav.prepare_prompt.call_count == 2
+
+
+def test_stage_stop_closes_reference_preparation(
+    reference_model: MiniCPMOCode2Wav, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        stages, "MiniCPMOCode2Wav", MagicMock(return_value=reference_model)
+    )
+    scheduler = stages.create_code2wav_executor("unused", device="cuda", gpu_id=0)
+    reference_model.prepare_references([b"a", b"b"])
+    scheduler.stop()
+    scheduler.stop()
+    with pytest.raises(RuntimeError, match="closed"):
+        reference_model.prepare_references([b"a", b"b"])
+
+
+def test_stage_stop_prevents_late_reference_pool_creation(
+    reference_model: MiniCPMOCode2Wav,
+    mock_token2wav: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    def delayed_vocode(
+        model: MiniCPMOCode2Wav, payloads: list[StagePayload]
+    ) -> list[StagePayload]:
+        entered.set()
+        assert release.wait(5)
+        model.prepare_references([b"a", b"b"])
+        return payloads
+
+    monkeypatch.setattr(
+        stages, "MiniCPMOCode2Wav", MagicMock(return_value=reference_model)
+    )
+    monkeypatch.setattr(stages, "vocode_code2wav_payloads", delayed_vocode)
+    scheduler = stages.create_code2wav_executor("unused", device="cuda", gpu_id=0)
+    scheduler.inbox.put(IncomingMessage("late", "new_request", _payload()))
+    with ThreadPoolExecutor(max_workers=1) as caller:
+        running = caller.submit(scheduler.start)
+        try:
+            assert entered.wait(5)
+            scheduler.stop()
+        finally:
+            release.set()
+            scheduler.stop()
+        running.result(timeout=5)
+    output = scheduler.outbox.get(timeout=5)
+    assert output.type == "error"
+    assert isinstance(output.data, RuntimeError)
+    assert "closed" in str(output.data)
+    mock_token2wav.prepare_prompt.assert_not_called()
 
 
 def _batch_model() -> MiniCPMOCode2Wav:
@@ -328,7 +609,7 @@ def _batch_model() -> MiniCPMOCode2Wav:
         hift=FakeHiFT(),
     )
 
-    def speaker_prompt(prompt_wav: bytes | None):
+    def speaker_prompt(prompt_wav: bytes | None) -> vocoder.SpeakerPrompt:
         prompt_len = 1 if prompt_wav in (None, b"ref") else 3
         return (
             torch.zeros(1, prompt_len, dtype=torch.int32),
@@ -337,7 +618,9 @@ def _batch_model() -> MiniCPMOCode2Wav:
             torch.zeros(1, prompt_len * 2, 80),
         )
 
-    model.speaker_prompt = speaker_prompt
+    model.prepare_references = lambda references: [
+        speaker_prompt(reference) for reference in references
+    ]
     return model
 
 
