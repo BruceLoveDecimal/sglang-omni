@@ -29,6 +29,10 @@ CODEC_TOKEN_RATE = 25
 SAMPLES_PER_CODEC_TOKEN = OUTPUT_SAMPLE_RATE // CODEC_TOKEN_RATE
 DEFAULT_PROMPT_CACHE_CAPACITY = 32
 DEFAULT_REFERENCE_WORKERS = 8
+# note(liuqihao): warm-up shapes; the dynamic compile covers other lengths and batches.
+WARMUP_GENERATED_TOKENS = 100
+WARMUP_PROMPT_TOKENS = 75
+WARMUP_BATCH_SIZES = (1, 2)
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +65,7 @@ class MiniCPMOCode2Wav(nn.Module):
         n_timesteps: int = 10,
         prompt_wav: str | None = None,
         enable_flow_variable_length: bool = False,
+        compile_flow_dit: bool = False,
         hift_max_padding_waste: float,
     ) -> None:
         super().__init__()
@@ -116,6 +121,16 @@ class MiniCPMOCode2Wav(nn.Module):
         self.token2wav.flow.decoder.estimator.enable_variable_length = (
             enable_flow_variable_length
         )
+        if compile_flow_dit:
+            # note(liuqihao): the DiT is launch-bound; one dynamic-shape compile
+            # with CUDA-graph replay halves its GPU time at every batch size.
+            self.token2wav.flow.decoder.estimator = torch.compile(
+                self.token2wav.flow.decoder.estimator,
+                mode="reduce-overhead",
+                dynamic=True,
+            )
+        else:
+            pass
 
         if prompt_wav is None:
             default_wav = os.path.join(model_dir, "assets", "HT_ref_audio.wav")
@@ -130,6 +145,58 @@ class MiniCPMOCode2Wav(nn.Module):
         self.sample_rate = OUTPUT_SAMPLE_RATE
         self.hift_max_padding_waste = hift_max_padding_waste
         self.eval()
+        if compile_flow_dit:
+            self.warmup_flow()
+        else:
+            pass
+
+    def warmup_flow(self) -> None:
+        """Run the flow on synthetic inputs so compilation happens before serving."""
+        flow = self.token2wav.flow
+        device = self.token2wav.device
+        mel_channels = flow.output_size
+        embedding_dim = flow.spk_embed_affine_layer.in_features
+        with self.device_context, torch.inference_mode():
+            for batch_size in WARMUP_BATCH_SIZES:
+                with torch.amp.autocast(
+                    "cuda",
+                    dtype=self.token2wav.dtype,
+                    enabled=self.token2wav.dtype != torch.float32,
+                ):
+                    flow.inference(
+                        torch.zeros(
+                            batch_size,
+                            WARMUP_GENERATED_TOKENS,
+                            dtype=torch.int32,
+                            device=device,
+                        ),
+                        torch.full(
+                            (batch_size,),
+                            WARMUP_GENERATED_TOKENS,
+                            dtype=torch.int32,
+                            device=device,
+                        ),
+                        torch.zeros(
+                            batch_size,
+                            WARMUP_PROMPT_TOKENS,
+                            dtype=torch.int32,
+                            device=device,
+                        ),
+                        torch.full(
+                            (batch_size,),
+                            WARMUP_PROMPT_TOKENS,
+                            dtype=torch.int32,
+                            device=device,
+                        ),
+                        torch.zeros(
+                            batch_size,
+                            WARMUP_PROMPT_TOKENS * flow.up_rate,
+                            mel_channels,
+                            device=device,
+                        ),
+                        torch.zeros(batch_size, embedding_dim, device=device),
+                        self.token2wav.n_timesteps,
+                    )
 
     @torch.inference_mode()
     def forward(

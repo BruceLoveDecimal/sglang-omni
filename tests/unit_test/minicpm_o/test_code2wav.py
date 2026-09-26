@@ -315,6 +315,30 @@ def test_variable_length_option_reaches_dit(
     assert token2wav.flow.decoder.estimator.enable_variable_length is enabled
 
 
+def test_compile_option_wraps_dit_and_warms_up_small_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "assets" / "token2wav").mkdir(parents=True)
+    flow = SimpleNamespace(
+        decoder=SimpleNamespace(estimator=torch.nn.Linear(4, 4)),
+        inference=MagicMock(return_value=torch.zeros(1, 80, 1)),
+        up_rate=2,
+        output_size=80,
+        spk_embed_affine_layer=torch.nn.Linear(192, 80),
+    )
+    token2wav = SimpleNamespace(
+        flow=flow, device=torch.device("cpu"), dtype=torch.float32, n_timesteps=10
+    )
+    monkeypatch.setattr(vocoder, "Token2Wav", lambda *args, **kwargs: token2wav)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    MiniCPMOCode2Wav(str(tmp_path), compile_flow_dit=True, hift_max_padding_waste=1.5)
+    assert isinstance(flow.decoder.estimator, torch._dynamo.eval_frame.OptimizedModule)
+    warmup_batches = [call.args[0].shape[0] for call in flow.inference.call_args_list]
+    assert warmup_batches == [1, 2]
+    prompt_mels = flow.inference.call_args_list[0].args[4]
+    assert prompt_mels.shape == (1, 150, 80)
+
+
 def test_speech_pipeline_enables_code2wav_batching_by_default() -> None:
     config = MiniCPMOSpeechPipelineConfig(model_path="unused")
     code2wav = next(stage for stage in config.stages if stage.name == "code2wav")
@@ -322,7 +346,8 @@ def test_speech_pipeline_enables_code2wav_batching_by_default() -> None:
     assert code2wav.factory.max_batch_wait_ms == 0.0
     assert code2wav.factory.batch_wait_when_idle is False
     assert code2wav.factory.dtype is None
-    assert code2wav.factory.enable_flow_variable_length is True
+    assert code2wav.factory.enable_flow_variable_length is False
+    assert code2wav.factory.compile_flow_dit is True
     assert code2wav.factory.hift_max_padding_waste == 1.5
 
 
@@ -739,7 +764,7 @@ def test_checkpoint_hift_padded_batch_matches_single_rows(
     if checkpoint is None or not torch.cuda.is_available():
         pytest.skip("Set MINICPMO_CHECKPOINT and provide CUDA for vocoder validation")
 
-    asset_dir, _ = resolve_token2wav_assets(str(checkpoint))
+    asset_dir = checkpoint / "assets" / "token2wav"
     weights = torch.load(asset_dir / "hift.pt", map_location="cpu", weights_only=True)
     hift = HiFTGenerator().to("cuda:0").eval()
     hift.load_state_dict(
