@@ -1783,10 +1783,10 @@ def test_top_k_and_top_p_filter_each_row_of_a_batch() -> None:
 
 
 @pytest.mark.parametrize("greedy", [True, False])
-def test_one_step_moves_token_ids_to_the_host_exactly_twice(
+def test_one_step_moves_token_ids_to_the_host_once(
     monkeypatch: pytest.MonkeyPatch, greedy: bool
 ) -> None:
-    """A step costs two Python-level transfers, not two per row, and never a multinomial sync."""
+    """Both sampling stages share one Python-level transfer per step, and never a multinomial sync."""
     transfers: list[str] = []
     multinomial_calls: list[int] = []
     original_item = torch.Tensor.item
@@ -1819,12 +1819,56 @@ def test_one_step_moves_token_ids_to_the_host_exactly_twice(
         [unit_request(state) for state in states],
     )
 
-    assert transfers == ["tolist", "tolist"]
+    assert transfers == ["tolist"]
     assert multinomial_calls == []
     assert token_ids.tolist() == [PLAIN_TOKEN_ID] * len(states)
     assert [state.generated_history for state in states] == [[PLAIN_TOKEN_ID]] * len(
         states
     )
+
+
+def test_each_talker_condition_holds_only_its_requests_last_hidden_row() -> None:
+    """Conditions reach the host as separate rows, not views that pin the whole step's batch."""
+    runner = duplex_runner(SPECIAL_TOKENS)
+    hidden_size = 4
+    pending_token_ids = [SPECIAL_TOKENS.turn_eos, PLAIN_TOKEN_ID]
+    requests = [
+        SimpleNamespace(
+            request_id=f"unit-{row}",
+            data=SimpleNamespace(
+                pending_unit_token=pending_token_id,
+                generation_steps=2,
+                talker_conditions=[],
+                generated_unit_ids=[],
+            ),
+        )
+        for row, pending_token_id in enumerate(pending_token_ids)
+    ]
+    hidden_states = [
+        torch.arange(3 * hidden_size, dtype=torch.float32).reshape(3, hidden_size)
+        + 100 * row
+        for row in range(len(requests))
+    ]
+
+    runner.post_process_outputs(
+        None,
+        SimpleNamespace(requests=requests),
+        {
+            request.request_id: SimpleNamespace(
+                data=OTHER_TOKEN_ID, extra={"hidden_states": hidden_state}
+            )
+            for request, hidden_state in zip(requests, hidden_states, strict=True)
+        },
+    )
+
+    for request, hidden_state, pending_token_id in zip(
+        requests, hidden_states, pending_token_ids, strict=True
+    ):
+        ((token_id, condition, is_turn_end),) = request.data.talker_conditions
+        assert token_id == pending_token_id
+        assert is_turn_end is (pending_token_id == SPECIAL_TOKENS.turn_eos)
+        torch.testing.assert_close(condition, hidden_state[-1])
+        assert condition.untyped_storage().nbytes() == hidden_size * 4
 
 
 def test_mixed_decode_tail_prefill_rows_follow_the_batch_span() -> None:

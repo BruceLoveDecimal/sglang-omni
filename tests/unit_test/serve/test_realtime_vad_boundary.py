@@ -16,6 +16,7 @@ from sglang_omni.audio.vad import (
     VAD_FRAME_SAMPLES,
     VAD_SAMPLE_RATE,
     Emit,
+    SileroSpeechModel,
     VADEvent,
     offsets_to_ms,
 )
@@ -257,3 +258,21 @@ async def test_clear_resets_vad_timeline():
         == 2 * VAD_FRAME_SAMPLES
     )
     assert vad.reset_calls == 1 and sent[-1]["type"] == "input_audio_buffer.cleared"
+
+
+def test_speech_models_share_one_onnx_session_but_not_rnn_state() -> None:
+    """Opening a session reuses the loaded network, and one session's audio never moves another's probabilities."""
+    generator = np.random.default_rng(0)
+    probe_frame = generator.uniform(-0.5, 0.5, VAD_FRAME_SAMPLES).astype(np.float32)
+    busy = SileroSpeechModel()
+    idle = SileroSpeechModel()
+    for _ in range(8):
+        busy.predict(
+            generator.uniform(-0.5, 0.5, VAD_FRAME_SAMPLES).astype(np.float32),
+            VAD_SAMPLE_RATE,
+        )
+
+    assert busy.model.session is idle.model.session
+    assert idle.predict(probe_frame, VAD_SAMPLE_RATE) == SileroSpeechModel().predict(
+        probe_frame, VAD_SAMPLE_RATE
+    )

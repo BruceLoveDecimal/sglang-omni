@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import functools
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -47,15 +49,29 @@ class SpeechProbabilityModel(Protocol):
     def reset(self) -> None: ...
 
 
+class SileroOnnxModel(Protocol):
+    def __call__(self, frame: torch.Tensor, sample_rate: int) -> torch.Tensor: ...
+
+    def reset_states(self) -> None: ...
+
+
+@functools.cache
+def load_shared_silero_model() -> SileroOnnxModel:
+    """The process's one ONNX session; every SileroSpeechModel copies its stateless runner."""
+    # note (ratish): importing silero_vad sets torch to one intra-op thread for
+    # the whole process, so only the process that loads the model imports it.
+    import silero_vad
+
+    return silero_vad.load_silero_vad(onnx=True)
+
+
 class SileroSpeechModel:
     """Per-frame speech probability. Holds no turn state, only the RNN's."""
 
     def __init__(self) -> None:
-        # note (ratish): importing silero_vad sets torch to one intra-op thread for
-        # the whole process, so only the process that loads the model imports it.
-        import silero_vad
-
-        self.model = silero_vad.load_silero_vad(onnx=True)
+        # note (BruceLoveDecimal): Building the ONNX session costs milliseconds on the thinker scheduler thread per opened session; the RNN state lives on the wrapper, so a shallow copy with fresh state is a private detector over the shared session.
+        self.model = copy.copy(load_shared_silero_model())
+        self.model.reset_states()
 
     def predict(self, frame: np.ndarray, sample_rate: int) -> float:
         with torch.inference_mode():

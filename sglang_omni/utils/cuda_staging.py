@@ -37,6 +37,21 @@ def new_device_event(device: torch.device, *, blocking: bool = False) -> torch.E
         return torch.get_device_module(device).Event()
 
 
+def host_values_to_device(
+    values: list[int] | list[float] | list[list[int]],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """A device tensor of host values whose copy is queued behind, not waiting on, earlier device work."""
+    if device.type == "cpu":
+        return torch.tensor(values, dtype=dtype)
+    else:
+        # note (BruceLoveDecimal): a copy from pageable memory first drains the stream, so a sampler building index tensors stalls on the forward once per tensor.
+        return torch.tensor(values, dtype=dtype, pin_memory=True).to(
+            device, non_blocking=True
+        )
+
+
 def normalize_device(device: torch.device | str | int) -> torch.device:
     resolved = torch.device(device)
     if has_device_streams(resolved) and resolved.index is None:

@@ -31,6 +31,7 @@ from sglang_omni.scheduling.sglang_backend.request_data import (
     session_prefill_rows,
 )
 from sglang_omni.scheduling.types import SchedulerRequest
+from sglang_omni.utils.cuda_staging import host_values_to_device
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -486,7 +487,10 @@ class MiniCPMOTalkerModelRunner(ModelRunner):
             < CHUNK_BOUNDARY_EOS_MASK_STEPS
         ]
         if boundary_rows:
-            logits[boundary_rows, self.model.codec_eos_id] = float("-inf")
+            logits[
+                host_values_to_device(boundary_rows, torch.long, logits.device),
+                self.model.codec_eos_id,
+            ] = float("-inf")
         else:
             pass
         vocab = logits.shape[1]
@@ -518,21 +522,26 @@ class MiniCPMOTalkerModelRunner(ModelRunner):
         else:
             pass
         # note (MayDomine): a dummy vocabulary bin excludes ragged-window padding.
-        num = len(windows)
-        window_ids = torch.full((num, REP_PENALTY_WINDOW), vocab, dtype=torch.long)
-        for i, window in enumerate(windows):
-            window_ids[i, : len(window)] = torch.tensor(window, dtype=torch.long)
-        window_ids = window_ids.to(device)
-        counts = torch.zeros(num, vocab + 1, dtype=torch.float32, device=device)
+        window_ids = host_values_to_device(
+            [
+                window + [vocab] * (REP_PENALTY_WINDOW - len(window))
+                for window in windows
+            ],
+            torch.long,
+            device,
+        )
+        counts = torch.zeros(
+            len(windows), vocab + 1, dtype=torch.float32, device=device
+        )
         counts.scatter_add_(
             1, window_ids, torch.ones_like(window_ids, dtype=torch.float32)
         )
         counts = counts[:, :vocab]
         alphas = (
-            torch.tensor(penalties, dtype=torch.float32, device=device).unsqueeze(1)
+            host_values_to_device(penalties, torch.float32, device).unsqueeze(1)
             ** counts
         )
-        rows_t = torch.tensor(penalized_rows, dtype=torch.long, device=device)
+        rows_t = host_values_to_device(penalized_rows, torch.long, device)
         orig_dtype = logits.dtype
         scores = logits[rows_t].to(torch.float32)
         penalized = torch.where(scores < 0, scores * alphas, scores / alphas)
