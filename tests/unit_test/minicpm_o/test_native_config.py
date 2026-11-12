@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
+import torch
 from click.testing import Result
 from pydantic import JsonValue, ValidationError
 from transformers import AutoConfig
@@ -27,7 +28,10 @@ from sglang_omni.config.runtime import (
 from sglang_omni.models.minicpm_o import native_stages, stages
 from sglang_omni.models.minicpm_o.components import audio_encoder, image_encoder
 from sglang_omni.models.minicpm_o.config import MiniCPMOSpeechPipelineConfig
-from sglang_omni.models.minicpm_o.engine_builder import MiniCPMOThinkerEngineBuilder
+from sglang_omni.models.minicpm_o.engine_builder import (
+    THINKER_PREFILL_CUDA_GRAPH_MAX_TOKENS,
+    MiniCPMOThinkerEngineBuilder,
+)
 from sglang_omni.models.minicpm_o.hf_config import MiniCPMOConfig
 from sglang_omni.models.minicpm_o.native_config import (
     TALKER_CONTEXT_LENGTH,
@@ -37,6 +41,11 @@ from sglang_omni.models.minicpm_o.native_config import (
 )
 from sglang_omni.models.minicpm_o.native_stages import SpeechHooks
 from sglang_omni.models.minicpm_o.session_adapters import build_realtime_deployment
+from sglang_omni.platforms import current_platform
+from sglang_omni.scheduling.generation_batch_policy import (
+    CudaGraphBackend,
+    build_generation_batch_overrides,
+)
 from sglang_omni.scheduling.session import BatchedSessionHooks
 from sglang_omni.scheduling.stage_kv_budget import consume_stage_kv_cache_bytes
 from sglang_omni.utils.gpu_memory import GpuDeviceInfo
@@ -407,6 +416,28 @@ def test_duplex_settings_select_decode_graphs_without_compile(
     )
 
 
+@pytest.mark.parametrize("is_cuda", [True, False])
+def test_thinker_bounds_its_breakable_prefill_graphs_on_nvidia(
+    monkeypatch: pytest.MonkeyPatch, is_cuda: bool
+) -> None:
+    """The unchunked thinker prefill gets a capped token ladder on NVIDIA and stays eager elsewhere."""
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: is_cuda)
+
+    overrides = build_generation_batch_overrides(
+        server_args_overrides={},
+        **MiniCPMOThinkerEngineBuilder().generation_defaults(dtype="bfloat16"),
+    )
+
+    if is_cuda:
+        assert overrides["cuda_graph_backend_prefill"] == CudaGraphBackend.BREAKABLE
+        assert max(overrides["cuda_graph_bs_prefill"]) == (
+            THINKER_PREFILL_CUDA_GRAPH_MAX_TOKENS
+        )
+    else:
+        assert "cuda_graph_backend_prefill" not in overrides
+        assert "cuda_graph_bs_prefill" not in overrides
+
+
 def test_minicpmo_configs_load_without_sglang(tmp_path: Path) -> None:
     config_path = tmp_path / "duplex.yaml"
     script = """
@@ -535,6 +566,43 @@ def test_duplex_speech_decodes_five_flow_steps_by_default(
         config.model_path, device="cpu", **config.stage_factory_kwargs("speech")
     )
     assert native_stages.MiniCPMOCode2Wav.call_args.kwargs["n_timesteps"] == 5
+
+
+@pytest.mark.parametrize(
+    ("flags", "device", "compiles_hift"),
+    [
+        ([], "cuda:0", True),
+        ([], "cpu", False),
+        (["--speech.enable_hift_torch_compile", "false"], "cuda:0", False),
+    ],
+    ids=["default-cuda", "default-elsewhere", "operator-off"],
+)
+def test_duplex_speech_compiles_hift_on_cuda_unless_turned_off(
+    flags: list[str],
+    device: str,
+    compiles_hift: bool,
+    tmp_path: Path,
+    stub_stage_models: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unset, the compiled HiFT body runs where it is validated; an explicit setting wins."""
+    monkeypatch.setattr(
+        native_stages,
+        "resolve_concrete_device",
+        lambda device, gpu_id: torch.device(device),
+    )
+    reference_path = tmp_path / "reference.wav"
+    reference_path.write_bytes(b"reference")
+    manager = ConfigManager(MiniCPMODuplexPipelineConfig(model_path="unused"))
+    config = manager.merge_config(manager.parse_extra_args(flags))
+    native_stages.MiniCPMOCode2Wav.return_value.default_prompt_wav = str(reference_path)
+
+    native_stages.create_speech_scheduler(
+        config.model_path, device=device, **config.stage_factory_kwargs("speech")
+    )
+
+    codec_kwargs = native_stages.MiniCPMOCode2Wav.call_args.kwargs
+    assert codec_kwargs["enable_hift_torch_compile"] is compiles_hift
 
 
 @pytest.mark.parametrize(

@@ -75,6 +75,7 @@ def test_prefill_graphs_resolve_the_talker_decoder():
     assert resolve_language_model(model) is model.llama.model
 
 
+@pytest.mark.parametrize("session_mode", [False, True], ids=["offline", "duplex-session"])
 @pytest.mark.parametrize(
     ("server_args_overrides", "is_cuda", "backend", "operator_selected"),
     [
@@ -85,6 +86,7 @@ def test_prefill_graphs_resolve_the_talker_decoder():
 )
 def test_talker_stage_defaults_breakable_prefill_graphs_on_nvidia(
     monkeypatch: pytest.MonkeyPatch,
+    session_mode: bool,
     server_args_overrides: dict[str, object],
     is_cuda: bool,
     backend: str,
@@ -118,7 +120,7 @@ def test_talker_stage_defaults_breakable_prefill_graphs_on_nvidia(
     )
 
     stages.create_sglang_talker_executor_from_config(
-        "model", server_args_overrides=server_args_overrides
+        "model", server_args_overrides=server_args_overrides, session_mode=session_mode
     )
 
     assert built["cuda_graph_backend_prefill"] == backend

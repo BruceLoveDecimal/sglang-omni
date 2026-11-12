@@ -118,7 +118,8 @@ class MiniCPMODuplexSpeech(BaseModel):
 
     dtype: Literal["float32", "float16", "bfloat16"] = "float32"
     enable_dit_torch_compile: bool = False
-    enable_hift_torch_compile: bool = False
+    enable_hift_torch_compile: bool | None = None
+    "Compile HiFT's real-valued body; unset compiles it on CUDA, the only device it is validated on."
     n_timesteps: int = Field(default=5, ge=1)
     enable_chunk_cuda_graph: bool = True
     "Replay the flow's chunk loop from CUDA graphs captured at startup; false decodes every chunk eagerly."

@@ -26,9 +26,14 @@ from sglang_omni.models.minicpm_o.native_thinker_model_runner import (
     MiniCPMOThinkerModelRunner,
 )
 from sglang_omni.models.minicpm_o.session_adapters import ThinkerAdapter
+from sglang_omni.platforms import current_platform
 from sglang_omni.scheduling.engine_factory import SGLangGenerationEngineBuilder
+from sglang_omni.scheduling.generation_batch_policy import CudaGraphBackend
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
+
+# note (BruceLoveDecimal): A duplex unit prefills about 13 tokens; session openings and media units above this run eager.
+THINKER_PREFILL_CUDA_GRAPH_MAX_TOKENS = 512
 
 
 def check_window_kv_cache(window: MiniCPMODuplexWindow, kv_cache: KVCache) -> None:
@@ -53,6 +58,7 @@ class MiniCPMOThinkerEngineBuilder(SGLangGenerationEngineBuilder):
     model_arch_override: str = "MiniCPMO"
     context_length: int = THINKER_CONTEXT_LENGTH
     supports_context_length_override: ClassVar[bool] = True
+    supports_breakable_prefill_cuda_graph = True
     tokenizer: PreTrainedTokenizerBase
     adapter: ThinkerAdapter
     window: MiniCPMODuplexWindow
@@ -63,7 +69,7 @@ class MiniCPMOThinkerEngineBuilder(SGLangGenerationEngineBuilder):
         self.window = window
 
     def generation_defaults(self, *, dtype: str) -> dict[str, str | int | float | bool]:
-        return dict(
+        defaults: dict[str, str | int | float | bool] = dict(
             max_running_requests=4,
             dtype=dtype,
             enable_streaming_session=True,
@@ -75,6 +81,13 @@ class MiniCPMOThinkerEngineBuilder(SGLangGenerationEngineBuilder):
             # note (Chenyang): CI serves MiniCPM-o with SGLang torch compile off.
             enable_torch_compile=False,
         )
+        if current_platform.is_cuda():
+            # note (BruceLoveDecimal): The unchunked prefill leaves no chunk to bound the capture, so the ladder needs its own cap.
+            defaults["cuda_graph_backend_prefill"] = CudaGraphBackend.BREAKABLE
+            defaults["cuda_graph_max_bs_prefill"] = THINKER_PREFILL_CUDA_GRAPH_MAX_TOKENS
+        else:
+            pass
+        return defaults
 
     def pre_infra_setup(self, checkpoint_dir: str) -> None:
         register_minicpm_o_hf_config()
