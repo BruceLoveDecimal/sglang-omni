@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
+import torch
 from click.testing import Result
 from pydantic import JsonValue, ValidationError
 from transformers import AutoConfig
@@ -517,7 +518,7 @@ def test_duplex_speech_settings_reach_the_vocoder(
     assert codec_kwargs["enable_hift_torch_compile"] is True
     assert codec_kwargs["n_timesteps"] == 6
     native_stages.MiniCPMOVocoderRuntime.return_value.warm_up.assert_called_once_with(
-        b"reference", capture_chunk_graphs=True
+        b"reference", capture_chunk_graphs=True, capture_hift_graphs=False
     )
     runtime_kwargs = native_stages.MiniCPMOVocoderRuntime.call_args.kwargs
     assert runtime_kwargs["max_open_sessions"] == config.max_sessions
@@ -584,5 +585,39 @@ def test_each_duplex_session_optimization_turns_off_alone(
     assert perception.gather_window_seconds == 0
     assert speech.gather_window_seconds == pytest.approx(gather_window_seconds)
     native_stages.MiniCPMOVocoderRuntime.return_value.warm_up.assert_called_once_with(
-        b"reference", capture_chunk_graphs=captures_chunk_graphs
+        b"reference",
+        capture_chunk_graphs=captures_chunk_graphs,
+        capture_hift_graphs=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("flags", "captures_hift_graphs"),
+    [([], True), (["--speech.enable_hift_cuda_graph", "false"], False)],
+    ids=["defaults", "eager-hift"],
+)
+def test_duplex_speech_captures_hift_graphs_on_cuda_unless_turned_off(
+    flags: list[str],
+    captures_hift_graphs: bool,
+    tmp_path: Path,
+    stub_stage_models: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        native_stages,
+        "resolve_concrete_device",
+        lambda device, gpu_id: torch.device("cuda:0"),
+    )
+    reference_path = tmp_path / "reference.wav"
+    reference_path.write_bytes(b"reference")
+    manager = ConfigManager(MiniCPMODuplexPipelineConfig(model_path="unused"))
+    config = manager.merge_config(manager.parse_extra_args(flags))
+    native_stages.MiniCPMOCode2Wav.return_value.default_prompt_wav = str(reference_path)
+    native_stages.create_speech_scheduler(
+        config.model_path, device="cuda:0", **config.stage_factory_kwargs("speech")
+    )
+    native_stages.MiniCPMOVocoderRuntime.return_value.warm_up.assert_called_once_with(
+        b"reference",
+        capture_chunk_graphs=True,
+        capture_hift_graphs=captures_hift_graphs,
     )

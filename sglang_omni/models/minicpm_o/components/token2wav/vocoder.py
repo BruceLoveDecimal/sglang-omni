@@ -33,6 +33,9 @@ from sglang_omni.models.minicpm_o.components.token2wav.flow_cuda_graph import (
     FlowCudaGraphRunner,
 )
 from sglang_omni.models.minicpm_o.components.token2wav.hift import HiFTGenerator
+from sglang_omni.models.minicpm_o.components.token2wav.hift_cuda_graph import (
+    HiftBodyCudaGraphRunner,
+)
 from sglang_omni.models.minicpm_o.components.token2wav.packed_dit_cuda_graph import (
     PackedDiTCudaGraphRunner,
 )
@@ -50,6 +53,8 @@ MEL_CACHE_FRAMES = 8
 SAMPLES_PER_MEL_FRAME = 480
 # note (Junnan Li): cuDNN builds a convolution plan per input shape, so HiFT batches are padded to a few repeating sizes.
 HIFT_BATCH_GRANULE = 8
+# note (BruceLoveDecimal): graphs mask the padded mel frames, so a few frame tiers serve every chunk.
+HIFT_GRAPH_FRAME_TIER = 16
 
 
 def hift_batch_rows(rows: int) -> int:
@@ -57,6 +62,19 @@ def hift_batch_rows(rows: int) -> int:
         return 1 << (rows - 1).bit_length()
     else:
         return -(-rows // HIFT_BATCH_GRANULE) * HIFT_BATCH_GRANULE
+
+
+def hift_graph_shapes(max_rows: int, max_frames: int) -> tuple[tuple[int, int], ...]:
+    """(rows, mel frames) graph shapes for every padded row count a batch of at most max_rows reaches, at frame tiers up to the first holding max_frames."""
+    return tuple(
+        (rows, frames)
+        for rows in sorted({hift_batch_rows(rows) for rows in range(1, max_rows + 1)})
+        for frames in range(
+            HIFT_GRAPH_FRAME_TIER,
+            max_frames + HIFT_GRAPH_FRAME_TIER,
+            HIFT_GRAPH_FRAME_TIER,
+        )
+    )
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -253,6 +271,19 @@ class Token2Wav(torch.nn.Module):
         )
         runner.capture(flow_capture_shapes)
         decoder.graph_runner = runner
+
+    def capture_hift_graphs(self, shapes: tuple[tuple[int, int], ...]) -> None:
+        """Capture HiFT's decode body at each (rows, mel frames) shape on the current stream's device."""
+        runner = HiftBodyCudaGraphRunner(self.hift.decode_body)
+        runner.capture(
+            shapes,
+            device=self.device,
+            mel_channels=self.flow.output_size,
+            samples_per_frame=int(self.hift.f0_upsamp.scale_factor),
+            fft_samples=self.hift.istft_params["n_fft"],
+            hop_samples=self.hift.istft_params["hop_len"],
+        )
+        self.hift.body_graph_runner = runner
 
     @torch.inference_mode()
     def prepare_prompt(self, source: str | io.BytesIO) -> SpeakerPrompt:

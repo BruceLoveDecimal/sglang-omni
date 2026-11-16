@@ -11,9 +11,12 @@ import torch
 
 from sglang_omni.models.minicpm_o.components.code2wav import OUTPUT_SAMPLE_RATE
 from sglang_omni.models.minicpm_o.components.token2wav.vocoder import (
+    HIFT_GRAPH_FRAME_TIER,
+    MEL_CACHE_FRAMES,
     SILENCE_TOKEN_ID,
     StreamCaches,
     StreamChunk,
+    hift_batch_rows,
 )
 from sglang_omni.models.minicpm_o.components.tts_runtime import (
     CHUNK_GRAPH_MAX_STREAMS,
@@ -47,8 +50,10 @@ class FakeToken2Wav:
     def __init__(self) -> None:
         self.flow = SimpleNamespace(pre_lookahead_len=PRE_LOOKAHEAD, up_rate=UP_RATE)
         self.device = torch.device("cpu")
+        self.mel_cache_len = MEL_CACHE_FRAMES
         self.forward_sizes: list[int] = []
         self.captured_graphs: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+        self.captured_hift_shapes: list[tuple[tuple[int, int], ...]] = []
         self.vocoder_warm_ups: list[tuple[int, int]] = []
 
     def capture_chunk_graphs(
@@ -63,6 +68,9 @@ class FakeToken2Wav:
 
     def warm_up_vocoder(self, max_rows: int, max_chunk_frames: int) -> None:
         self.vocoder_warm_ups.append((max_rows, max_chunk_frames))
+
+    def capture_hift_graphs(self, shapes: tuple[tuple[int, int], ...]) -> None:
+        self.captured_hift_shapes.append(shapes)
 
     def open_stream(self, prompt: object) -> StreamCaches:
         return {"history": torch.zeros(1, OPENED_HISTORY_FRAMES)}, {
@@ -212,6 +220,7 @@ def test_units_finish_before_later_rounds_in_request_order() -> None:
     ]
 
 
+@pytest.mark.parametrize("capture_hift_graphs", [True, False])
 @pytest.mark.parametrize("capture_chunk_graphs", [True, False])
 @pytest.mark.parametrize(
     ("max_open_sessions", "stream_counts", "forward_widths"),
@@ -228,6 +237,7 @@ def test_warm_up_decodes_equal_and_ragged_forwards_of_every_reachable_width(
     stream_counts: tuple[int, ...],
     forward_widths: tuple[int, ...],
     capture_chunk_graphs: bool,
+    capture_hift_graphs: bool,
 ) -> None:
     runtime = MiniCPMOVocoderRuntime(
         FakeCode2Wav(),
@@ -253,8 +263,24 @@ def test_warm_up_decodes_equal_and_ragged_forwards_of_every_reachable_width(
         return decode(chunks)
 
     runtime.token2wav.stream_batch = recording_stream_batch
-    runtime.warm_up(b"voice", capture_chunk_graphs=capture_chunk_graphs)
+    runtime.warm_up(
+        b"voice",
+        capture_chunk_graphs=capture_chunk_graphs,
+        capture_hift_graphs=capture_hift_graphs,
+    )
     window = CODEC_CHUNK_SIZE + PRE_LOOKAHEAD
+    if capture_hift_graphs:
+        (shapes,) = runtime.token2wav.captured_hift_shapes
+        # note (BruceLoveDecimal): every padded forward width meets a graph whose frame tier pads it by less than one tier.
+        for rows in range(1, max_open_sessions + 1):
+            for frames in range(1, MEL_CACHE_FRAMES + window * UP_RATE + 1):
+                assert any(
+                    graph_rows == hift_batch_rows(rows)
+                    and frames <= graph_frames < frames + HIFT_GRAPH_FRAME_TIER
+                    for graph_rows, graph_frames in shapes
+                )
+    else:
+        assert runtime.token2wav.captured_hift_shapes == []
     if capture_chunk_graphs:
         assert runtime.token2wav.captured_graphs == [
             (stream_counts, (CODEC_CHUNK_SIZE * UP_RATE, (window - 1) * UP_RATE))

@@ -579,6 +579,7 @@ def create_speech_scheduler(
     enable_hift_torch_compile: bool = DEFAULT_SPEECH_SETTINGS.enable_hift_torch_compile,
     n_timesteps: int = DEFAULT_SPEECH_SETTINGS.n_timesteps,
     enable_chunk_cuda_graph: bool = DEFAULT_SPEECH_SETTINGS.enable_chunk_cuda_graph,
+    enable_hift_cuda_graph: bool = DEFAULT_SPEECH_SETTINGS.enable_hift_cuda_graph,
     gather_window_ms: float = DEFAULT_SPEECH_SETTINGS.gather_window_ms,
 ) -> SessionScheduler:
     device = str(resolve_concrete_device(device, gpu_id))
@@ -607,7 +608,12 @@ def create_speech_scheduler(
     )
     reference_audio_bytes = Path(codec.default_prompt_wav).read_bytes()
     # note (Junnan Li): Code2Wav warms only the offline flow, so the streaming chunk graphs and compiled forms are built here.
-    runtime.warm_up(reference_audio_bytes, capture_chunk_graphs=enable_chunk_cuda_graph)
+    runtime.warm_up(
+        reference_audio_bytes,
+        capture_chunk_graphs=enable_chunk_cuda_graph,
+        capture_hift_graphs=enable_hift_cuda_graph
+        and torch.device(device).type == "cuda",
+    )
     return SessionScheduler(
         SpeechHooks(runtime, reference_audio_bytes, gather_window_ms=gather_window_ms),
         max_open_sessions=max_open_sessions,

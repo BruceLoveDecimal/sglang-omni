@@ -16,6 +16,7 @@ from sglang_omni.models.minicpm_o.components.token2wav.vocoder import (
     StreamCaches,
     StreamChunk,
     Token2Wav,
+    hift_graph_shapes,
 )
 from sglang_omni.proto.session import ResourceUsage
 from sglang_omni.scheduling.speaker_cache import estimate_cache_bytes
@@ -207,8 +208,14 @@ class MiniCPMOVocoderRuntime:
         else:
             return max(1, unheld_bytes // forward_bytes_per_stream)
 
-    def warm_up(self, reference_audio: bytes, *, capture_chunk_graphs: bool) -> None:
-        """Capture the flow's chunk graphs for this voice if asked, then decode a stream prefill and an equal-length and a ragged chunk forward of every width a forward can reach."""
+    def warm_up(
+        self,
+        reference_audio: bytes,
+        *,
+        capture_chunk_graphs: bool,
+        capture_hift_graphs: bool,
+    ) -> None:
+        """Capture the flow's chunk graphs for this voice and HiFT's graphs for every forward width if asked, then decode a stream prefill and an equal-length and a ragged chunk forward of every width a forward can reach."""
         # note (Junnan Li): A forward wider than every graph runs eagerly, and a compiled estimator compiles its equal and ragged forms once each.
         if self.max_open_sessions > CHUNK_GRAPH_MAX_STREAMS:
             forward_stream_counts = (2, CHUNK_GRAPH_MAX_STREAMS + 1)
@@ -260,17 +267,29 @@ class MiniCPMOVocoderRuntime:
             )
         else:
             pass
+        if capture_hift_graphs:
+            self.token2wav.capture_hift_graphs(
+                hift_graph_shapes(
+                    self.max_open_sessions,
+                    self.token2wav.mel_cache_len + self.max_chunk_mel_frames(),
+                )
+            )
+        else:
+            pass
         for batch in batches:
             list(self.synthesize_batch(batch))
         for request in requests:
             self.close_session(request.session_id)
 
+    def max_chunk_mel_frames(self) -> int:
+        """The mel frames of a chunk that holds one whole window of tokens."""
+        flow = self.token2wav.flow
+        return flow.up_rate * (CODEC_CHUNK_SIZE + flow.pre_lookahead_len)
+
     def warm_up_vocoder(self) -> None:
         # note (Junnan Li): A forward takes at most every open session and a chunk holds at most one window of tokens, and cuDNN keeps its plans per thread.
-        flow = self.token2wav.flow
         self.token2wav.warm_up_vocoder(
-            self.max_open_sessions,
-            flow.up_rate * (CODEC_CHUNK_SIZE + flow.pre_lookahead_len),
+            self.max_open_sessions, self.max_chunk_mel_frames()
         )
 
     def close_session(self, session_id: str) -> None:
