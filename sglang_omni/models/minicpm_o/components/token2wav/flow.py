@@ -25,6 +25,7 @@ from typing import Literal
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sglang.srt.utils.common import async_h2d
 from torch.nn.utils.rnn import pad_sequence
 
 from sglang_omni.models.minicpm_o.components.token2wav.conformer import (
@@ -64,8 +65,10 @@ class RaggedLayout:
         """Keys are [new frames, history] as Attention concatenates them; a row sees only its own real keys."""
         padded_frames = self.padded_frames
         keys = torch.arange(padded_frames + self.padded_history, device=device)
-        frame_counts = torch.tensor(self.frame_counts, device=device)
-        history_counts = torch.tensor(self.history_counts, device=device)
+        frame_counts = async_h2d(self.frame_counts, dtype=torch.int64, device=device)
+        history_counts = async_h2d(
+            self.history_counts, dtype=torch.int64, device=device
+        )
         visible = (keys[None, :] < frame_counts[:, None]) | (
             (keys[None, :] >= padded_frames)
             & (keys[None, :] < padded_frames + history_counts[:, None])
@@ -486,7 +489,9 @@ class CausalConditionalCFM(torch.nn.Module):
         graph.convolution_cache.copy_(convolution_cache)
         graph.attention_mask.copy_(layout.attention_mask(mu.device).repeat(2, 1, 1))
         graph.valid_frame_counts.copy_(
-            torch.tensor(layout.frame_counts, device=mu.device).repeat(2)
+            async_h2d(layout.frame_counts, dtype=torch.int64, device=mu.device).repeat(
+                2
+            )
         )
         graph.graph.replay()
         return graph.mel.clone(), graph.next_convolution_cache.clone()
@@ -520,8 +525,8 @@ class CausalConditionalCFM(torch.nn.Module):
                 # note (Junnan Li): stepaudio2 starts a chunk's noise at its own history length.
                 noise_offsets = layout.history_counts
                 attention_mask = layout.attention_mask(mu.device).repeat(2, 1, 1)
-                valid_frame_counts = torch.tensor(
-                    layout.frame_counts, device=mu.device
+                valid_frame_counts = async_h2d(
+                    layout.frame_counts, dtype=torch.int64, device=mu.device
                 ).repeat(2)
             states = [
                 DiTState(

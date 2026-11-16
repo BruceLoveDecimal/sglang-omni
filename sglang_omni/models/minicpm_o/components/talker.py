@@ -6,6 +6,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sglang.srt.utils.common import async_h2d, is_pin_memory_available
 
 
 class MiniCPMTTSProjector(nn.Module):
@@ -32,9 +33,23 @@ def build_tts_condition(
 ) -> torch.Tensor:
     """Compose token-aligned speech conditions with explicit turn/unit boundaries."""
     device, dtype = text_embedding.weight.device, text_embedding.weight.dtype
-    tokens = token_ids.to(device=device, dtype=torch.long).reshape(-1)
-    hidden = hidden_states.to(device=device, dtype=dtype)
-    boundary = text_embedding(torch.tensor(boundary_tokens, device=device))
+    # note (BruceLoveDecimal): a copy from pageable memory waits for the device to drain first; casting after the copy keeps it pinned.
+    pins_host_tensors = is_pin_memory_available(device)
+    if pins_host_tensors and token_ids.device.type == "cpu":
+        token_ids = token_ids.pin_memory()
+    else:
+        pass
+    if pins_host_tensors and hidden_states.device.type == "cpu":
+        hidden_states = hidden_states.pin_memory()
+    else:
+        pass
+    tokens = (
+        token_ids.to(device=device, non_blocking=True).to(dtype=torch.long).reshape(-1)
+    )
+    hidden = hidden_states.to(device=device, non_blocking=True).to(dtype=dtype)
+    boundary = text_embedding(
+        async_h2d(list(boundary_tokens), dtype=torch.long, device=device)
+    )
     if not tokens.numel():
         return boundary
     else:

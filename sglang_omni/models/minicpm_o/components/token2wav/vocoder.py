@@ -19,6 +19,7 @@ import torchaudio.compliance.kaldi as kaldi
 import whisper
 import yaml
 from librosa.filters import mel as librosa_mel
+from sglang.srt.utils.common import async_h2d
 
 from sglang_omni.models.minicpm_o.components.token2wav.conformer import (
     UpsampleConformerEncoderV2,
@@ -40,6 +41,7 @@ from sglang_omni.models.minicpm_o.components.token2wav.speech_tokenizer import (
 )
 from sglang_omni.platforms import current_platform
 from sglang_omni.utils.audio import load_with_torchaudio
+from sglang_omni.utils.short_time_fourier import HAS_TRITON, ShortTimeFourierTransform
 
 # note (Junnan Li): stepaudio2 Token2wav keeps the prompt plus this many frames so positions stay in range.
 FLOW_CACHE_TAIL_FRAMES = 100
@@ -209,6 +211,13 @@ class Token2Wav(torch.nn.Module):
             strict=True,
         )
         self.hift.to(device).eval()
+        # note (BruceLoveDecimal): a ROCm device is a cuda device too, and the transform's inline PTX cannot compile there.
+        if HAS_TRITON and device.type == "cuda" and current_platform.is_cuda():
+            self.hift.short_time_fourier = ShortTimeFourierTransform(
+                self.hift.stft_window, self.hift.istft_params["hop_len"]
+            )
+        else:
+            pass
         self.mel_cache_len = MEL_CACHE_FRAMES
         self.source_cache_len = MEL_CACHE_FRAMES * SAMPLES_PER_MEL_FRAME
         self.speech_window = torch.from_numpy(np.hamming(2 * self.source_cache_len)).to(
@@ -382,16 +391,17 @@ class Token2Wav(torch.nn.Module):
         self, chunks: list[StreamChunk]
     ) -> list[tuple[bytes, StreamCaches]]:
         """Decode one token chunk of each of several streams; each caller owns its caches and receives new ones."""
+        token_counts = [len(chunk.token_ids) for chunk in chunks]
+        device_token_ids = async_h2d(
+            [token_id for chunk in chunks for token_id in chunk.token_ids],
+            dtype=torch.int32,
+            device=self.device,
+        ).split(token_counts)
         with torch.amp.autocast(
             "cuda", dtype=self.dtype, enabled=self.dtype != torch.float32
         ):
             decoded = self.flow.inference_chunks(
-                token_ids=[
-                    torch.tensor(
-                        [chunk.token_ids], dtype=torch.int32, device=self.device
-                    )
-                    for chunk in chunks
-                ],
+                token_ids=[row_token_ids[None] for row_token_ids in device_token_ids],
                 speaker_embeddings=torch.cat(
                     [chunk.prompt.speaker_embedding for chunk in chunks]
                 ),
@@ -448,7 +458,8 @@ class Token2Wav(torch.nn.Module):
                     hift_cache["speech"].shape[1],
                 )
             ].append(index)
-        results: dict[int, tuple[bytes, StreamCaches]] = {}
+        caches_by_index: dict[int, StreamCaches] = {}
+        device_pcm_rows: list[tuple[list[int], torch.Tensor]] = []
         for indices in groups.values():
             is_last_chunk = chunks[indices[0]].is_last_chunk
             hift_cache = {
@@ -496,17 +507,30 @@ class Token2Wav(torch.nn.Module):
                 speech = speech[:, : -self.source_cache_len]
             else:
                 pass
-            waveform = np.clip(speech.cpu().numpy(), -1.0, 1.0)
-            pcm = (waveform * 32767.0).astype("<i2")
+            # note (BruceLoveDecimal): float32 clip, scale and truncation as the host did, so the PCM keeps its bits.
+            device_pcm_rows.append(
+                (indices, (torch.clamp(speech, -1.0, 1.0) * 32767.0).to(torch.int16))
+            )
             for position, index in enumerate(indices):
-                results[index] = (
-                    pcm[position].tobytes(),
-                    (
-                        decoded[index][1],
-                        {
-                            name: value[position : position + 1].clone()
-                            for name, value in next_hift_cache.items()
-                        },
-                    ),
+                caches_by_index[index] = (
+                    decoded[index][1],
+                    {
+                        name: value[position : position + 1].clone()
+                        for name, value in next_hift_cache.items()
+                    },
                 )
-        return [results[index] for index in range(len(chunks))]
+        # note (BruceLoveDecimal): one read back per forward; each one waits for the GPU's turn again.
+        host_pcm = (
+            torch.cat([pcm.reshape(-1) for _, pcm in device_pcm_rows]).cpu().numpy()
+        )
+        pcm_by_index: dict[int, bytes] = {}
+        offset = 0
+        for indices, pcm in device_pcm_rows:
+            samples = pcm.shape[1]
+            for index in indices:
+                pcm_by_index[index] = host_pcm[offset : offset + samples].tobytes()
+                offset += samples
+        return [
+            (pcm_by_index[index], caches_by_index[index])
+            for index in range(len(chunks))
+        ]

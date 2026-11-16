@@ -36,6 +36,7 @@ from sglang_omni.models.minicpm_o.components.token2wav.hift_layers import (
     init_weights,
     masked,
 )
+from sglang_omni.utils.short_time_fourier import ShortTimeFourierTransform
 
 
 def frame_mask(
@@ -227,6 +228,7 @@ class HiFTGenerator(nn.Module):
         )
         self.noise_generator: torch.Generator | None = None
         self.body_graph_runner: HiftBodyCudaGraphRunner | None = None
+        self.short_time_fourier: ShortTimeFourierTransform | None = None
 
     def stft(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         with default_stream_for_cufft(x.device) as caller_stream:
@@ -264,13 +266,20 @@ class HiFTGenerator(nn.Module):
         return inverse_transform
 
     def decode(self, x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-        s_stft_real, s_stft_imag = self.stft(s.squeeze(1))
-        s_stft = torch.cat([s_stft_real, s_stft_imag], dim=1)
+        if self.short_time_fourier is None:
+            s_stft_real, s_stft_imag = self.stft(s.squeeze(1))
+            s_stft = torch.cat([s_stft_real, s_stft_imag], dim=1)
+        else:
+            s_stft = self.short_time_fourier.spectrum(s.squeeze(1))
         if self.body_graph_runner is None:
             magnitude, phase = self.decode_body(x, s_stft)
         else:
             magnitude, phase = self.body_graph_runner.run(x, s_stft)
-        x = self.istft(magnitude, phase)
+        if self.short_time_fourier is None:
+            x = self.istft(magnitude, phase)
+        else:
+            # note (BruceLoveDecimal): torch.istft reads its window envelope back to the host on every call.
+            x = self.short_time_fourier.inverse(magnitude, phase)
         x = torch.clamp(x, -self.audio_limit, self.audio_limit)
         return x
 

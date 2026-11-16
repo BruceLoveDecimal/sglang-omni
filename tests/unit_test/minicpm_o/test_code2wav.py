@@ -52,6 +52,7 @@ from sglang_omni.serve.openai_api import (
     build_chat_generate_request,
 )
 from sglang_omni.utils.device import resolve_concrete_device
+from sglang_omni.utils.short_time_fourier import ShortTimeFourierTransform
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CHECKPOINT_CODEC_TOKENS = [1498, 1734, 3732, 3726, 3645]
@@ -736,6 +737,50 @@ def test_hift_graph_matches_decode_across_shapes_and_replays(
                     torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
             assert runner.graphs.keys() == {(1, 4), (2, 6)}
             assert fallback.call_count == 4
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_matmul_tf32
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_hift_decode_on_triton_transforms_matches_torch_without_a_host_wait() -> None:
+    """torch.istft read its window envelope back to the host on every HiFT decode."""
+    previous_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        with torch.backends.cudnn.flags(
+            benchmark=False, deterministic=True, allow_tf32=False
+        ):
+            torch.manual_seed(7)
+            hift = HiFTGenerator(base_channels=32).cuda().eval()
+            runner = HiftBodyCudaGraphRunner(hift.decode_body)
+            runner.capture(
+                ((2, 16),),
+                device=hift.stft_window.device,
+                mel_channels=80,
+                samples_per_frame=int(hift.f0_upsamp.scale_factor),
+                fft_samples=hift.istft_params["n_fft"],
+                hop_samples=hift.istft_params["hop_len"],
+            )
+            mel = torch.randn(2, 80, 13, device="cuda")
+            source = (
+                torch.randn(2, 1, 13 * int(hift.f0_upsamp.scale_factor), device="cuda")
+                * 0.01
+            )
+            with torch.inference_mode():
+                expected = hift.decode(mel, source)
+                hift.short_time_fourier = ShortTimeFourierTransform(
+                    hift.stft_window, hift.istft_params["hop_len"]
+                )
+                hift.body_graph_runner = runner
+                torch.cuda.synchronize()
+                sync_debug_mode = torch.cuda.get_sync_debug_mode()
+                torch.cuda.set_sync_debug_mode("error")
+                try:
+                    actual = hift.decode(mel, source)
+                finally:
+                    torch.cuda.set_sync_debug_mode(sync_debug_mode)
+            torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
     finally:
         torch.backends.cuda.matmul.allow_tf32 = previous_matmul_tf32
 
