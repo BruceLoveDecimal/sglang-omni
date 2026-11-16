@@ -2194,11 +2194,11 @@ def test_vocoder_spectra_match_cosyvoice_without_a_host_wait(
         sync_debug_mode = torch.cuda.get_sync_debug_mode()
         torch.cuda.set_sync_debug_mode("error")
         try:
-            spectrum = decode.spectrum(waveforms)
+            spectrum = decode.short_time_fourier.spectrum(waveforms)
             outputs = (
                 spectrum[:, :9],
                 spectrum[:, 9:],
-                decode.inverse(magnitude, phase),
+                decode.short_time_fourier.inverse(magnitude, phase),
             )
         finally:
             torch.cuda.set_sync_debug_mode(sync_debug_mode)

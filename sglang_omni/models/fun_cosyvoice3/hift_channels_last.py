@@ -14,8 +14,6 @@ import torch.nn.functional as F
 from sglang_omni.models.fun_cosyvoice3.hift_kernels import (
     add_bias_and_residual,
     leaky_relu_padded,
-    overlap_add_inverse,
-    short_time_spectrum,
     snake_padded,
 )
 from sglang_omni.utils.channels_last_conv import (
@@ -24,6 +22,7 @@ from sglang_omni.utils.channels_last_conv import (
     channels_last_strides,
     channels_last_weight,
 )
+from sglang_omni.utils.short_time_fourier import ShortTimeFourierTransform
 
 # note (ratish): cuDNN's TF32 tensor-core engines take channel counts in multiples of
 # four; the spectrum's n_fft + 2 channels are zero padded to a multiple of eight.
@@ -85,44 +84,8 @@ class ChannelsLastHiftDecode:
                     alpha,
                     1.0 / (alpha + activation.no_div_by_zero),
                 )
-        window = hift.stft_window.to(device=device, dtype=torch.float64)
-        angle = (2 * math.pi / self.n_fft) * torch.outer(
-            torch.arange(self.bins, device=device, dtype=torch.float64),
-            torch.arange(self.n_fft, device=device, dtype=torch.float64),
-        )
-        self.forward_basis = (
-            torch.cat([torch.cos(angle), -torch.sin(angle)]) * window
-        ).float()
-        # note (ratish): a one sided inverse counts the bins between DC and Nyquist
-        # twice.
-        one_sided = torch.full((self.bins, 1), 2.0, device=device, dtype=torch.float64)
-        one_sided[0] = 1.0
-        one_sided[-1] = 1.0
-        self.inverse_basis = (
-            torch.cat([torch.cos(angle) * one_sided, -torch.sin(angle) * one_sided])
-            * window
-            / self.n_fft
-        ).float()
-        self.squared_window = hift.stft_window.to(device).pow(2)
-
-    def spectrum(self, signal: torch.Tensor) -> torch.Tensor:
-        """The centered short time spectrum of (rows, samples): (rows, 2 * bins,
-        frames), the real parts then the imaginary parts."""
-        half = self.n_fft // 2
-        padded_signal = F.pad(signal[:, None], (half, half), mode="reflect")[
-            :, 0
-        ].contiguous()
-        return short_time_spectrum(padded_signal, self.forward_basis, self.hop_length)
-
-    def inverse(self, magnitude: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
-        """The inverse transform of (rows, bins, frames) magnitudes and phases."""
-        magnitude = torch.clip(magnitude, max=1e2)
-        return overlap_add_inverse(
-            (magnitude * torch.cos(phase)).contiguous(),
-            (magnitude * torch.sin(phase)).contiguous(),
-            self.inverse_basis,
-            self.squared_window,
-            self.hop_length,
+        self.short_time_fourier = ShortTimeFourierTransform(
+            hift.stft_window.to(device), self.hop_length
         )
 
     def source_down(self, stage: int, source_spectrum: torch.Tensor) -> torch.Tensor:
@@ -205,7 +168,7 @@ class ChannelsLastHiftDecode:
         # note (ratish): three small transposes, the mel, the source spectrum and the
         # output spectrum, in place of one per convolution inside cuDNN.
         source_spectrum = F.pad(
-            self.spectrum(s.squeeze(1)).transpose(1, 2),
+            self.short_time_fourier.spectrum(s.squeeze(1)).transpose(1, 2),
             (0, self.spectrum_channel_padding),
         ).contiguous()
         if finalize:
@@ -268,7 +231,7 @@ class ChannelsLastHiftDecode:
         )
         magnitude = torch.exp(hidden_states[..., : self.bins]).transpose(1, 2)
         phase = torch.sin(hidden_states[..., self.bins : 2 * self.bins]).transpose(1, 2)
-        audio = self.inverse(magnitude, phase)
+        audio = self.short_time_fourier.inverse(magnitude, phase)
         if finalize:
             pass
         else:
